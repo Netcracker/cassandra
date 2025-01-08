@@ -43,6 +43,7 @@ import org.apache.cassandra.config.Config;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.io.FSError;
 import org.apache.cassandra.io.sstable.CorruptSSTableException;
+import org.apache.cassandra.journal.Params.FailurePolicy;
 import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.utils.concurrent.UncheckedInterruptedException;
 
@@ -94,6 +95,11 @@ public final class JVMStabilityInspector
         inspectThrowable(t, ex -> DiskErrorsHandlerService.get().inspectCommitLogError(ex));
     }
 
+    public static void inspectJournalThrowable(Throwable t, String journalName, FailurePolicy failurePolicy)
+    {
+        inspectThrowable(t, th -> inspectJournalError(th, journalName, failurePolicy));
+    }
+
     public static void inspectThrowable(Throwable t, Consumer<Throwable> fn) throws OutOfMemoryError
     {
         boolean isUnstable = false;
@@ -128,7 +134,14 @@ public final class JVMStabilityInspector
         }
 
         // Anything other than an OOM, we should try and heap dump to capture what's going on if configured to do so
-        HeapUtils.maybeCreateHeapDump();
+        try
+        {
+            HeapUtils.maybeCreateHeapDump();
+        }
+        catch (Throwable sub)
+        {
+            t.addSuppressed(sub);
+        }
 
         if (t instanceof InterruptedException)
             throw new UncheckedInterruptedException((InterruptedException) t);
@@ -186,6 +199,20 @@ public final class JVMStabilityInspector
             // java.util.AbstractCollection.MAX_ARRAY_SIZE is defined as Integer.MAX_VALUE - 8
             // so Integer.MAX_VALUE / 2 should be a large enough and safe size to request.
             ignored.add(new long[Integer.MAX_VALUE / 2]);
+        }
+    }
+
+    // TODO: Migrate to DiskErrorsHandlerService
+    private static void inspectJournalError(Throwable t, String journalName, FailurePolicy failurePolicy)
+    {
+        if (!StorageService.instance.isDaemonSetupCompleted())
+        {
+            logger.error("Exiting due to error while processing journal {} during initialization.", journalName, t);
+            killer.killCurrentJVM(t, true);
+        }
+        else if (failurePolicy == FailurePolicy.DIE)
+        {
+            killer.killCurrentJVM(t);
         }
     }
 
