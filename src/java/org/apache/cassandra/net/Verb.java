@@ -72,6 +72,7 @@ import org.apache.cassandra.repair.messages.SyncResponse;
 import org.apache.cassandra.repair.messages.SyncRequest;
 import org.apache.cassandra.repair.messages.ValidationResponse;
 import org.apache.cassandra.repair.messages.ValidationRequest;
+import org.apache.cassandra.replication.ForwardedWrite;
 import org.apache.cassandra.schema.SchemaMutationsSerializer;
 import org.apache.cassandra.schema.SchemaPullVerbHandler;
 import org.apache.cassandra.schema.SchemaPushVerbHandler;
@@ -247,6 +248,7 @@ public enum Verb
     READ_RECONCILE_SEND        (901, P0, rpcTimeout,   READ,             () -> ReadReconcileSend.serializer,          () -> ReadReconcileSend.verbHandler                                ),
     READ_RECONCILE_RCV         (902, P0, rpcTimeout,   MUTATION,         () -> ReadReconcileReceive.serializer,       () -> ReadReconcileReceive.verbHandler                             ),
     READ_RECONCILE_NOTIFY      (903, P0, rpcTimeout,   REQUEST_RESPONSE, () -> ReadReconcileNotify.serializer,        () -> ReadReconcileNotify.verbHandler                              ),
+    FORWARDING_WRITE           (904, P3, writeTimeout, MUTATION,         () -> ForwardedWrite.Request.serializer,     () -> ForwardedWrite.verbHandler),
 
     TRACKED_PARTITION_READ_RSP (906, P2, readTimeout,  REQUEST_RESPONSE, () -> TrackedDataResponse.serializer,        () -> ResponseVerbHandler.instance                                 ),
     TRACKED_PARTITION_READ_REQ (907, P3, readTimeout,  READ,             () -> TrackedRead.DataRequest.serializer,    () -> TrackedRead.verbHandler,           TRACKED_PARTITION_READ_RSP),
