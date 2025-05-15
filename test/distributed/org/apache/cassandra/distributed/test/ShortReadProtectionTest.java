@@ -41,6 +41,7 @@ import org.apache.cassandra.distributed.Cluster;
 import org.apache.cassandra.distributed.api.ConsistencyLevel;
 import org.apache.cassandra.distributed.api.IInvokableInstance;
 import org.apache.cassandra.distributed.shared.AssertUtils;
+import org.apache.cassandra.schema.ReplicationType;
 import org.apache.cassandra.utils.ByteBufferUtil;
 
 import static com.google.common.collect.Iterators.toArray;
@@ -81,14 +82,19 @@ public class ShortReadProtectionTest extends TestBaseImpl
     @Parameterized.Parameter(2)
     public boolean paging;
 
-    @Parameterized.Parameters(name = "{index}: read_cl={0} flush={1} paging={2}")
+    @Parameterized.Parameter(3)
+    public ReplicationType replicationType;
+
+    @Parameterized.Parameters(name = "{index}: read_cl={0} flush={1} paging={2} replication={3}")
     public static Collection<Object[]> data()
     {
         List<Object[]> result = new ArrayList<>();
         for (ConsistencyLevel readConsistencyLevel : Arrays.asList(ALL, QUORUM))
             for (boolean flush : BOOLEANS)
                 for (boolean paging : BOOLEANS)
-                    result.add(new Object[]{ readConsistencyLevel, flush, paging });
+                    for (ReplicationType replication : ReplicationType.values())
+                        result.add(new Object[]{ readConsistencyLevel, flush, paging, replication});
+
         return result;
     }
 
@@ -111,7 +117,7 @@ public class ShortReadProtectionTest extends TestBaseImpl
     @Before
     public void setupTester()
     {
-        tester = new Tester(readConsistencyLevel, flush, paging);
+        tester = new Tester(readConsistencyLevel, flush, paging, replicationType);
     }
 
     @After
@@ -149,7 +155,8 @@ public class ShortReadProtectionTest extends TestBaseImpl
     {
         tester.createTable("CREATE TABLE %s (id int PRIMARY KEY)")
               .allNodes(0, 10, i -> format("INSERT INTO %%s (id) VALUES (%d) USING TIMESTAMP 0", i)) // order is 5,1,8,0,2,4,7,6,9,3
-              .toNode1("DELETE FROM %s WHERE id IN (1, 0, 4, 6, 3)") // delete every other row
+//              .toNode1("DELETE FROM %s WHERE id IN (1, 0, 4, 6, 3)") // delete every other row
+              .toNode1(IntStream.of(1, 0, 4, 6, 3).mapToObj(k -> "DELETE FROM %s WHERE id=" + k).toArray(String[]::new)) // FIXME: revert once mutation tracking supports mutations with pk IN
               .assertRows("SELECT DISTINCT token(id), id FROM %s",
                           row(token(5), 5), row(token(8), 8), row(token(2), 2), row(token(7), 7), row(token(9), 9));
     }
@@ -166,8 +173,10 @@ public class ShortReadProtectionTest extends TestBaseImpl
     {
         tester.createTable("CREATE TABLE %s (id int PRIMARY KEY)")
               .allNodes(0, 10, i -> format("INSERT INTO %%s (id) VALUES (%d) USING TIMESTAMP 0", i)) // order is 5,1,8,0,2,4,7,6,9,3
-              .toNode1("DELETE FROM %s WHERE id IN (5, 8, 2, 7, 9)") // delete every other row
-              .toNode2("DELETE FROM %s WHERE id IN (1, 0, 4, 6)") // delete every other row but the last one
+//              .toNode1("DELETE FROM %s WHERE id IN (5, 8, 2, 7, 9)") // delete every other row
+              .toNode1(IntStream.of(5, 8, 2, 7, 9).mapToObj(k -> "DELETE FROM %s WHERE id=" + k).toArray(String[]::new)) // FIXME: revert once mutation tracking supports mutations with pk IN
+//              .toNode2("DELETE FROM %s WHERE id IN (1, 0, 4, 6)") // delete every other row but the last one
+              .toNode2(IntStream.of(1, 0, 4, 6).mapToObj(k -> "DELETE FROM %s WHERE id=" + k).toArray(String[]::new)) // FIXME: revert once mutation tracking supports mutations with pk IN
               .assertRows("SELECT id FROM %s LIMIT 1", row(3))
               .assertRows("SELECT DISTINCT id FROM %s LIMIT 1", row(3));
     }
@@ -417,15 +426,19 @@ public class ShortReadProtectionTest extends TestBaseImpl
         private final ConsistencyLevel readConsistencyLevel;
         private final boolean flush, paging;
         private final String qualifiedTableName;
+        private final ReplicationType replicationType;
 
+        private final String keyspaceName = "ks_" + seqNumber.getAndIncrement();
         private boolean flushed = false;
 
-        private Tester(ConsistencyLevel readConsistencyLevel, boolean flush, boolean paging)
+        private Tester(ConsistencyLevel readConsistencyLevel, boolean flush, boolean paging, ReplicationType replicationType)
         {
             this.readConsistencyLevel = readConsistencyLevel;
             this.flush = flush;
             this.paging = paging;
-            qualifiedTableName = KEYSPACE + ".t_" + seqNumber.getAndIncrement();
+            this.replicationType = replicationType;
+
+            qualifiedTableName = this.keyspaceName + ".tbl";
 
             assert readConsistencyLevel == ALL || readConsistencyLevel == QUORUM
             : "Only ALL and QUORUM consistency levels are supported";
@@ -433,6 +446,8 @@ public class ShortReadProtectionTest extends TestBaseImpl
 
         private Tester createTable(String query)
         {
+            cluster.schemaChange(String.format("CREATE KEYSPACE IF NOT EXISTS %s WITH REPLICATION={'class': 'SimpleStrategy', 'replication_factor': " + NUM_NODES + "} AND replication_type='%s'",
+                                               keyspaceName, replicationType.name()));
             cluster.schemaChange(format(query) + " WITH read_repair='NONE'");
             return this;
         }

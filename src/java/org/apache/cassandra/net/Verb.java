@@ -88,6 +88,7 @@ import org.apache.cassandra.service.paxos.cleanup.PaxosCleanupResponse;
 import org.apache.cassandra.service.paxos.cleanup.PaxosCleanupComplete;
 import org.apache.cassandra.service.paxos.cleanup.PaxosStartPrepareCleanup;
 import org.apache.cassandra.service.paxos.cleanup.PaxosFinishPrepareCleanup;
+import org.apache.cassandra.service.reads.tracked.*;
 import org.apache.cassandra.streaming.DataMovement;
 import org.apache.cassandra.streaming.DataMovementVerbHandler;
 import org.apache.cassandra.tcm.Discovery;
@@ -241,6 +242,18 @@ public enum Verb
     TCM_DISCOVER_REQ       (813, P0, rpcTimeout,      INTERNAL_METADATA,    () -> NoPayload.serializer,                         () -> Discovery.instance.requestHandler,    TCM_DISCOVER_RSP       ),
     TCM_FETCH_PEER_LOG_RSP (818, P0, rpcTimeout,      FETCH_LOG,            MessageSerializers::logStateSerializer,             () -> ResponseVerbHandler.instance                                 ),
     TCM_FETCH_PEER_LOG_REQ (819, P0, rpcTimeout,      FETCH_LOG,            () -> FetchPeerLog.serializer,                      () -> FetchPeerLog.Handler.instance,        TCM_FETCH_PEER_LOG_RSP ),
+
+    // tracked replication
+    READ_RECONCILE_SEND        (901, P0, rpcTimeout,   READ,             () -> ReadReconcileSend.serializer,          () -> ReadReconcileSend.verbHandler                                ),
+    READ_RECONCILE_RCV         (902, P0, rpcTimeout,   MUTATION,         () -> ReadReconcileReceive.serializer,       () -> ReadReconcileReceive.verbHandler                             ),
+    READ_RECONCILE_NOTIFY      (903, P0, rpcTimeout,   REQUEST_RESPONSE, () -> ReadReconcileNotify.serializer,        () -> ReadReconcileNotify.verbHandler                              ),
+
+    TRACKED_PARTITION_READ_RSP (906, P2, readTimeout,  REQUEST_RESPONSE, () -> TrackedDataResponse.serializer,        () -> ResponseVerbHandler.instance                                 ),
+    TRACKED_PARTITION_READ_REQ (907, P3, readTimeout,  READ,             () -> TrackedRead.DataRequest.serializer,    () -> TrackedRead.verbHandler,           TRACKED_PARTITION_READ_RSP),
+    TRACKED_RANGE_READ_RSP     (908, P2, rangeTimeout, REQUEST_RESPONSE, () -> TrackedDataResponse.serializer,        () -> ResponseVerbHandler.instance                                 ),
+    TRACKED_RANGE_READ_REQ     (909, P3, rangeTimeout, READ,             () -> TrackedRead.DataRequest.serializer,    () -> TrackedRead.verbHandler,           TRACKED_RANGE_READ_RSP    ),
+    TRACKED_SUMMARY_RSP        (910, P2, readTimeout,  REQUEST_RESPONSE, () -> TrackedSummaryResponse.serializer,     () -> TrackedSummaryResponse.verbHandler                           ),
+    TRACKED_SUMMARY_REQ        (911, P3, readTimeout,  READ,             () -> TrackedRead.SummaryRequest.serializer, () -> TrackedRead.verbHandler,           TRACKED_SUMMARY_RSP       ),
 
     INITIATE_DATA_MOVEMENTS_RSP (814, P1, rpcTimeout, MISC, () -> NoPayload.serializer,             () -> ResponseVerbHandler.instance                                  ),
     INITIATE_DATA_MOVEMENTS_REQ (815, P1, rpcTimeout, MISC, () -> DataMovement.serializer,          () -> DataMovementVerbHandler.instance, INITIATE_DATA_MOVEMENTS_RSP ),
