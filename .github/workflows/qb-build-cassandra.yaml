@@ -66,6 +66,6 @@ jobs:
         uses: netcracker/qubership-workflow-hub/actions/assets-action@main
         with:
           tag: ${{ github.ref_name }}
-          item-path: build/apache-cassandra-*.tar.gz, NEWS.txt, NOTICE.txt, ci
+          item-path: build/apache-cassandra-*.tar.gz
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
