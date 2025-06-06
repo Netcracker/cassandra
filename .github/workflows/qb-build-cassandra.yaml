@@ -63,7 +63,7 @@ jobs:
           name: apache-cassandra
 
       - name: "Upload assets"
-        uses: nookyo/qubership-workflow-hub/actions/assets-action@main
+        uses: netcracker/qubership-workflow-hub/actions/assets-action@main
         with:
           tag: ${{ github.ref_name }}
           item-path: build/apache-cassandra-*.tar.gz, NEWS.txt, NOTICE.txt, ci
