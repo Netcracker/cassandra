@@ -67,6 +67,5 @@ jobs:
         with:
           tag: ${{ github.ref_name }}
           item-path: build/apache-cassandra-*.tar.gz, NEWS.txt, NOTICE.txt, ci
-          compression-level: 9
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
