@@ -16,10 +16,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-name: Build TAR for Apache Cassandra
+name: Build .tgz for Apache Cassandra
 run-name: "Image for ${{ github.event.repository.name }}: ${{ github.run_number }} - ${{ github.actor }}"
 
-on: workflow_dispatch
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag name to create"
+        required: true
+        default: "latest"
+      forceCreate:
+        description: "Force tag creation"
+        required: false
+        default: "false"
 
 permissions:
   contents: write
@@ -30,6 +40,13 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Create a New Tag
+        uses: netcracker/qubership-workflow-hub/actions/tag-action@main
+        with:
+          ref: ${{ github.ref_name }}
+          tag-name: ${{ inputs.tag }}
+          force-create: ${{ inputs.forceCreate }}
 
       - name: Setup JDK
         uses: actions/setup-java@v4
@@ -63,6 +80,7 @@ jobs:
           name: apache-cassandra
 
       - name: "Upload assets"
+        if: success()
         uses: netcracker/qubership-workflow-hub/actions/assets-action@main
         with:
           tag: ${{ github.ref_name }}
