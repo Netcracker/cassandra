@@ -89,7 +89,7 @@ jobs:
         if: success()
         uses: netcracker/qubership-workflow-hub/actions/assets-action@main
         with:
-          tag: ${{ github.ref_name }}
+          tag: ${{ inputs.tag }}
           item-path: build/apache-cassandra-*.tar.gz, NEWS.txt, NOTICE.txt, ci
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
