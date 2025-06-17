@@ -27,9 +27,9 @@ import java.util.List;
 
 import org.apache.cassandra.stress.generate.PartitionGenerator;
 import org.apache.cassandra.stress.generate.SeedManager;
+import org.apache.cassandra.stress.report.Timer;
 import org.apache.cassandra.stress.settings.Command;
 import org.apache.cassandra.stress.settings.StressSettings;
-import org.apache.cassandra.stress.util.Timer;
 
 public class CqlCounterGetter extends CqlOperation<Integer>
 {
@@ -48,13 +48,13 @@ public class CqlCounterGetter extends CqlOperation<Integer>
     @Override
     protected String buildQuery()
     {
-        return "SELECT * FROM " + wrapInQuotes(type.table) + " WHERE KEY=?";
+        return "SELECT * FROM " + settings.schema.keyspace + '.' + wrapInQuotes(type.table) + " WHERE KEY=?";
     }
 
     @Override
-    protected CqlRunOp<Integer> buildRunOp(ClientWrapper client, String query, Object queryId, List<Object> params, ByteBuffer key)
+    protected CqlRunOp<Integer> buildRunOp(QueryExecutor<?> queryExecutor, List<Object> params, ByteBuffer key)
     {
-        return new CqlRunOpTestNonEmpty(client, query, queryId, params, key);
+        return new CqlRunOpTestNonEmpty(queryExecutor, params, key);
     }
 
 }

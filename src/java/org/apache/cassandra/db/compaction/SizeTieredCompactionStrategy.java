@@ -21,6 +21,7 @@ import java.util.*;
 import java.util.Map.Entry;
 
 import com.google.common.annotations.VisibleForTesting;
+import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Iterables;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -29,7 +30,7 @@ import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.Directories;
 import org.apache.cassandra.db.compaction.writers.CompactionAwareWriter;
 import org.apache.cassandra.db.compaction.writers.SplittingSizeTieredCompactionWriter;
-import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
+import org.apache.cassandra.db.lifecycle.ILifecycleTransaction;
 import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.schema.CompactionParams;
@@ -65,7 +66,8 @@ public class SizeTieredCompactionStrategy extends AbstractCompactionStrategy
 
     protected SizeTieredCompactionStrategyOptions sizeTieredOptions;
     protected volatile int estimatedRemainingTasks;
-    private final Set<SSTableReader> sstables = new HashSet<>();
+    @VisibleForTesting
+    protected final Set<SSTableReader> sstables = new HashSet<>();
 
     public SizeTieredCompactionStrategy(ColumnFamilyStore cfs, Map<String, String> options)
     {
@@ -74,7 +76,7 @@ public class SizeTieredCompactionStrategy extends AbstractCompactionStrategy
         this.sizeTieredOptions = new SizeTieredCompactionStrategyOptions(options);
     }
 
-    private synchronized List<SSTableReader> getNextBackgroundSSTables(final int gcBefore)
+    private synchronized List<SSTableReader> getNextBackgroundSSTables(final long gcBefore)
     {
         // make local copies so they can't be changed out from under us mid-method
         int minThreshold = cfs.getMinimumCompactionThreshold();
@@ -84,7 +86,8 @@ public class SizeTieredCompactionStrategy extends AbstractCompactionStrategy
 
         List<List<SSTableReader>> buckets = getBuckets(createSSTableAndLengthPairs(candidates), sizeTieredOptions.bucketHigh, sizeTieredOptions.bucketLow, sizeTieredOptions.minSSTableSize);
         logger.trace("Compaction buckets are {}", buckets);
-        updateEstimatedCompactionsByTasks(buckets);
+        estimatedRemainingTasks = getEstimatedCompactionsByTasks(cfs, buckets);
+        cfs.getCompactionStrategyManager().compactionLogger.pending(this, estimatedRemainingTasks);
         List<SSTableReader> mostInteresting = mostInterestingBucket(buckets, minThreshold, maxThreshold);
         if (!mostInteresting.isEmpty())
             return mostInteresting;
@@ -100,8 +103,7 @@ public class SizeTieredCompactionStrategy extends AbstractCompactionStrategy
         if (sstablesWithTombstones.isEmpty())
             return Collections.emptyList();
 
-        Collections.sort(sstablesWithTombstones, new SSTableReader.SizeComparator());
-        return Collections.singletonList(sstablesWithTombstones.get(0));
+        return Collections.singletonList(Collections.max(sstablesWithTombstones, SSTableReader.sizeComparator));
     }
 
 
@@ -173,29 +175,39 @@ public class SizeTieredCompactionStrategy extends AbstractCompactionStrategy
         return sstr.getReadMeter() == null ? 0.0 : sstr.getReadMeter().twoHourRate() / sstr.estimatedKeys();
     }
 
-    @SuppressWarnings("resource")
-    public synchronized AbstractCompactionTask getNextBackgroundTask(int gcBefore)
+    public Collection<AbstractCompactionTask> getNextBackgroundTasks(long gcBefore)
     {
+        List<SSTableReader> previousCandidate = null;
         while (true)
         {
             List<SSTableReader> hottestBucket = getNextBackgroundSSTables(gcBefore);
 
             if (hottestBucket.isEmpty())
-                return null;
+                return Collections.emptyList();
 
-            LifecycleTransaction transaction = cfs.getTracker().tryModify(hottestBucket, OperationType.COMPACTION);
+            // Already tried acquiring references without success. It means there is a race with
+            // the tracker but candidate SSTables were not yet replaced in the compaction strategy manager
+            if (hottestBucket.equals(previousCandidate))
+            {
+                logger.warn("Could not acquire references for compacting SSTables {} which is not a problem per se," +
+                            "unless it happens frequently, in which case it must be reported. Will retry later.",
+                            hottestBucket);
+                return Collections.emptyList();
+            }
+
+            ILifecycleTransaction transaction = cfs.getTracker().tryModify(hottestBucket, OperationType.COMPACTION);
             if (transaction != null)
-                return new CompactionTask(cfs, transaction, gcBefore);
+                return Collections.singletonList(new CompactionTask(cfs, transaction, gcBefore));
+            previousCandidate = hottestBucket;
         }
     }
 
-    @SuppressWarnings("resource")
-    public synchronized Collection<AbstractCompactionTask> getMaximalTask(final int gcBefore, boolean splitOutput)
+    public synchronized List<AbstractCompactionTask> getMaximalTasks(final long gcBefore, boolean splitOutput)
     {
         Iterable<SSTableReader> filteredSSTables = filterSuspectSSTables(sstables);
         if (Iterables.isEmpty(filteredSSTables))
             return null;
-        LifecycleTransaction txn = cfs.getTracker().tryModify(filteredSSTables, OperationType.COMPACTION);
+        ILifecycleTransaction txn = cfs.getTracker().tryModify(filteredSSTables, OperationType.COMPACTION);
         if (txn == null)
             return null;
         if (splitOutput)
@@ -203,12 +215,11 @@ public class SizeTieredCompactionStrategy extends AbstractCompactionStrategy
         return Arrays.<AbstractCompactionTask>asList(new CompactionTask(cfs, txn, gcBefore));
     }
 
-    @SuppressWarnings("resource")
-    public AbstractCompactionTask getUserDefinedTask(Collection<SSTableReader> sstables, final int gcBefore)
+    public AbstractCompactionTask getUserDefinedTask(Collection<SSTableReader> sstables, final long gcBefore)
     {
         assert !sstables.isEmpty(); // checked for by CM.submitUserDefined
 
-        LifecycleTransaction transaction = cfs.getTracker().tryModify(sstables, OperationType.COMPACTION);
+        ILifecycleTransaction transaction = cfs.getTracker().tryModify(sstables, OperationType.COMPACTION);
         if (transaction == null)
         {
             logger.trace("Unable to mark {} for compaction; probably a background compaction got to it first.  You can disable background compactions temporarily if this is a problem", sstables);
@@ -282,15 +293,15 @@ public class SizeTieredCompactionStrategy extends AbstractCompactionStrategy
         return new ArrayList<List<T>>(buckets.values());
     }
 
-    private void updateEstimatedCompactionsByTasks(List<List<SSTableReader>> tasks)
+    public static int getEstimatedCompactionsByTasks(ColumnFamilyStore cfs, List<List<SSTableReader>> tasks)
     {
         int n = 0;
-        for (List<SSTableReader> bucket: tasks)
+        for (List<SSTableReader> bucket : tasks)
         {
             if (bucket.size() >= cfs.getMinimumCompactionThreshold())
                 n += Math.ceil((double)bucket.size() / cfs.getMaximumCompactionThreshold());
         }
-        estimatedRemainingTasks = n;
+        return n;
     }
 
     public long getMaxSSTableBytes()
@@ -321,6 +332,12 @@ public class SizeTieredCompactionStrategy extends AbstractCompactionStrategy
         sstables.remove(sstable);
     }
 
+    @Override
+    protected synchronized Set<SSTableReader> getSSTables()
+    {
+        return ImmutableSet.copyOf(sstables);
+    }
+
     public String toString()
     {
         return String.format("SizeTieredCompactionStrategy[%s/%s]",
@@ -330,7 +347,7 @@ public class SizeTieredCompactionStrategy extends AbstractCompactionStrategy
 
     private static class SplittingCompactionTask extends CompactionTask
     {
-        public SplittingCompactionTask(ColumnFamilyStore cfs, LifecycleTransaction txn, int gcBefore)
+        public SplittingCompactionTask(ColumnFamilyStore cfs, ILifecycleTransaction txn, long gcBefore)
         {
             super(cfs, txn, gcBefore);
         }
@@ -338,7 +355,7 @@ public class SizeTieredCompactionStrategy extends AbstractCompactionStrategy
         @Override
         public CompactionAwareWriter getCompactionAwareWriter(ColumnFamilyStore cfs,
                                                               Directories directories,
-                                                              LifecycleTransaction txn,
+                                                              ILifecycleTransaction txn,
                                                               Set<SSTableReader> nonExpiredSSTables)
         {
             return new SplittingSizeTieredCompactionWriter(cfs, directories, txn, nonExpiredSSTables);

@@ -22,10 +22,8 @@ package org.apache.cassandra.stress.generate;
 
 
 import java.nio.ByteBuffer;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.NoSuchElementException;
+import java.util.*;
+import java.util.stream.Collectors;
 
 import com.google.common.collect.Iterables;
 
@@ -71,7 +69,7 @@ public class PartitionGenerator
         }
         this.maxRowCount = maxRowCount;
         this.minRowCount = minRowCount;
-        this.indexMap = new HashMap<>();
+        this.indexMap = new LinkedHashMap<>();
         int i = 0;
         for (Generator generator : partitionKey)
             indexMap.put(generator.name, --i);
@@ -85,6 +83,16 @@ public class PartitionGenerator
         return !(index < 0 || index < clusteringComponents.size());
     }
 
+    public List<Generator> getPartitionKey()
+    {
+        return Collections.unmodifiableList(partitionKey);
+    }
+
+    public List<Generator> getClusteringComponents()
+    {
+        return Collections.unmodifiableList(clusteringComponents);
+    }
+
     public int indexOf(String name)
     {
         Integer i = indexMap.get(name);
@@ -96,10 +104,10 @@ public class PartitionGenerator
     public ByteBuffer convert(int c, Object v)
     {
         if (c < 0)
-            return partitionKey.get(-1-c).type.decompose(v);
+            return partitionKey.get(-1-c).type.decomposeUntyped(v);
         if (c < clusteringComponents.size())
-            return clusteringComponents.get(c).type.decompose(v);
-        return valueComponents.get(c - clusteringComponents.size()).type.decompose(v);
+            return clusteringComponents.get(c).type.decomposeUntyped(v);
+        return valueComponents.get(c - clusteringComponents.size()).type.decomposeUntyped(v);
     }
 
     public Object convert(int c, ByteBuffer v)
@@ -109,5 +117,10 @@ public class PartitionGenerator
         if (c < clusteringComponents.size())
             return clusteringComponents.get(c).type.compose(v);
         return valueComponents.get(c - clusteringComponents.size()).type.compose(v);
+    }
+
+    public List<String> getColumnNames()
+    {
+        return indexMap.keySet().stream().collect(Collectors.toList());
     }
 }

@@ -18,24 +18,27 @@
 
 package org.apache.cassandra.service;
 
-import java.net.InetAddress;
 import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
 
+import org.apache.cassandra.exceptions.RequestFailure;
 import org.apache.cassandra.exceptions.WriteFailureException;
 import org.apache.cassandra.exceptions.WriteTimeoutException;
-import org.apache.cassandra.net.MessageIn;
+import org.apache.cassandra.locator.InetAddressAndPort;
+import org.apache.cassandra.net.Message;
+import org.apache.cassandra.transport.Dispatcher;
 
 public class BatchlogResponseHandler<T> extends AbstractWriteResponseHandler<T>
 {
-    AbstractWriteResponseHandler<T> wrapped;
-    BatchlogCleanup cleanup;
+    final AbstractWriteResponseHandler<T> wrapped;
+    final BatchlogCleanup cleanup;
     protected volatile int requiredBeforeFinish;
+
     private static final AtomicIntegerFieldUpdater<BatchlogResponseHandler> requiredBeforeFinishUpdater
             = AtomicIntegerFieldUpdater.newUpdater(BatchlogResponseHandler.class, "requiredBeforeFinish");
 
-    public BatchlogResponseHandler(AbstractWriteResponseHandler<T> wrapped, int requiredBeforeFinish, BatchlogCleanup cleanup)
+    public BatchlogResponseHandler(AbstractWriteResponseHandler<T> wrapped, int requiredBeforeFinish, BatchlogCleanup cleanup, Dispatcher.RequestTime requestTime)
     {
-        super(wrapped.keyspace, wrapped.naturalEndpoints, wrapped.pendingEndpoints, wrapped.consistencyLevel, wrapped.callback, wrapped.writeType);
+        super(wrapped.replicaPlan, wrapped.callback, wrapped.writeType, null, requestTime);
         this.wrapped = wrapped;
         this.requiredBeforeFinish = requiredBeforeFinish;
         this.cleanup = cleanup;
@@ -46,26 +49,21 @@ public class BatchlogResponseHandler<T> extends AbstractWriteResponseHandler<T>
         return wrapped.ackCount();
     }
 
-    public void response(MessageIn<T> msg)
+    public void onResponse(Message<T> msg)
     {
-        wrapped.response(msg);
+        wrapped.onResponse(msg);
         if (requiredBeforeFinishUpdater.decrementAndGet(this) == 0)
             cleanup.ackMutation();
     }
 
-    public boolean isLatencyForSnitch()
+    public void onFailure(InetAddressAndPort from, RequestFailure failure)
     {
-        return wrapped.isLatencyForSnitch();
+        wrapped.onFailure(from, failure);
     }
 
-    public void onFailure(InetAddress from)
+    public boolean invokeOnFailure()
     {
-        wrapped.onFailure(from);
-    }
-
-    public void assureSufficientLiveNodes()
-    {
-        wrapped.assureSufficientLiveNodes();
+        return wrapped.invokeOnFailure();
     }
 
     public void get() throws WriteTimeoutException, WriteFailureException
@@ -73,17 +71,17 @@ public class BatchlogResponseHandler<T> extends AbstractWriteResponseHandler<T>
         wrapped.get();
     }
 
-    protected int totalBlockFor()
+    protected int blockFor()
     {
-        return wrapped.totalBlockFor();
+        return wrapped.blockFor();
     }
 
-    protected int totalEndpoints()
+    protected int candidateReplicaCount()
     {
-        return wrapped.totalEndpoints();
+        return wrapped.candidateReplicaCount();
     }
 
-    protected boolean waitingFor(InetAddress from)
+    protected boolean waitingFor(InetAddressAndPort from)
     {
         return wrapped.waitingFor(from);
     }
@@ -107,6 +105,11 @@ public class BatchlogResponseHandler<T> extends AbstractWriteResponseHandler<T>
             this.callback = callback;
         }
 
+        public BatchlogCleanup(BatchlogCleanupCallback callback)
+        {
+            this.callback = callback;
+        }
+
         public int decrement()
         {
             return mutationsWaitingForUpdater.decrementAndGet(this);
@@ -116,6 +119,11 @@ public class BatchlogResponseHandler<T> extends AbstractWriteResponseHandler<T>
         {
             if (decrement() == 0)
                 callback.invoke();
+        }
+
+        public void setMutationsWaitingFor(int mutationsWaitingFor)
+        {
+            mutationsWaitingForUpdater.lazySet(this, mutationsWaitingFor);
         }
     }
 

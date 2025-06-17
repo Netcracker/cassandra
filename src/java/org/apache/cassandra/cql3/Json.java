@@ -18,48 +18,38 @@
 package org.apache.cassandra.cql3;
 
 import java.io.IOException;
-import java.nio.ByteBuffer;
-import java.util.*;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 
-import org.apache.cassandra.config.CFMetaData;
-import org.apache.cassandra.config.ColumnDefinition;
 import org.apache.cassandra.cql3.functions.Function;
+import org.apache.cassandra.cql3.terms.Constants;
+import org.apache.cassandra.cql3.terms.Term;
+import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.db.marshal.UTF8Type;
 import org.apache.cassandra.exceptions.InvalidRequestException;
+import org.apache.cassandra.schema.ColumnMetadata;
+import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.serializers.MarshalException;
-import org.codehaus.jackson.io.JsonStringEncoder;
-import org.codehaus.jackson.map.ObjectMapper;
+import org.apache.cassandra.utils.JsonUtils;
 
-/** Term-related classes for INSERT JSON support. */
-public class Json
+import static java.lang.String.format;
+
+/**
+ * Term-related classes for INSERT JSON support.
+ */
+public final class Json
 {
-    public static final ObjectMapper JSON_OBJECT_MAPPER = new ObjectMapper();
-
     public static final ColumnIdentifier JSON_COLUMN_ID = new ColumnIdentifier("[json]", true);
 
-    /**
-     * Quotes string contents using standard JSON quoting.
-     */
-    public static String quoteAsJsonString(String s)
+    private Json()
     {
-        return new String(JsonStringEncoder.getInstance().quoteAsString(s));
-    }
-
-    public static Object decodeJson(String json)
-    {
-        try
-        {
-            return JSON_OBJECT_MAPPER.readValue(json, Object.class);
-        }
-        catch (IOException exc)
-        {
-            throw new MarshalException("Error decoding JSON string: " + exc.getMessage());
-        }
     }
 
     public interface Raw
     {
-        public Prepared prepareAndCollectMarkers(CFMetaData metadata, Collection<ColumnDefinition> receivers, VariableSpecifications boundNames);
+        public Prepared prepareAndCollectMarkers(TableMetadata metadata, Collection<ColumnMetadata> receivers, VariableSpecifications boundNames);
     }
 
     /**
@@ -75,7 +65,7 @@ public class Json
             this.text = text;
         }
 
-        public Prepared prepareAndCollectMarkers(CFMetaData metadata, Collection<ColumnDefinition> receivers, VariableSpecifications boundNames)
+        public Prepared prepareAndCollectMarkers(TableMetadata metadata, Collection<ColumnMetadata> receivers, VariableSpecifications boundNames)
         {
             return new PreparedLiteral(parseJson(text, receivers));
         }
@@ -94,15 +84,15 @@ public class Json
             this.bindIndex = bindIndex;
         }
 
-        public Prepared prepareAndCollectMarkers(CFMetaData metadata, Collection<ColumnDefinition> receivers, VariableSpecifications boundNames)
+        public Prepared prepareAndCollectMarkers(TableMetadata metadata, Collection<ColumnMetadata> receivers, VariableSpecifications boundNames)
         {
             boundNames.add(bindIndex, makeReceiver(metadata));
             return new PreparedMarker(bindIndex, receivers);
         }
 
-        private ColumnSpecification makeReceiver(CFMetaData metadata)
+        private ColumnSpecification makeReceiver(TableMetadata metadata)
         {
-            return new ColumnSpecification(metadata.ksName, metadata.cfName, JSON_COLUMN_ID, UTF8Type.instance);
+            return new ColumnSpecification(metadata.keyspace, metadata.name, JSON_COLUMN_ID, UTF8Type.instance);
         }
     }
 
@@ -111,7 +101,7 @@ public class Json
      */
     public static abstract class Prepared
     {
-        public abstract Term.Raw getRawTermForColumn(ColumnDefinition def);
+        public abstract Term.Raw getRawTermForColumn(ColumnMetadata def, boolean defaultUnset);
     }
 
     /**
@@ -126,36 +116,38 @@ public class Json
             this.columnMap = columnMap;
         }
 
-        public Term.Raw getRawTermForColumn(ColumnDefinition def)
+        public Term.Raw getRawTermForColumn(ColumnMetadata def, boolean defaultUnset)
         {
             Term value = columnMap.get(def.name);
-            return value == null ? Constants.NULL_LITERAL : new ColumnValue(value);
+            return value == null
+                   ? (defaultUnset ? Constants.UNSET_LITERAL : Constants.NULL_LITERAL)
+                   : new ColumnValue(value);
         }
     }
 
     /**
-     *  A prepared bind marker for a set of JSON values
+     * A prepared bind marker for a set of JSON values
      */
     private static class PreparedMarker extends Prepared
     {
         private final int bindIndex;
-        private final Collection<ColumnDefinition> columns;
+        private final Collection<ColumnMetadata> columns;
 
-        public PreparedMarker(int bindIndex, Collection<ColumnDefinition> columns)
+        public PreparedMarker(int bindIndex, Collection<ColumnMetadata> columns)
         {
             this.bindIndex = bindIndex;
             this.columns = columns;
         }
 
-        public RawDelayedColumnValue getRawTermForColumn(ColumnDefinition def)
+        public RawDelayedColumnValue getRawTermForColumn(ColumnMetadata def, boolean defaultUnset)
         {
-            return new RawDelayedColumnValue(this, def);
+            return new RawDelayedColumnValue(this, def, defaultUnset);
         }
     }
 
     /**
      * A Terminal for a single column.
-     *
+     * <p>
      * Note that this is intrinsically an already prepared term, but this still implements Term.Raw so that we can
      * easily use it to create raw operations.
      */
@@ -180,6 +172,11 @@ public class Json
             return TestResult.NOT_ASSIGNABLE;
         }
 
+        public AbstractType<?> getExactTypeIfKnown(String keyspace)
+        {
+            return null;
+        }
+
         public String getText()
         {
             return term.toString();
@@ -192,24 +189,31 @@ public class Json
     private static class RawDelayedColumnValue extends Term.Raw
     {
         private final PreparedMarker marker;
-        private final ColumnDefinition column;
+        private final ColumnMetadata column;
+        private final boolean defaultUnset;
 
-        public RawDelayedColumnValue(PreparedMarker prepared, ColumnDefinition column)
+        public RawDelayedColumnValue(PreparedMarker prepared, ColumnMetadata column, boolean defaultUnset)
         {
             this.marker = prepared;
             this.column = column;
+            this.defaultUnset = defaultUnset;
         }
 
         @Override
         public Term prepare(String keyspace, ColumnSpecification receiver) throws InvalidRequestException
         {
-            return new DelayedColumnValue(marker, column);
+            return new DelayedColumnValue(marker, column, defaultUnset);
         }
 
         @Override
         public TestResult testAssignment(String keyspace, ColumnSpecification receiver)
         {
             return TestResult.WEAKLY_ASSIGNABLE;
+        }
+
+        public AbstractType<?> getExactTypeIfKnown(String keyspace)
+        {
+            return null;
         }
 
         public String getText()
@@ -224,12 +228,14 @@ public class Json
     private static class DelayedColumnValue extends Term.NonTerminal
     {
         private final PreparedMarker marker;
-        private final ColumnDefinition column;
+        private final ColumnMetadata column;
+        private final boolean defaultUnset;
 
-        public DelayedColumnValue(PreparedMarker prepared, ColumnDefinition column)
+        public DelayedColumnValue(PreparedMarker prepared, ColumnMetadata column, boolean defaultUnset)
         {
             this.marker = prepared;
             this.column = column;
+            this.defaultUnset = defaultUnset;
         }
 
         @Override
@@ -248,7 +254,9 @@ public class Json
         public Terminal bind(QueryOptions options) throws InvalidRequestException
         {
             Term term = options.getJsonColumnValue(marker.bindIndex, column.name, marker.columns);
-            return term == null ? null : term.bind(options);
+            return term == null
+                   ? (defaultUnset ? Constants.UNSET_VALUE : null)
+                   : term.bind(options);
         }
 
         @Override
@@ -260,24 +268,30 @@ public class Json
     /**
      * Given a JSON string, return a map of columns to their values for the insert.
      */
-    public static Map<ColumnIdentifier, Term> parseJson(String jsonString, Collection<ColumnDefinition> expectedReceivers)
+    static Map<ColumnIdentifier, Term> parseJson(String jsonString, Collection<ColumnMetadata> expectedReceivers)
     {
         try
         {
-            Map<String, Object> valueMap = JSON_OBJECT_MAPPER.readValue(jsonString, Map.class);
+            Map<String, Object> valueMap = JsonUtils.JSON_OBJECT_MAPPER.readValue(jsonString, Map.class);
 
             if (valueMap == null)
                 throw new InvalidRequestException("Got null for INSERT JSON values");
 
-            handleCaseSensitivity(valueMap);
+            JsonUtils.handleCaseSensitivity(valueMap);
 
             Map<ColumnIdentifier, Term> columnMap = new HashMap<>(expectedReceivers.size());
             for (ColumnSpecification spec : expectedReceivers)
             {
+                // We explicitely test containsKey() because the value itself can be null, and we want to distinguish an
+                // explicit null value from no value
+                if (!valueMap.containsKey(spec.name.toString()))
+                    continue;
+
                 Object parsedJsonObject = valueMap.remove(spec.name.toString());
                 if (parsedJsonObject == null)
                 {
-                    columnMap.put(spec.name, null);
+                    // This is an explicit user null
+                    columnMap.put(spec.name, Constants.NULL_VALUE);
                 }
                 else
                 {
@@ -285,49 +299,28 @@ public class Json
                     {
                         columnMap.put(spec.name, spec.type.fromJSONObject(parsedJsonObject));
                     }
-                    catch(MarshalException exc)
+                    catch (MarshalException exc)
                     {
-                        throw new InvalidRequestException(String.format("Error decoding JSON value for %s: %s", spec.name, exc.getMessage()));
+                        throw new InvalidRequestException(format("Error decoding JSON value for %s: %s", spec.name, exc.getMessage()));
                     }
                 }
             }
 
             if (!valueMap.isEmpty())
             {
-                throw new InvalidRequestException(String.format(
-                        "JSON values map contains unrecognized column: %s", valueMap.keySet().iterator().next()));
+                throw new InvalidRequestException(format("JSON values map contains unrecognized column: %s",
+                                                         valueMap.keySet().iterator().next()));
             }
 
             return columnMap;
         }
         catch (IOException exc)
         {
-            throw new InvalidRequestException(String.format("Could not decode JSON string as a map: %s. (String was: %s)", exc.toString(), jsonString));
+            throw new InvalidRequestException(format("Could not decode JSON string as a map: %s. (String was: %s)", exc.toString(), jsonString));
         }
         catch (MarshalException exc)
         {
             throw new InvalidRequestException(exc.getMessage());
-        }
-    }
-
-    /**
-     * Handles unquoting and case-insensitivity in map keys.
-     */
-    public static void handleCaseSensitivity(Map<String, Object> valueMap)
-    {
-        for (String mapKey : new ArrayList<>(valueMap.keySet()))
-        {
-            // if it's surrounded by quotes, remove them and preserve the case
-            if (mapKey.startsWith("\"") && mapKey.endsWith("\""))
-            {
-                valueMap.put(mapKey.substring(1, mapKey.length() - 1), valueMap.remove(mapKey));
-                continue;
-            }
-
-            // otherwise, lowercase it if needed
-            String lowered = mapKey.toLowerCase(Locale.US);
-            if (!mapKey.equals(lowered))
-                valueMap.put(lowered, valueMap.remove(mapKey));
         }
     }
 }

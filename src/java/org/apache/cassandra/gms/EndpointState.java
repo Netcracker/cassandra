@@ -18,69 +18,130 @@
 package org.apache.cassandra.gms;
 
 import java.io.*;
-import java.util.Collections;
-import java.util.EnumMap;
-import java.util.Map;
-import java.util.Set;
+import java.util.*;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.Collectors;
 
+import javax.annotation.Nullable;
+
+import com.google.common.annotations.VisibleForTesting;
+
+import com.google.common.base.Function;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.config.CassandraRelevantProperties;
 import org.apache.cassandra.db.TypeSizes;
 import org.apache.cassandra.io.IVersionedSerializer;
 import org.apache.cassandra.io.util.DataInputPlus;
 import org.apache.cassandra.io.util.DataOutputPlus;
+import org.apache.cassandra.tcm.ClusterMetadata;
+import org.apache.cassandra.utils.CassandraVersion;
+import org.apache.cassandra.utils.NullableSerializer;
+
+import static org.apache.cassandra.utils.Clock.Global.nanoTime;
+
 /**
  * This abstraction represents both the HeartBeatState and the ApplicationState in an EndpointState
  * instance. Any state for a given endpoint can be retrieved from this instance.
  */
-
-
 public class EndpointState
 {
     protected static final Logger logger = LoggerFactory.getLogger(EndpointState.class);
 
-    public final static IVersionedSerializer<EndpointState> serializer = new EndpointStateSerializer();
+    static volatile boolean LOOSE_DEF_OF_EMPTY_ENABLED = CassandraRelevantProperties.LOOSE_DEF_OF_EMPTY_ENABLED.getBoolean();
 
-    private volatile HeartBeatState hbState;
-    private final AtomicReference<Map<ApplicationState, VersionedValue>> applicationState;
+    public final static IVersionedSerializer<EndpointState> serializer = new EndpointStateSerializer();
+    public final static IVersionedSerializer<EndpointState> nullableSerializer = NullableSerializer.wrap(serializer);
+
+    private static class View
+    {
+        final HeartBeatState hbState;
+        final Map<ApplicationState, VersionedValue> applicationState;
+
+        private View(HeartBeatState hbState, Map<ApplicationState, VersionedValue> applicationState)
+        {
+            this.hbState = hbState;
+            this.applicationState = applicationState;
+        }
+    }
+
+    private final AtomicReference<View> ref;
 
     /* fields below do not get serialized */
     private volatile long updateTimestamp;
     private volatile boolean isAlive;
 
-    EndpointState(HeartBeatState initialHbState)
+    public EndpointState(HeartBeatState initialHbState)
     {
-        this(initialHbState, new EnumMap<ApplicationState, VersionedValue>(ApplicationState.class));
+        this(initialHbState, new EnumMap<>(ApplicationState.class));
     }
 
-    EndpointState(HeartBeatState initialHbState, Map<ApplicationState, VersionedValue> states)
+    public EndpointState(EndpointState other)
     {
-        hbState = initialHbState;
-        applicationState = new AtomicReference<Map<ApplicationState, VersionedValue>>(new EnumMap<>(states));
-        updateTimestamp = System.nanoTime();
+        ref = new AtomicReference<>(other.ref.get());
+        updateTimestamp = nanoTime();
         isAlive = true;
     }
 
-    HeartBeatState getHeartBeatState()
+    @VisibleForTesting
+    public EndpointState(HeartBeatState initialHbState, Map<ApplicationState, VersionedValue> states)
     {
-        return hbState;
+        ref = new AtomicReference<>(new View(initialHbState, new EnumMap<>(states)));
+        updateTimestamp = nanoTime();
+        isAlive = true;
     }
 
-    void setHeartBeatState(HeartBeatState newHbState)
+    @VisibleForTesting
+    public HeartBeatState getHeartBeatState()
     {
-        updateTimestamp();
-        hbState = newHbState;
+        return ref.get().hbState;
+    }
+
+    public void updateHeartBeat()
+    {
+        updateHeartBeat(HeartBeatState::updateHeartBeat);
+    }
+
+    public void forceNewerGenerationUnsafe()
+    {
+        updateHeartBeat(HeartBeatState::forceNewerGenerationUnsafe);
+    }
+
+    @VisibleForTesting
+    public void forceHighestPossibleVersionUnsafe()
+    {
+        updateHeartBeat(HeartBeatState::forceHighestPossibleVersionUnsafe);
+    }
+
+    private void updateHeartBeat(Function<HeartBeatState, HeartBeatState> fn)
+    {
+        HeartBeatState previous = null;
+        HeartBeatState update = null;
+        while (true)
+        {
+            View view = ref.get();
+            if (previous == null || view.hbState != previous) // if this races with updating states then can avoid bumping versions
+                update = fn.apply(view.hbState);
+            if (ref.compareAndSet(view, new View(update, view.applicationState)))
+                return;
+            previous = view.hbState;
+        }
     }
 
     public VersionedValue getApplicationState(ApplicationState key)
     {
-        return applicationState.get().get(key);
+        return ref.get().applicationState.get(key);
+    }
+
+    public boolean containsApplicationState(ApplicationState key)
+    {
+        return ref.get().applicationState.containsKey(key);
     }
 
     public Set<Map.Entry<ApplicationState, VersionedValue>> states()
     {
-        return applicationState.get().entrySet();
+        return ref.get().applicationState.entrySet();
     }
 
     public void addApplicationState(ApplicationState key, VersionedValue value)
@@ -95,17 +156,69 @@ public class EndpointState
 
     public void addApplicationStates(Set<Map.Entry<ApplicationState, VersionedValue>> values)
     {
+        addApplicationStates(values, null);
+    }
+
+    public void addApplicationStates(Set<Map.Entry<ApplicationState, VersionedValue>> values, @Nullable HeartBeatState hbState)
+    {
         while (true)
         {
-            Map<ApplicationState, VersionedValue> orig = applicationState.get();
+            View view = this.ref.get();
+            Map<ApplicationState, VersionedValue> orig = view.applicationState;
             Map<ApplicationState, VersionedValue> copy = new EnumMap<>(orig);
 
             for (Map.Entry<ApplicationState, VersionedValue> value : values)
                 copy.put(value.getKey(), value.getValue());
 
-            if (applicationState.compareAndSet(orig, copy))
+            if (this.ref.compareAndSet(view, new View(hbState == null ? view.hbState : hbState, copy)))
+            {
+                if (hbState != null)
+                    updateTimestamp();
+                return;
+            }
+        }
+    }
+
+    void removeMajorVersion3LegacyApplicationStates()
+    {
+        while (hasLegacyFields())
+        {
+            View view = ref.get();
+            Map<ApplicationState, VersionedValue> orig = view.applicationState;
+            Map<ApplicationState, VersionedValue> updatedStates = filterMajorVersion3LegacyApplicationStates(orig);
+            // avoid updating if no state is removed
+            if (orig.size() == updatedStates.size()
+                || ref.compareAndSet(view, new View(view.hbState, updatedStates)))
                 return;
         }
+    }
+
+    private boolean hasLegacyFields()
+    {
+        Set<ApplicationState> statesPresent = ref.get().applicationState.keySet();
+        if (statesPresent.isEmpty())
+            return false;
+        return (statesPresent.contains(ApplicationState.STATUS) && statesPresent.contains(ApplicationState.STATUS_WITH_PORT))
+               || (statesPresent.contains(ApplicationState.INTERNAL_IP) && statesPresent.contains(ApplicationState.INTERNAL_ADDRESS_AND_PORT))
+               || (statesPresent.contains(ApplicationState.RPC_ADDRESS) && statesPresent.contains(ApplicationState.NATIVE_ADDRESS_AND_PORT));
+    }
+
+    private static Map<ApplicationState, VersionedValue> filterMajorVersion3LegacyApplicationStates(Map<ApplicationState, VersionedValue> states)
+    {
+        return states.entrySet().stream().filter(entry -> {
+                // Filter out pre-4.0 versions of data for more complete 4.0 versions
+                switch (entry.getKey())
+                {
+                    case INTERNAL_IP:
+                        return !states.containsKey(ApplicationState.INTERNAL_ADDRESS_AND_PORT);
+                    case STATUS:
+                        return !states.containsKey(ApplicationState.STATUS_WITH_PORT);
+                    case RPC_ADDRESS:
+                        return !states.containsKey(ApplicationState.NATIVE_ADDRESS_AND_PORT);
+                    default:
+                        return true;
+                }
+            }).collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue));
     }
 
     /* getters and setters */
@@ -119,7 +232,13 @@ public class EndpointState
 
     void updateTimestamp()
     {
-        updateTimestamp = System.nanoTime();
+        updateTimestamp = nanoTime();
+    }
+
+    @VisibleForTesting
+    public void unsafeSetUpdateTimestamp(long value)
+    {
+        updateTimestamp = value;
     }
 
     public boolean isAlive()
@@ -127,14 +246,41 @@ public class EndpointState
         return isAlive;
     }
 
-    void markAlive()
+    @VisibleForTesting
+    public void markAlive()
     {
         isAlive = true;
     }
 
-    void markDead()
+    @VisibleForTesting
+    public void markDead()
     {
         isAlive = false;
+    }
+
+    public boolean isStateEmpty()
+    {
+        return ref.get().applicationState.isEmpty();
+    }
+
+    /**
+     * @return true if {@link HeartBeatState#isEmpty()} is true and no STATUS application state exists
+     */
+    public boolean isEmptyWithoutStatus()
+    {
+        View view = ref.get();
+        Map<ApplicationState, VersionedValue> state = view.applicationState;
+        boolean hasStatus = state.containsKey(ApplicationState.STATUS_WITH_PORT) || state.containsKey(ApplicationState.STATUS);
+        return view.hbState.isEmpty() && !hasStatus
+               // In the very specific case where hbState.isEmpty and STATUS is missing, this is known to be safe to "fake"
+               // the data, as this happens when the gossip state isn't coming from the node but instead from a peer who
+               // restarted and is missing the node's state.
+               //
+               // When hbState is not empty, then the node gossiped an empty STATUS; this happens during bootstrap, and it's not
+               // possible to tell if this is ok or not (we can't really tell if the node is dead or having networking issues).
+               // For these cases allow an external actor to verify and inform Cassandra that it is safe - this is done by
+               // updating the LOOSE_DEF_OF_EMPTY_ENABLED field.
+               || (LOOSE_DEF_OF_EMPTY_ENABLED && !hasStatus);
     }
 
     public boolean isRpcReady()
@@ -145,18 +291,54 @@ public class EndpointState
 
     public String getStatus()
     {
-        VersionedValue status = getApplicationState(ApplicationState.STATUS);
+        VersionedValue status = getApplicationState(ApplicationState.STATUS_WITH_PORT);
         if (status == null)
+        {
+            status = getApplicationState(ApplicationState.STATUS);
+        }
+        if (status == null)
+        {
             return "";
+        }
 
         String[] pieces = status.value.split(VersionedValue.DELIMITER_STR, -1);
         assert (pieces.length > 0);
         return pieces[0];
     }
 
+    @Nullable
+    public UUID getSchemaVersion()
+    {
+        return ClusterMetadata.current().schema.getVersion();
+    }
+
+    @Nullable
+    public CassandraVersion getReleaseVersion()
+    {
+        VersionedValue applicationState = getApplicationState(ApplicationState.RELEASE_VERSION);
+        return applicationState != null
+               ? new CassandraVersion(applicationState.value)
+               : null;
+    }
+
     public String toString()
     {
-        return "EndpointState: HeartBeatState = " + hbState + ", AppStateMap = " + applicationState.get();
+        View view = ref.get();
+        return "EndpointState: HeartBeatState = " + view.hbState + ", AppStateMap = " + view.applicationState;
+    }
+
+    public boolean isSupersededBy(EndpointState that)
+    {
+        int thisGeneration = this.getHeartBeatState().getGeneration();
+        int thatGeneration = that.getHeartBeatState().getGeneration();
+
+        if (thatGeneration > thisGeneration)
+            return true;
+
+        if (thisGeneration > thatGeneration)
+            return false;
+
+        return Gossiper.getMaxEndpointStateVersion(that) > Gossiper.getMaxEndpointStateVersion(this);
     }
 }
 

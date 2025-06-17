@@ -19,16 +19,14 @@
 <project basedir="." name="apache-cassandra-owasp-tasks"
          xmlns:unless="ant:unless"
          xmlns:if="ant:if">
-    <property name="dependency-check.version" value="10.0.4"/>
+    <property name="dependency-check.version" value="12.1.0"/>
     <property name="dependency-check.home" value="${tmp.dir}/dependency-check-ant-${dependency-check.version}"/>
-    <property name="dependency-check.archive.dir"
-              value="${local.repository}/org/owasp/dependency-check-ant/${dependency-check.version}"/>
-    <property name="dependency-check.archive.name"
-              value="dependency-check-ant-${dependency-check.version}-release.zip"/>
+    <property name="dependency-check.archive.dir" value="${local.repository}/org/owasp/dependency-check-ant/${dependency-check.version}"/>
+    <property name="dependency-check.archive.name" value="dependency-check-ant-${dependency-check.version}-release.zip"/>
     <property name="dependency-check.report.dir" value="${build.dir}/owasp"/>
 
     <condition property="dependency-check-ant.archive.present">
-        <available file="${dependency-check.archive.dir}/${dependency-check.archive.name}" type="file"/>
+        <available file="${dependency-check.archive.dir}/${dependency-check.archive.name}" type="file" />
     </condition>
 
     <target name="-dependency-check-download"
@@ -36,7 +34,7 @@
             unless="dependency-check-ant.archive.present">
 
         <mkdir dir="${dependency-check.archive.dir}"/>
-        <get src="https://github.com/jeremylong/DependencyCheck/releases/download/v${dependency-check.version}/${dependency-check.archive.name}"
+        <get src="https://github.com/dependency-check/DependencyCheck/releases/download/v${dependency-check.version}/${dependency-check.archive.name}"
              dest="${dependency-check.archive.dir}/${dependency-check.archive.name}" retries="3"/>
     </target>
 
@@ -80,7 +78,7 @@
             failBuildOnCVSS is by default 11 so build would never fail,
             the table categorising vulnerabilities is here (1), so by setting
             "failBuildOnCVSS" to 1, we will fail the build on any CVE found
-            if it is not suppressed already dependency-check-suppressions.xml
+            if it is not suppressed already owasp/dependency-check-suppressions.xml
 
             If a vendor provides no details about a vulnerability,
             NVD will score that vulnerability as 10.0 (the highest rating translating to critical).
@@ -101,17 +99,20 @@
                           failBuildOnCVSS="1"
                           assemblyAnalyzerEnabled="false"
                           dataDirectory="${nvd.data.dir}"
-                          suppressionFile="${basedir}/.build/dependency-check-suppressions.xml"
+                          suppressionFile="${build.helpers.dir}/owasp/dependency-check-suppressions.xml"
                           nvdDatafeedUrl="${nvdDatafeedUrl}">
             <fileset refid="dependencies_to_check"/>
         </dependency-check>
     </target>
 
-    <target name="dependency-check" depends="resolver-dist-lib">
+    <target name="dependency-check" depends="resolver-dist-lib,generate-snyk-file">
         <fileset dir="lib" id="dependencies_to_check">
             <include name="**/*.jar"/>
         </fileset>
         <antcall target="-run-owasp-scan" inheritrefs="true" inheritall="true"/>
     </target>
 
+    <target name="generate-snyk-file" unless="ant.gen-snyk.skip">
+        <exec executable="python3" failonerror="true"><arg value="${basedir}/.build/generate-snyk-file"/></exec>
+    </target>
 </project>

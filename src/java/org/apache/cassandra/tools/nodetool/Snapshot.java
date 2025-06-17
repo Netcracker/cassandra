@@ -17,19 +17,25 @@
  */
 package org.apache.cassandra.tools.nodetool;
 
-import static com.google.common.collect.Iterables.toArray;
-import static org.apache.commons.lang3.StringUtils.join;
-import io.airlift.command.Arguments;
-import io.airlift.command.Command;
-import io.airlift.command.Option;
-
 import java.io.IOException;
 import java.io.PrintStream;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
+import io.airlift.airline.Arguments;
+import io.airlift.airline.Command;
+import io.airlift.airline.Option;
+import org.apache.cassandra.config.DurationSpec;
+import org.apache.cassandra.io.util.File;
+import org.apache.cassandra.service.snapshot.SnapshotOptions;
 import org.apache.cassandra.tools.NodeProbe;
 import org.apache.cassandra.tools.NodeTool.NodeToolCmd;
+
+import static com.google.common.collect.Iterables.toArray;
+import static org.apache.cassandra.utils.Clock.Global.currentTimeMillis;
+import static org.apache.commons.lang3.StringUtils.join;
 
 @Command(name = "snapshot", description = "Take a snapshot of specified keyspaces or a snapshot of the specified table")
 public class Snapshot extends NodeToolCmd
@@ -41,10 +47,16 @@ public class Snapshot extends NodeToolCmd
     private String table = null;
 
     @Option(title = "tag", name = {"-t", "--tag"}, description = "The name of the snapshot")
-    private String snapshotName = Long.toString(System.currentTimeMillis());
+    private String snapshotName = Long.toString(currentTimeMillis());
 
     @Option(title = "ktlist", name = { "-kt", "--kt-list", "-kc", "--kc.list" }, description = "The list of Keyspace.table to take snapshot.(you must not specify only keyspace)")
     private String ktList = null;
+
+    @Option(title = "skip-flush", name = {"-sf", "--skip-flush"}, description = "Do not flush memtables before snapshotting (snapshot will not contain unflushed data)")
+    private boolean skipFlush = false;
+
+    @Option(title = "ttl", name = {"--ttl"}, description = "Specify a TTL of created snapshot")
+    private String ttl = null;
 
     @Override
     public void execute(NodeProbe probe)
@@ -56,21 +68,33 @@ public class Snapshot extends NodeToolCmd
 
             sb.append("Requested creating snapshot(s) for ");
 
+            Map<String, String> options = new HashMap<String,String>();
+            options.put(SnapshotOptions.SKIP_FLUSH, Boolean.toString(skipFlush));
+            if (null != ttl) {
+                DurationSpec.LongNanosecondsBound d = new DurationSpec.LongNanosecondsBound(ttl);
+                options.put(SnapshotOptions.TTL, d.toString());
+            }
+
+            if (!snapshotName.isEmpty() && snapshotName.contains(File.pathSeparator()))
+            {
+                throw new IOException("Snapshot name cannot contain " + File.pathSeparator());
+            }
             // Create a separate path for kclist to avoid breaking of already existing scripts
             if (null != ktList && !ktList.isEmpty())
             {
                 ktList = ktList.replace(" ", "");
                 if (keyspaces.isEmpty() && null == table)
-                    sb.append("[").append(ktList).append("]");
+                    sb.append('[').append(ktList).append(']');
                 else
                 {
                     throw new IOException(
-                            "When specifying the Keyspace columfamily list for a snapshot, you should not specify columnfamily");
+                            "When specifying the Keyspace table list (using -kt,--kt-list,-kc,--kc.list), you must not also specify keyspaces to snapshot");
                 }
                 if (!snapshotName.isEmpty())
-                    sb.append(" with snapshot name [").append(snapshotName).append("]");
-                out.println(sb.toString());
-                probe.takeMultipleTableSnapshot(snapshotName, ktList.split(","));
+                    sb.append(" with snapshot name [").append(snapshotName).append(']');
+                sb.append(" and options ").append(options);
+                out.println(sb);
+                probe.takeMultipleTableSnapshot(snapshotName, options, ktList.split(","));
                 out.println("Snapshot directory: " + snapshotName);
             }
             else
@@ -78,14 +102,14 @@ public class Snapshot extends NodeToolCmd
                 if (keyspaces.isEmpty())
                     sb.append("[all keyspaces]");
                 else
-                    sb.append("[").append(join(keyspaces, ", ")).append("]");
+                    sb.append('[').append(join(keyspaces, ", ")).append(']');
 
                 if (!snapshotName.isEmpty())
-                    sb.append(" with snapshot name [").append(snapshotName).append("]");
+                    sb.append(" with snapshot name [").append(snapshotName).append(']');
+                sb.append(" and options ").append(options);
+                out.println(sb);
 
-                out.println(sb.toString());
-
-                probe.takeSnapshot(snapshotName, table, toArray(keyspaces, String.class));
+                probe.takeSnapshot(snapshotName, table, options, toArray(keyspaces, String.class));
                 out.println("Snapshot directory: " + snapshotName);
             }
         }

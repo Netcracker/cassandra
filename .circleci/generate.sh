@@ -18,7 +18,7 @@
 #
 
 BASEDIR=`dirname $0`
-BASE_BRANCH=cassandra-3.0
+BASE_BRANCH=trunk
 set -e
 
 die ()
@@ -33,7 +33,9 @@ print_help()
   echo "Usage: $0 [-f|-p|-a|-e|-i|-b|-s]"
   echo "   -a Generate the config.yml, config.yml.FREE and config.yml.PAID expanded configuration"
   echo "      files from the main config_template.yml reusable configuration file."
-  echo "      Use this for permanent changes in config that will be committed to the main repo."
+  echo "      Use this for permanent changes in config.yml that will be committed to the main repo."
+  echo "   -d Minimal development checks only. Sanity check during your dev before sending it to review for speed and cost reductions."
+  echo "      Submitting cleaning pre-commit clean CI run is still a requirement when the patch is ready for review"
   echo "   -f Generate config.yml for tests compatible with the CircleCI free tier resources"
   echo "   -p Generate config.yml for tests compatible with the CircleCI paid tier resources"
   echo "   -b Specify the base git branch for comparison when determining changed tests to"
@@ -47,8 +49,16 @@ print_help()
   echo "                   -e REPEATED_TESTS_STOP_ON_FAILURE=false"
   echo "                   -e REPEATED_UTESTS=org.apache.cassandra.cql3.ViewTest#testCountersTable"
   echo "                   -e REPEATED_UTESTS_COUNT=500"
+  echo "                   -e REPEATED_UTESTS_FQLTOOL=org.apache.cassandra.fqltool.FQLCompareTest"
+  echo "                   -e REPEATED_UTESTS_FQLTOOL_COUNT=500"
+  echo "                   -e REPEATED_UTESTS_SSTABLELOADER=org.apache.cassandra.tools.LoaderOptionsTest"
+  echo "                   -e REPEATED_UTESTS_SSTABLELOADER_COUNT=500"
   echo "                   -e REPEATED_UTESTS_LONG=org.apache.cassandra.db.commitlog.CommitLogStressTest"
   echo "                   -e REPEATED_UTESTS_LONG_COUNT=100"
+  echo "                   -e REPEATED_UTESTS_STRESS=org.apache.cassandra.stress.generate.DistributionGaussianTest"
+  echo "                   -e REPEATED_UTESTS_STRESS_COUNT=500"
+  echo "                   -e REPEATED_SIMULATOR_DTESTS=org.apache.cassandra.simulator.test.TrivialSimulationTest"
+  echo "                   -e REPEATED_SIMULATOR_DTESTS_COUNT=500"
   echo "                   -e REPEATED_JVM_DTESTS=org.apache.cassandra.distributed.test.PagingTest"
   echo "                   -e REPEATED_JVM_DTESTS_COUNT=500"
   echo "                   -e REPEATED_JVM_UPGRADE_DTESTS=org.apache.cassandra.distributed.upgrade.GroupByTest"
@@ -62,6 +72,7 @@ print_help()
   echo "                   -e REPEATED_ANT_TEST_TARGET=testsome"
   echo "                   -e REPEATED_ANT_TEST_CLASS=org.apache.cassandra.cql3.ViewTest"
   echo "                   -e REPEATED_ANT_TEST_METHODS=testCompoundPartitionKey,testStaticTable"
+  echo "                   -e REPEATED_ANT_TEST_VNODES=false"
   echo "                   -e REPEATED_ANT_TEST_COUNT=500"
   echo "                  For the complete list of environment variables, please check the"
   echo "                  list of examples in config_template.yml and/or the documentation."
@@ -73,27 +84,30 @@ print_help()
 all=false
 free=false
 paid=false
+dev_min=false
 env_vars=""
 has_env_vars=false
 check_env_vars=true
 detect_changed_tests=true
-while getopts "e:afpib:s" opt; do
+while getopts "e:afpdib:s" opt; do
   case $opt in
       a ) all=true
           detect_changed_tests=false
+          ;;
+      d ) dev_min=true
           ;;
       f ) free=true
           ;;
       p ) paid=true
           ;;
-      b ) BASE_BRANCH="$OPTARG"
-          ;;
-      e ) if (!($has_env_vars)); then
+      e ) if (! ($has_env_vars)); then
             env_vars="$OPTARG"
           else
             env_vars="$env_vars|$OPTARG"
           fi
           has_env_vars=true
+          ;;
+      b ) BASE_BRANCH="$OPTARG"
           ;;
       i ) check_env_vars=false
           ;;
@@ -117,8 +131,16 @@ if $has_env_vars && $check_env_vars; then
        [ "$key" != "REPEATED_TESTS_STOP_ON_FAILURE" ] &&
        [ "$key" != "REPEATED_UTESTS" ] &&
        [ "$key" != "REPEATED_UTESTS_COUNT" ] &&
+       [ "$key" != "REPEATED_UTESTS_FQLTOOL" ] &&
+       [ "$key" != "REPEATED_UTESTS_FQLTOOL_COUNT" ] &&
+       [ "$key" != "REPEATED_UTESTS_SSTABLELOADER" ] &&
+       [ "$key" != "REPEATED_UTESTS_SSTABLELOADER_COUNT" ] &&
        [ "$key" != "REPEATED_UTESTS_LONG" ] &&
        [ "$key" != "REPEATED_UTESTS_LONG_COUNT" ] &&
+       [ "$key" != "REPEATED_UTESTS_STRESS" ] &&
+       [ "$key" != "REPEATED_UTESTS_STRESS_COUNT" ] &&
+       [ "$key" != "REPEATED_SIMULATOR_DTESTS" ] &&
+       [ "$key" != "REPEATED_SIMULATOR_DTESTS_COUNT" ] &&
        [ "$key" != "REPEATED_JVM_DTESTS" ] &&
        [ "$key" != "REPEATED_JVM_DTESTS_COUNT" ] &&
        [ "$key" != "REPEATED_JVM_UPGRADE_DTESTS" ]  &&
@@ -132,10 +154,15 @@ if $has_env_vars && $check_env_vars; then
        [ "$key" != "REPEATED_ANT_TEST_TARGET" ] &&
        [ "$key" != "REPEATED_ANT_TEST_CLASS" ] &&
        [ "$key" != "REPEATED_ANT_TEST_METHODS" ] &&
+       [ "$key" != "REPEATED_ANT_TEST_VNODES" ] &&
        [ "$key" != "REPEATED_ANT_TEST_COUNT" ]; then
       die "Unrecognised environment variable name: $key"
     fi
   done
+fi
+
+if $dev_min && $detect_changed_tests; then
+  die "-d doesn't support repeated tests. Use -s to skip it."
 fi
 
 if $free; then
@@ -148,7 +175,7 @@ if $free; then
 elif $paid; then
   ($all || $free) && die "Cannot use option -p with options -a or -f"
   echo "Generating new config.yml file for paid tier from config_template.yml"
-  patch -o $BASEDIR/config_template.yml.PAID $BASEDIR/config_template.yml $BASEDIR/config_template.yml.PAID.patch
+  patch --silent -o $BASEDIR/config_template.yml.PAID $BASEDIR/config_template.yml $BASEDIR/config_template.yml.PAID.patch
   circleci config process $BASEDIR/config_template.yml.PAID > $BASEDIR/config.yml.PAID.tmp
   cat $BASEDIR/license.yml $BASEDIR/config.yml.PAID.tmp > $BASEDIR/config.yml
   rm $BASEDIR/config_template.yml.PAID $BASEDIR/config.yml.PAID.tmp
@@ -165,7 +192,7 @@ elif $all; then
   rm $BASEDIR/config.yml.FREE.tmp
 
   # setup config for paid tier
-  patch -o $BASEDIR/config_template.yml.PAID $BASEDIR/config_template.yml $BASEDIR/config_template.yml.PAID.patch
+  patch --silent -o $BASEDIR/config_template.yml.PAID $BASEDIR/config_template.yml $BASEDIR/config_template.yml.PAID.patch
   circleci config process $BASEDIR/config_template.yml.PAID > $BASEDIR/config.yml.PAID.tmp
   cat $BASEDIR/license.yml $BASEDIR/config.yml.PAID.tmp > $BASEDIR/config.yml.PAID
   rm $BASEDIR/config_template.yml.PAID $BASEDIR/config.yml.PAID.tmp
@@ -173,7 +200,7 @@ elif $all; then
   # copy free tier into config.yml to make sure this gets updated
   cp $BASEDIR/config.yml.FREE $BASEDIR/config.yml
 
-elif (!($has_env_vars)); then
+elif (! ($has_env_vars)); then
   print_help
   exit 0
 fi
@@ -216,6 +243,10 @@ if $detect_changed_tests; then
   echo "Detecting new or modified tests with git diff --diff-filter=AMR ${BASE_BRANCH}...HEAD:"
   add_diff_tests "REPEATED_UTESTS" "test/unit/" "org.apache.cassandra"
   add_diff_tests "REPEATED_UTESTS_LONG" "test/long/" "org.apache.cassandra"
+  add_diff_tests "REPEATED_UTESTS_STRESS" "tools/stress/test/unit/" "org.apache.cassandra.stress"
+  add_diff_tests "REPEATED_UTESTS_FQLTOOL" "tools/fqltool/test/unit/" "org.apache.cassandra.fqltool"
+  add_diff_tests "REPEATED_UTESTS_SSTABLELOADER" "tools/sstableloader/test/unit/" "org.apache.cassandra.tools"
+  add_diff_tests "REPEATED_SIMULATOR_DTESTS" "test/simulator/test/" "org.apache.cassandra.simulator.test"
   add_diff_tests "REPEATED_JVM_DTESTS" "test/distributed/" "org.apache.cassandra.distributed.test"
   add_diff_tests "REPEATED_JVM_UPGRADE_DTESTS" "test/distributed/" "org.apache.cassandra.distributed.upgrade"
 fi
@@ -236,7 +267,7 @@ if $has_env_vars; then
 fi
 
 # Define function to remove unneeded jobs.
-# The first argument is the file name, and the second arguemnt is the job name.
+# The first argument is the file name, and the second argument is the job name.
 delete_job()
 {
   delete_yaml_block()
@@ -245,8 +276,8 @@ delete_job()
     sed -Ei.bak "/^    - ${2}/d" "$1"
   }
   file="$BASEDIR/$1"
-  delete_yaml_block "$file" "${2}"
-  delete_yaml_block "$file" "start_${2}"
+  delete_yaml_block "$file" "${2}:"
+  delete_yaml_block "$file" "start_${2}:"
 }
 
 # Define function to remove any unneeded repeated jobs.
@@ -254,45 +285,154 @@ delete_job()
 delete_repeated_jobs()
 {
   if (! (echo "$env_vars" | grep -q "REPEATED_UTESTS=" )); then
-    delete_job "$1" "j8_unit_tests_repeat"
     delete_job "$1" "j11_unit_tests_repeat"
-    delete_job "$1" "utests_compression_repeat"
-    delete_job "$1" "utests_system_keyspace_directory_repeat"
+    delete_job "$1" "j17_unit_tests_repeat"
+    delete_job "$1" "j11_utests_cdc_repeat"
+    delete_job "$1" "j17_utests_cdc_repeat"
+    delete_job "$1" "j11_utests_compression_repeat"
+    delete_job "$1" "j17_utests_compression_repeat"
+    delete_job "$1" "j11_utests_latest_repeat"
+    delete_job "$1" "j17_utests_latest_repeat"
+    delete_job "$1" "j11_utests_oa_repeat"
+    delete_job "$1" "j17_utests_oa_repeat"
+    delete_job "$1" "j11_utests_system_keyspace_directory_repeat"
+    delete_job "$1" "j17_utests_system_keyspace_directory_repeat"
   fi
   if (! (echo "$env_vars" | grep -q "REPEATED_UTESTS_LONG=")); then
-    delete_job "$1" "utests_long_repeat"
+    delete_job "$1" "j11_utests_long_repeat"
+    delete_job "$1" "j17_utests_long_repeat"
+  fi
+  if (! (echo "$env_vars" | grep -q "REPEATED_UTESTS_STRESS=")); then
+    delete_job "$1" "j11_utests_stress_repeat"
+    delete_job "$1" "j17_utests_stress_repeat"
+  fi
+  if (! (echo "$env_vars" | grep -q "REPEATED_UTESTS_FQLTOOL=")); then
+    delete_job "$1" "j11_utests_fqltool_repeat"
+    delete_job "$1" "j17_utests_fqltool_repeat"
+  fi
+  if (! (echo "$env_vars" | grep -q "REPEATED_UTESTS_SSTABLELOADER=")); then
+    delete_job "$1" "j11_utests_sstableloader_repeat"
+    delete_job "$1" "j17_utests_sstableloader_repeat"
+  fi
+  if (! (echo "$env_vars" | grep -q "REPEATED_SIMULATOR_DTESTS=")); then
+    delete_job "$1" "j11_simulator_dtests_repeat"
   fi
   if (! (echo "$env_vars" | grep -q "REPEATED_JVM_DTESTS=")); then
-    delete_job "$1" "j8_jvm_dtests_repeat"
-    delete_job "$1" "j8_jvm_dtests_vnode_repeat"
     delete_job "$1" "j11_jvm_dtests_repeat"
-    delete_job "$1" "j11_jvm_dtests_vnode_repeat"
+    delete_job "$1" "j11_jvm_dtests_latest_vnode_repeat"
+    delete_job "$1" "j17_jvm_dtests_repeat"
+    delete_job "$1" "j17_jvm_dtests_latest_vnode_repeat"
   fi
   if (! (echo "$env_vars" | grep -q "REPEATED_JVM_UPGRADE_DTESTS=")); then
     delete_job "$1" "start_jvm_upgrade_dtests_repeat"
-    delete_job "$1" "j8_jvm_upgrade_dtests_repeat"
+    delete_job "$1" "j11_jvm_upgrade_dtests_repeat"
   fi
   if (! (echo "$env_vars" | grep -q "REPEATED_DTESTS=")); then
-    delete_job "$1" "j8_dtests_repeat"
-    delete_job "$1" "j8_dtests_vnode_repeat"
     delete_job "$1" "j11_dtests_repeat"
     delete_job "$1" "j11_dtests_vnode_repeat"
+    delete_job "$1" "j11_dtests_latest_repeat"
+    delete_job "$1" "j17_dtests_repeat"
+    delete_job "$1" "j17_dtests_vnode_repeat"
+    delete_job "$1" "j17_dtests_latest_repeat"
   fi
   if (! (echo "$env_vars" | grep -q "REPEATED_LARGE_DTESTS=")); then
-    delete_job "$1" "j8_dtests_large_repeat"
-    delete_job "$1" "j8_dtests_large_vnode_repeat"
+    delete_job "$1" "j11_dtests_large_repeat"
+    delete_job "$1" "j11_dtests_large_vnode_repeat"
+    delete_job "$1" "j17_dtests_large_repeat"
+    delete_job "$1" "j17_dtests_large_vnode_repeat"
   fi
   if (! (echo "$env_vars" | grep -q "REPEATED_UPGRADE_DTESTS=")); then
-    delete_job "$1" "j8_upgrade_dtests_repeat"
+    delete_job "$1" "j11_upgrade_dtests_repeat"
   fi
   if (! (echo "$env_vars" | grep -q "REPEATED_ANT_TEST_CLASS=")); then
-    delete_job "$1" "j8_repeated_ant_test"
     delete_job "$1" "j11_repeated_ant_test"
+    delete_job "$1" "j17_repeated_ant_test"
   fi
+}
+
+# Update the workflow names
+rename_workflow()
+{
+  file="$BASEDIR/$1"
+  echo "Updating workflow names in the configuration $2 -> $3"
+
+  sed -Ei.bak "s/$2/$3/g" "$file"
+}
+
+# Define function to leave only a single config run for each test group.
+# This builds a minimal sanity check config for dev only for time and cost purposes.
+# The first and only argument is the file name.
+build_dev_min_jobs()
+{
+  delete_job "$1" "j11_cqlsh_dtests_py311_latest"
+  delete_job "$1" "j11_cqlsh_dtests_py38_latest"
+  delete_job "$1" "j17_cqlsh_dtests_py311_latest"
+  delete_job "$1" "j17_cqlsh_dtests_py38_latest"
+  delete_job "$1" "j11_cqlsh_dtests_py311_vnode"
+  delete_job "$1" "j11_cqlsh_dtests_py38_vnode"
+  delete_job "$1" "j11_cqlsh_dtests_py38"
+  delete_job "$1" "j11_cqlshlib_cython_tests"
+  delete_job "$1" "j17_cqlsh_dtests_py311_vnode"
+  delete_job "$1" "j17_cqlsh_dtests_py311"
+  delete_job "$1" "j17_cqlsh_dtests_py38_vnode"
+  delete_job "$1" "j17_cqlsh_dtests_py38"
+  delete_job "$1" "j17_cqlshlib_tests"
+  delete_job "$1" "j17_cqlshlib_cython_tests"
+  delete_job "$1" "j11_dtests_vnode"
+  delete_job "$1" "j11_dtests_large_vnode"
+  delete_job "$1" "j11_dtests_latest"
+  delete_job "$1" "j17_dtests_vnode"
+  delete_job "$1" "j17_dtests_large"
+  delete_job "$1" "j17_dtests_large_vnode"
+  delete_job "$1" "j17_dtests_latest"
+  delete_job "$1" "j17_dtests"
+  delete_job "$1" "j11_jvm_dtests_latest_vnode"
+  delete_job "$1" "j17_jvm_dtests_vnode"
+  delete_job "$1" "j17_jvm_dtests_latest_vnode"
+  delete_job "$1" "j17_jvm_dtests_vnode"
+  delete_job "$1" "j17_jvm_dtests"
+  delete_job "$1" "j11_utests_oa"
+  delete_job "$1" "j11_utests_cdc"
+  delete_job "$1" "j11_utests_compression"
+  delete_job "$1" "j11_utests_fqltool"
+  delete_job "$1" "j11_utests_sstableloader"
+  delete_job "$1" "j11_utests_long"
+  delete_job "$1" "j11_utests_stress"
+  delete_job "$1" "j11_utests_system_keyspace_directory"
+  delete_job "$1" "j17_unit_tests"
+  delete_job "$1" "j17_utests_oa"
+  delete_job "$1" "j17_utests_cdc"
+  delete_job "$1" "j17_utests_compression"
+  delete_job "$1" "j17_utests_fqltool"
+  delete_job "$1" "j17_utests_sstableloader"
+  delete_job "$1" "j17_utests_long"
+  delete_job "$1" "j17_utests_stress"
+  delete_job "$1" "j11_utests_latest"
+  delete_job "$1" "j17_utests_latest"
+  delete_job "$1" "j17_utests_system_keyspace_directory"
+  delete_job "$1" "start_utests_system_keyspace_directory"
+  delete_job "$1" "start_utests_stress"
+  delete_job "$1" "start_utests_long"
+  delete_job "$1" "start_utests_fqltool"
+  delete_job "$1" "start_utests_sstableloader"
+  delete_job "$1" "start_utests_compression"
+  delete_job "$1" "start_utests_cdc"
+  delete_job "$1" "start_j17_cqlsh-dtests-latest"
+  delete_job "$1" "start_j11_cqlsh_dtests_latest"
+  delete_job "$1" "start_j17_cqlsh_tests"
+  delete_job "$1" "start_j17_cqlsh_tests_latest"
+  delete_job "$1" "start_j11_cqlsh_tests_latest"
+
+  rename_workflow "$1" "java11_pre-commit_tests" "java11_dev_tests"
+  rename_workflow "$1" "java17_pre-commit_tests" "java17_dev_tests"
 }
 
 delete_repeated_jobs "config.yml"
 if $all; then
   delete_repeated_jobs "config.yml.FREE"
   delete_repeated_jobs "config.yml.PAID"
+fi
+
+if $dev_min; then
+  build_dev_min_jobs "config.yml"
 fi

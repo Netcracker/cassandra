@@ -18,40 +18,44 @@
 
 package org.apache.cassandra.distributed.mock.nodetool;
 
-import java.io.IOException;
 import java.lang.management.ManagementFactory;
 import java.util.Iterator;
 import java.util.Map;
 
-import javax.management.ListenerNotFoundException;
-
 import com.google.common.collect.Multimap;
 
 import org.apache.cassandra.batchlog.BatchlogManager;
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.ColumnFamilyStoreMBean;
-import org.apache.cassandra.db.HintedHandOffManager;
 import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.db.compaction.CompactionManager;
 import org.apache.cassandra.gms.FailureDetector;
 import org.apache.cassandra.gms.FailureDetectorMBean;
 import org.apache.cassandra.gms.Gossiper;
+import org.apache.cassandra.hints.HintsService;
+import org.apache.cassandra.locator.DynamicEndpointSnitch;
+import org.apache.cassandra.locator.DynamicEndpointSnitchMBean;
 import org.apache.cassandra.locator.EndpointSnitchInfo;
 import org.apache.cassandra.locator.EndpointSnitchInfoMBean;
+import org.apache.cassandra.locator.SnitchAdapter;
 import org.apache.cassandra.metrics.CassandraMetricsRegistry;
 import org.apache.cassandra.net.MessagingService;
+import org.apache.cassandra.service.ActiveRepairService;
 import org.apache.cassandra.service.CacheService;
 import org.apache.cassandra.service.CacheServiceMBean;
 import org.apache.cassandra.service.GCInspector;
 import org.apache.cassandra.service.StorageProxy;
 import org.apache.cassandra.service.StorageService;
-import org.apache.cassandra.service.StorageServiceMBean;
+import org.apache.cassandra.service.accord.AccordOperations;
+import org.apache.cassandra.service.snapshot.SnapshotManager;
 import org.apache.cassandra.streaming.StreamManager;
+import org.apache.cassandra.tcm.CMSOperations;
 import org.apache.cassandra.tools.NodeProbe;
-import org.mockito.Mockito;
 
 public class InternalNodeProbe extends NodeProbe
 {
     private final boolean withNotifications;
+    private boolean previousSkipNotificationListeners = false;
 
     public InternalNodeProbe(boolean withNotifications)
     {
@@ -65,39 +69,25 @@ public class InternalNodeProbe extends NodeProbe
         mbeanServerConn = null;
         jmxc = null;
 
-
-        if (withNotifications)
-        {
-            ssProxy = StorageService.instance;
-        }
-        else
-        {
-            // replace the notification apis with a no-op method
-            StorageServiceMBean mock = Mockito.spy(StorageService.instance);
-            Mockito.doNothing().when(mock).addNotificationListener(Mockito.any(), Mockito.any(), Mockito.any());
-            try
-            {
-                Mockito.doNothing().when(mock).removeNotificationListener(Mockito.any(), Mockito.any(), Mockito.any());
-                Mockito.doNothing().when(mock).removeNotificationListener(Mockito.any());
-            }
-            catch (ListenerNotFoundException e)
-            {
-                throw new AssertionError(e);
-            }
-            ssProxy = mock;
-        }
+        previousSkipNotificationListeners = StorageService.instance.skipNotificationListeners;
+        StorageService.instance.skipNotificationListeners = !withNotifications;
 
         ssProxy = StorageService.instance;
+        snapshotProxy = SnapshotManager.instance;
+        cmsProxy = CMSOperations.instance;
+        accordProxy = AccordOperations.instance;
         msProxy = MessagingService.instance();
         streamProxy = StreamManager.instance;
         compactionProxy = CompactionManager.instance;
         fdProxy = (FailureDetectorMBean) FailureDetector.instance;
         cacheService = CacheService.instance;
         spProxy = StorageProxy.instance;
-        hhProxy = HintedHandOffManager.instance;
+        hsProxy = HintsService.instance;
+
         gcProxy = new GCInspector();
         gossProxy = Gossiper.instance;
         bmProxy = BatchlogManager.instance;
+        arsProxy = ActiveRepairService.instance();
         memProxy = ManagementFactory.getMemoryMXBean();
         runtimeProxy = ManagementFactory.getRuntimeMXBean();
     }
@@ -105,7 +95,7 @@ public class InternalNodeProbe extends NodeProbe
     @Override
     public void close()
     {
-        // nothing to close. no-op
+        StorageService.instance.skipNotificationListeners = previousSkipNotificationListeners;
     }
 
     @Override
@@ -115,7 +105,13 @@ public class InternalNodeProbe extends NodeProbe
         return new EndpointSnitchInfo();
     }
 
-    @Override
+	@Override
+    public DynamicEndpointSnitchMBean getDynamicEndpointSnitchInfoProxy()
+    {
+        // TODO At some point we should change this to use modern config e.g. Locator and InitialLocationProvider
+        return new DynamicEndpointSnitch(new SnitchAdapter(DatabaseDescriptor.createEndpointSnitch(DatabaseDescriptor.getRawConfig().endpoint_snitch)));
+    }
+
     public CacheServiceMBean getCacheServiceMBean()
     {
         return cacheService;
@@ -127,8 +123,8 @@ public class InternalNodeProbe extends NodeProbe
         return Keyspace.open(ks).getColumnFamilyStore(cf);
     }
 
-    @Override
     // The below methods are only used by the commands (i.e. Info, TableHistogram, TableStats, etc.) that display informations. Not useful for dtest, so disable it.
+    @Override
     public Object getCacheMetric(String cacheType, String metricName)
     {
         throw new UnsupportedOperationException();
@@ -165,7 +161,19 @@ public class InternalNodeProbe extends NodeProbe
     }
 
     @Override
+    public CassandraMetricsRegistry.JmxTimerMBean getMessagingQueueWaitMetrics(String verb)
+    {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
     public Object getCompactionMetric(String metricName)
+    {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public Object getClientMetric(String metricName)
     {
         throw new UnsupportedOperationException();
     }

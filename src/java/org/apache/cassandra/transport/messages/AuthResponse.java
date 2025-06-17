@@ -20,9 +20,6 @@ package org.apache.cassandra.transport.messages;
 import java.nio.ByteBuffer;
 
 import io.netty.buffer.ByteBuf;
-import org.apache.cassandra.auth.AuthenticatedUser;
-import org.apache.cassandra.auth.IAuthenticator;
-import org.apache.cassandra.exceptions.AuthenticationException;
 import org.apache.cassandra.service.QueryState;
 import org.apache.cassandra.transport.*;
 
@@ -35,9 +32,9 @@ public class AuthResponse extends Message.Request
 {
     public static final Message.Codec<AuthResponse> codec = new Message.Codec<AuthResponse>()
     {
-        public AuthResponse decode(ByteBuf body, int version)
+        public AuthResponse decode(ByteBuf body, ProtocolVersion version)
         {
-            if (version == 1)
+            if (version == ProtocolVersion.V1)
                 throw new ProtocolException("SASL Authentication is not supported in version 1 of the protocol");
 
             ByteBuffer b = CBUtil.readValue(body);
@@ -46,12 +43,12 @@ public class AuthResponse extends Message.Request
             return new AuthResponse(token);
         }
 
-        public void encode(AuthResponse response, ByteBuf dest, int version)
+        public void encode(AuthResponse response, ByteBuf dest, ProtocolVersion version)
         {
             CBUtil.writeValue(response.token, dest);
         }
 
-        public int encodedSize(AuthResponse response, int version)
+        public int encodedSize(AuthResponse response, ProtocolVersion version)
         {
             return CBUtil.sizeOfValue(response.token);
         }
@@ -67,27 +64,18 @@ public class AuthResponse extends Message.Request
     }
 
     @Override
-    public Response execute(QueryState queryState)
+    protected Response execute(QueryState queryState, Dispatcher.RequestTime requestTime, boolean traceRequest)
     {
-        try
+        return AuthUtil.handleLogin(connection, queryState, token, (negotiationComplete, challenge) ->
         {
-            IAuthenticator.SaslNegotiator negotiator = ((ServerConnection) connection).getSaslNegotiator(queryState);
-            byte[] challenge = negotiator.evaluateResponse(token);
-            if (negotiator.isComplete())
+            if (negotiationComplete)
             {
-                AuthenticatedUser user = negotiator.getAuthenticatedUser();
-                queryState.getClientState().login(user);
-                // authentication is complete, send a ready message to the client
                 return new AuthSuccess(challenge);
             }
             else
             {
                 return new AuthChallenge(challenge);
             }
-        }
-        catch (AuthenticationException e)
-        {
-            return ErrorMessage.fromException(e);
-        }
+        });
     }
 }

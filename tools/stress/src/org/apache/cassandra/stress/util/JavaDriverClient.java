@@ -25,16 +25,23 @@ import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLEngine;
 
 import com.google.common.net.HostAndPort;
+
 import com.datastax.driver.core.*;
 import com.datastax.driver.core.policies.DCAwareRoundRobinPolicy;
+import com.datastax.driver.core.policies.LoadBalancingPolicy;
+import com.datastax.driver.core.policies.TokenAwarePolicy;
 import com.datastax.driver.core.policies.WhiteListPolicy;
+import com.datastax.shaded.netty.channel.socket.SocketChannel;
 import io.netty.util.internal.logging.InternalLoggerFactory;
 import io.netty.util.internal.logging.Slf4JLoggerFactory;
 import org.apache.cassandra.config.EncryptionOptions;
 import org.apache.cassandra.security.SSLFactory;
 import org.apache.cassandra.stress.settings.StressSettings;
+
+import static org.apache.cassandra.config.EncryptionOptions.ClientEncryptionOptions.ClientAuth.REQUIRED;
 
 public class JavaDriverClient
 {
@@ -56,13 +63,18 @@ public class JavaDriverClient
     private final EncryptionOptions.ClientEncryptionOptions encryptionOptions;
     private Cluster cluster;
     private Session session;
-    private final WhiteListPolicy whitelist;
+    private final LoadBalancingPolicy loadBalancingPolicy;
 
     private static final ConcurrentMap<String, PreparedStatement> stmts = new ConcurrentHashMap<>();
 
     public JavaDriverClient(StressSettings settings, String host, int port)
     {
         this(settings, Collections.singletonList(host), port, new EncryptionOptions.ClientEncryptionOptions());
+    }
+
+    public JavaDriverClient(StressSettings settings, List<String> hosts, int port)
+    {
+        this(settings, hosts, port, new EncryptionOptions.ClientEncryptionOptions());
     }
 
     public JavaDriverClient(StressSettings settings, List<String> hosts, int port, EncryptionOptions.ClientEncryptionOptions encryptionOptions)
@@ -73,12 +85,9 @@ public class JavaDriverClient
         this.username = settings.mode.username;
         this.password = settings.mode.password;
         this.authProvider = settings.mode.authProvider;
-        this.encryptionOptions = encryptionOptions;
-        if (settings.node.isWhiteList)
-            whitelist = new WhiteListPolicy(DCAwareRoundRobinPolicy.builder().build(), settings.node.resolveAll(settings.port.nativePort));
-        else
-            whitelist = null;
-        connectionsPerHost = settings.mode.connectionsPerHost == null ? 8 : settings.mode.connectionsPerHost;
+        this.encryptionOptions = new EncryptionOptions.ClientEncryptionOptions(encryptionOptions).applyConfig();
+        this.loadBalancingPolicy = loadBalancingPolicy(settings);
+        this.connectionsPerHost = settings.mode.connectionsPerHost == null ? 8 : settings.mode.connectionsPerHost;
 
         int maxThreadCount = 0;
         if (settings.rate.auto)
@@ -91,6 +100,22 @@ public class JavaDriverClient
         int requestsPerConnection = (maxThreadCount / connectionsPerHost) + connectionsPerHost;
 
         maxPendingPerConnection = settings.mode.maxPendingPerConnection == null ? Math.max(128, requestsPerConnection ) : settings.mode.maxPendingPerConnection;
+    }
+
+    private LoadBalancingPolicy loadBalancingPolicy(StressSettings settings)
+    {
+        DCAwareRoundRobinPolicy.Builder policyBuilder = DCAwareRoundRobinPolicy.builder();
+        if (settings.node.datacenter != null)
+            policyBuilder.withLocalDc(settings.node.datacenter);
+
+        LoadBalancingPolicy ret = null;
+        if (settings.node.datacenter != null)
+            ret = policyBuilder.build();
+
+        if (settings.node.isWhiteList)
+            ret = new WhiteListPolicy(ret == null ? policyBuilder.build() : ret, settings.node.resolveAll(settings.port.nativePort));
+
+        return new TokenAwarePolicy(ret == null ? policyBuilder.build() : ret);
     }
 
     public PreparedStatement prepare(String query)
@@ -121,7 +146,7 @@ public class JavaDriverClient
         for (String host : hosts)
         {
             HostAndPort hap = HostAndPort.fromString(host).withDefaultPort(port);
-            InetSocketAddress contact = new InetSocketAddress(InetAddress.getByName(hap.getHostText()), hap.getPort());
+            InetSocketAddress contact = new InetSocketAddress(InetAddress.getByName(hap.getHost()), hap.getPort());
             contacts.add(contact);
         }
 
@@ -131,16 +156,31 @@ public class JavaDriverClient
                                                 .withoutJMXReporting()
                                                 .withProtocolVersion(protocolVersion)
                                                 .withoutMetrics(); // The driver uses metrics 3 with conflict with our version
-        if (whitelist != null)
-            clusterBuilder.withLoadBalancingPolicy(whitelist);
+
+        if (loadBalancingPolicy != null)
+            clusterBuilder.withLoadBalancingPolicy(loadBalancingPolicy);
         clusterBuilder.withCompression(compression);
-        if (encryptionOptions.enabled)
+        if (encryptionOptions.getEnabled())
         {
             SSLContext sslContext;
-            sslContext = SSLFactory.createSSLContext(encryptionOptions, true);
-            SSLOptions sslOptions = JdkSSLOptions.builder()
-                                                 .withSSLContext(sslContext)
-                                                 .withCipherSuites(encryptionOptions.cipher_suites).build();
+            sslContext = SSLFactory.createSSLContext(encryptionOptions, REQUIRED);
+
+            // Temporarily override newSSLEngine to set accepted protocols until it is added to
+            // RemoteEndpointAwareJdkSSLOptions.  See CASSANDRA-13325 and CASSANDRA-16362.
+            RemoteEndpointAwareJdkSSLOptions sslOptions = new RemoteEndpointAwareJdkSSLOptions(sslContext, encryptionOptions.cipherSuitesArray())
+            {
+                @Override
+                protected SSLEngine newSSLEngine(SocketChannel channel, InetSocketAddress remoteEndpoint)
+                {
+                    SSLEngine engine = super.newSSLEngine(channel, remoteEndpoint);
+
+                    String[] acceptedProtocols = encryptionOptions.acceptedProtocolsArray();
+                    if (acceptedProtocols != null && acceptedProtocols.length > 0)
+                        engine.setEnabledProtocols(acceptedProtocols);
+
+                    return engine;
+                }
+            };
             clusterBuilder.withSSL(sslOptions);
         }
 
@@ -162,8 +202,8 @@ public class JavaDriverClient
                 connectionsPerHost);
         for (Host host : metadata.getAllHosts())
         {
-            System.out.printf("Datatacenter: %s; Host: %s; Rack: %s%n",
-                    host.getDatacenter(), host.getAddress(), host.getRack());
+            System.out.printf("Datacenter: %s; Host: %s; Rack: %s%n",
+                    host.getDatacenter(), host.getAddress() + ":" + host.getSocketAddress().getPort(), host.getRack());
         }
 
         session = cluster.connect();
@@ -182,14 +222,24 @@ public class JavaDriverClient
     public ResultSet execute(String query, org.apache.cassandra.db.ConsistencyLevel consistency)
     {
         SimpleStatement stmt = new SimpleStatement(query);
-        stmt.setConsistencyLevel(from(consistency));
+
+        if (consistency.isSerialConsistency())
+            stmt.setSerialConsistencyLevel(from(consistency));
+        else
+            stmt.setConsistencyLevel(from(consistency));
         return getSession().execute(stmt);
     }
 
     public ResultSet executePrepared(PreparedStatement stmt, List<Object> queryParams, org.apache.cassandra.db.ConsistencyLevel consistency)
     {
-
-        stmt.setConsistencyLevel(from(consistency));
+        if (consistency.isSerialConsistency())
+        {
+            stmt.setSerialConsistencyLevel(from(consistency));
+        }
+        else
+        {
+            stmt.setConsistencyLevel(from(consistency));
+        }
         BoundStatement bstmt = stmt.bind((Object[]) queryParams.toArray(new Object[queryParams.size()]));
         return getSession().execute(bstmt);
     }
@@ -223,6 +273,10 @@ public class JavaDriverClient
                 return com.datastax.driver.core.ConsistencyLevel.EACH_QUORUM;
             case LOCAL_ONE:
                 return com.datastax.driver.core.ConsistencyLevel.LOCAL_ONE;
+            case SERIAL:
+                return com.datastax.driver.core.ConsistencyLevel.SERIAL;
+            case LOCAL_SERIAL:
+                return com.datastax.driver.core.ConsistencyLevel.LOCAL_SERIAL;
         }
         throw new AssertionError();
     }

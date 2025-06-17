@@ -14,10 +14,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from cqlshlib.displaying import MAGENTA
-from datetime import datetime, timedelta
-import time
+from datetime import datetime, timezone
+
 from cassandra.query import QueryTrace, TraceUnavailable
+from cqlshlib.displaying import MAGENTA
 
 
 def print_trace_session(shell, session, session_id, partial_session=False):
@@ -38,41 +38,52 @@ def print_trace(shell, trace):
     """
     Print an already populated cassandra.query.QueryTrace instance.
     """
+    temp_query = None
+    temp_color = None
+    if shell.shunted_query_out is not None:
+        temp_query = shell.query_out
+        shell.query_out = shell.shunted_query_out
+        temp_color = shell.color
+        shell.color = shell.shunted_color
+
     rows = make_trace_rows(trace)
     if not rows:
         shell.printerr("No rows for session %s found." % (trace.trace_id,))
         return
-    names = ['activity', 'timestamp', 'source', 'source_elapsed']
+    names = ['activity', 'timestamp', 'source', 'source_elapsed', 'client']
 
-    formatted_names = map(shell.myformat_colname, names)
-    formatted_values = [map(shell.myformat_value, row) for row in rows]
+    formatted_names = list(map(shell.myformat_colname, names))
+    formatted_values = [list(map(shell.myformat_value, row)) for row in rows]
 
     shell.writeresult('')
     shell.writeresult('Tracing session: ', color=MAGENTA, newline=False)
     shell.writeresult(trace.trace_id)
     shell.writeresult('')
-    shell.print_formatted_result(formatted_names, formatted_values)
+    shell.print_formatted_result(formatted_names, formatted_values, with_header=True, tty=shell.tty)
     shell.writeresult('')
+
+    if temp_query is not None:
+        shell.query_out = temp_query
+        shell.color = temp_color
 
 
 def make_trace_rows(trace):
     if not trace.events:
         return []
 
-    rows = [[trace.request_type, str(datetime_from_utc_to_local(trace.started_at)), trace.coordinator, 0]]
+    rows = [[trace.request_type, str(datetime_from_utc_to_local(trace.started_at)), trace.coordinator, 0, trace.client]]
 
     # append main rows (from events table).
     for event in trace.events:
         rows.append(["%s [%s]" % (event.description, event.thread_name),
                      str(datetime_from_utc_to_local(event.datetime)),
                      event.source,
-                     total_micro_seconds(event.source_elapsed)])
+                     total_micro_seconds(event.source_elapsed),
+                     trace.client])
     # append footer row (from sessions table).
     if trace.duration:
         finished_at = (datetime_from_utc_to_local(trace.started_at) + trace.duration)
-        rows.append(['Request complete', str(finished_at), trace.coordinator, total_micro_seconds(trace.duration)])
-    else:
-        finished_at = trace.duration = "--"
+        rows.append(['Request complete', str(finished_at), trace.coordinator, total_micro_seconds(trace.duration), trace.client])
 
     return rows
 
@@ -85,6 +96,8 @@ def total_micro_seconds(td):
 
 
 def datetime_from_utc_to_local(utc_datetime):
-    now_timestamp = time.time()
-    offset = datetime.fromtimestamp(now_timestamp) - datetime.utcfromtimestamp(now_timestamp)
-    return utc_datetime + offset
+    """
+    Convert a naive UTC datetime to the local timezone.
+    This is necessary because the driver always returns naive datetime objects.
+    """
+    return utc_datetime.replace(tzinfo=timezone.utc).astimezone()

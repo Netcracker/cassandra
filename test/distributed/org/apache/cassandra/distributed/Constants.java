@@ -31,4 +31,23 @@ public final class Constants
      * of the YAML is not desired.
      */
     public static final String KEY_DTEST_API_CONFIG_CHECK = "dtest.api.config.check";
+
+    /**
+     * Property used by AbstractCluster to determine how a failed Instance startup state should be; if not set
+     * the Instance is marked as "shutdown", but this flag can be used to leave the instance "running" by setting
+     * 'true'.
+     */
+    public static final String KEY_DTEST_API_STARTUP_FAILURE_AS_SHUTDOWN = "dtest.api.startup.failure_as_shutdown";
+
+    public static final String KEY_DTEST_FULL_STARTUP = "dtest.api.startup.full_startup";
+
+    public static final String KEY_DTEST_JOIN_RING = "dtest.api.startup.join_ring";
+
+    /**
+     * Adds a timeout to instance startup so the tests don't block forever when startup bugs can happen.  This should
+     * almost always be paired with {@link #KEY_DTEST_API_STARTUP_FAILURE_AS_SHUTDOWN} as the startup still needs to cleanup.
+     *
+     * {@code c.set(Constants.KEY_DTEST_API_STARTUP_FAILURE_AS_SHUTDOWN, false); }
+     */
+    public static final String KEY_DTEST_STARTUP_TIMEOUT = "dtest.api.startup.timeout";
 }

@@ -26,13 +26,7 @@ public class NativePool extends MemtablePool
     }
 
     @Override
-    public boolean needToCopyOnHeap()
-    {
-        return true;
-    }
-
-    @Override
-    public NativeAllocator newAllocator()
+    public NativeAllocator newAllocator(String table)
     {
         return new NativeAllocator(this);
     }

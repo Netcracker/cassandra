@@ -1,4 +1,4 @@
-/**
+/*
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -19,31 +19,50 @@ package org.apache.cassandra.metrics;
 
 import com.codahale.metrics.Gauge;
 import com.codahale.metrics.Meter;
-import com.codahale.metrics.RatioGauge;
 import org.apache.cassandra.utils.memory.BufferPool;
 
 import static org.apache.cassandra.metrics.CassandraMetricsRegistry.Metrics;
 
 public class BufferPoolMetrics
 {
-    private static final MetricNameFactory factory = new DefaultNameFactory("BufferPool");
+    public static final String TYPE_NAME = "BufferPool";
+    /** Total number of hits */
+    public final Meter hits;
 
     /** Total number of misses */
     public final Meter misses;
 
-    /** Total size of buffer pools, in bytes */
+    /** Total threshold for a certain type of buffer pool*/
+    public final Gauge<Long> capacity;
+
+    /** Total size of buffer pools, in bytes, including overflow allocation */
     public final Gauge<Long> size;
 
-    public BufferPoolMetrics()
+    /** Total size, in bytes, of active buffered being used from the pool currently + overflow */
+    public final Gauge<Long> usedSize;
+
+    /**
+     * Total size, in bytes, of direct or heap buffers allocated by the pool but not part of the pool
+     * either because they are too large to fit or because the pool has exceeded its maximum limit or because it's
+     * on-heap allocation.
+     */
+    public final Gauge<Long> overflowSize;
+
+    public BufferPoolMetrics(String scope, BufferPool bufferPool)
     {
+        MetricNameFactory factory = new DefaultNameFactory(TYPE_NAME, scope);
+
+        hits = Metrics.meter(factory.createMetricName("Hits"));
+
         misses = Metrics.meter(factory.createMetricName("Misses"));
 
-        size = Metrics.register(factory.createMetricName("Size"), new Gauge<Long>()
-        {
-            public Long getValue()
-            {
-                return BufferPool.sizeInBytes();
-            }
-        });
+        capacity = Metrics.register(factory.createMetricName("Capacity"), bufferPool::memoryUsageThreshold);
+
+        overflowSize = Metrics.register(factory.createMetricName("OverflowSize"), bufferPool::overflowMemoryInBytes);
+
+        usedSize = Metrics.register(factory.createMetricName("UsedSize"), bufferPool::usedSizeInBytes);
+
+        size = Metrics.register(factory.createMetricName("Size"), bufferPool::sizeInBytes);
     }
+
 }

@@ -17,18 +17,46 @@
  */
 package org.apache.cassandra.io.util;
 
-import java.io.*;
+import java.io.DataInput;
+import java.io.DataInputStream;
+import java.io.EOFException;
+import java.io.IOException;
+import java.io.InputStream;
 
+import org.apache.cassandra.utils.Shared;
 import org.apache.cassandra.utils.vint.VIntCoding;
+import org.apache.cassandra.utils.vint.VIntCoding.VIntOutOfRangeException;
+
+import static org.apache.cassandra.utils.Shared.Scope.SIMULATION;
 
 /**
  * Extension to DataInput that provides support for reading varints
  */
+@Shared(scope = SIMULATION)
 public interface DataInputPlus extends DataInput
 {
+    /**
+     * Read a 64-bit integer back.
+     *
+     * This method assumes it was originally written using
+     * {@link DataOutputPlus#writeVInt(long)} or similar that zigzag encodes the vint.
+     */
     default long readVInt() throws IOException
     {
         return VIntCoding.readVInt(this);
+    }
+
+    /**
+     * Read up to a 32-bit integer back.
+     *
+     * This method assumes the integer was originally written using
+     * {@link DataOutputPlus#writeVInt32(int)} or similar that zigzag encodes the vint.
+     *
+     * @throws VIntOutOfRangeException If the vint doesn't fit into a 32-bit integer
+     */
+    default int readVInt32() throws IOException
+    {
+        return VIntCoding.readVInt32(this);
     }
 
     /**
@@ -41,6 +69,46 @@ public interface DataInputPlus extends DataInput
     default long readUnsignedVInt() throws IOException
     {
         return VIntCoding.readUnsignedVInt(this);
+    }
+
+    /**
+     * Read up to a 32-bit integer back.
+     *
+     * This method assumes the original integer was written using {@link DataOutputPlus#writeUnsignedVInt32(int)}
+     * or similar that doesn't zigzag encodes the vint.
+     *
+     * @throws VIntOutOfRangeException If the vint doesn't fit into a 32-bit integer
+     */
+    default int readUnsignedVInt32() throws IOException
+    {
+        return VIntCoding.readUnsignedVInt32(this);
+    }
+
+    default long readLeastSignificantBytes(int bytes) throws IOException
+    {
+        switch (bytes)
+        {
+            case 0: return 0;
+            case 1: return readByte() & 0xffL;
+            case 2: return readShort() & 0xffffL;
+            case 3:
+                return ((readShort() & 0xffffL) << 8)
+                     | (readByte() & 0xffL);
+            case 4:
+                return (readInt() & 0xffffffffL);
+            case 5:
+                return ((readInt() & 0xffffffffL) << 8)
+                     | (readByte() & 0xffL);
+            case 6:
+                return ((readInt() & 0xffffffffL) << 16)
+                     | (readShort() & 0xffffL);
+            case 7:
+                return ((readInt() & 0xffffffffL) << 24)
+                     | ((readShort() & 0xffffL) << 8)
+                     | (readByte() & 0xffL);
+            case 8: return readLong();
+            default: throw new IllegalArgumentException();
+        }
     }
 
     /**
@@ -58,14 +126,85 @@ public interface DataInputPlus extends DataInput
             throw new EOFException("EOF after " + skipped + " bytes out of " + n);
     }
 
+    @Override
+    default byte readByte() throws IOException
+    {
+        return (byte) readUnsignedByte();
+    }
+
+    @Override
+    default boolean readBoolean() throws IOException
+    {
+        return readUnsignedByte() != 0;
+    }
+
+    @Override
+    default short readShort() throws IOException
+    {
+        int ch1 = readUnsignedByte();
+        int ch2 = readUnsignedByte();
+        if ((ch1 | ch2) < 0)
+            throw new EOFException();
+        return (short)((ch1 << 8) + (ch2 << 0));
+    }
+
+    @Override
+    default int readUnsignedShort() throws IOException
+    {
+        int ch1 = readUnsignedByte();
+        int ch2 = readUnsignedByte();
+        if ((ch1 | ch2) < 0)
+            throw new EOFException();
+        return (ch1 << 8) + (ch2 << 0);
+    }
+
+    @Override
+    default char readChar() throws IOException
+    {
+        int ch1 = readUnsignedByte();
+        int ch2 = readUnsignedByte();
+        if ((ch1 | ch2) < 0)
+            throw new EOFException();
+        return (char)((ch1 << 8) + (ch2 << 0));
+    }
+
+    @Override
+    default int readInt() throws IOException
+    {
+        int ch1 = readUnsignedByte();
+        int ch2 = readUnsignedByte();
+        int ch3 = readUnsignedByte();
+        int ch4 = readUnsignedByte();
+        if ((ch1 | ch2 | ch3 | ch4) < 0)
+            throw new EOFException();
+        return ((ch1 << 24) + (ch2 << 16) + (ch3 << 8) + (ch4 << 0));
+    }
+
+    @Override
+    long readLong() throws IOException;
+
+    @Override
+    default float readFloat() throws IOException
+    {
+        return Float.intBitsToFloat(readInt());
+    }
+
+    @Override
+    default double readDouble() throws IOException
+    {
+        return Double.longBitsToDouble(readLong());
+    }
+
+    @Override
+    default String readUTF() throws IOException
+    {
+        return DataInputStream.readUTF(this);
+    }
+
     /**
      * Wrapper around an InputStream that provides no buffering but can decode varints
      */
-    public class DataInputStreamPlus extends DataInputStream implements DataInputPlus
+    abstract class DataInputStreamPlus extends InputStream implements DataInputPlus
     {
-        public DataInputStreamPlus(InputStream is)
-        {
-            super(is);
-        }
     }
 }

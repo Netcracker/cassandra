@@ -20,24 +20,23 @@ package org.apache.cassandra.index;
 
 import java.util.*;
 import java.util.concurrent.Callable;
-import java.util.function.BiFunction;
 
 import org.apache.cassandra.Util;
-import org.apache.cassandra.config.ColumnDefinition;
+import org.apache.cassandra.db.partitions.UnfilteredPartitionIterator;
+import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.cql3.Operator;
 import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.filter.RowFilter;
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.db.marshal.UTF8Type;
-import org.apache.cassandra.db.partitions.PartitionIterator;
+import org.apache.cassandra.db.memtable.Memtable;
 import org.apache.cassandra.db.partitions.PartitionUpdate;
-import org.apache.cassandra.db.partitions.UnfilteredPartitionIterator;
 import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.index.transactions.IndexTransaction;
 import org.apache.cassandra.schema.IndexMetadata;
+import org.apache.cassandra.service.ClientState;
 import org.apache.cassandra.utils.Pair;
-import org.apache.cassandra.utils.concurrent.OpOrder;
 
 /**
  * Basic custom index implementation for testing.
@@ -54,6 +53,7 @@ public class StubIndex implements Index
     public List<Row> rowsInserted = new ArrayList<>();
     public List<Row> rowsDeleted = new ArrayList<>();
     public List<Pair<Row,Row>> rowsUpdated = new ArrayList<>();
+    public volatile boolean preJoinInvocation;
     private IndexMetadata indexMetadata;
     private ColumnFamilyStore baseCfs;
 
@@ -77,12 +77,12 @@ public class StubIndex implements Index
         return false;
     }
 
-    public boolean dependsOn(ColumnDefinition column)
+    public boolean dependsOn(ColumnMetadata column)
     {
         return false;
     }
 
-    public boolean supportsExpression(ColumnDefinition column, Operator operator)
+    public boolean supportsExpression(ColumnMetadata column, Operator operator)
     {
         return operator == Operator.EQ;
     }
@@ -98,10 +98,11 @@ public class StubIndex implements Index
     }
 
     public Indexer indexerFor(final DecoratedKey key,
-                              PartitionColumns columns,
-                              int nowInSec,
-                              OpOrder.Group opGroup,
-                              IndexTransaction.Type transactionType)
+                              RegularAndStaticColumns columns,
+                              long nowInSec,
+                              WriteContext ctx,
+                              IndexTransaction.Type transactionType,
+                              Memtable memtable)
     {
         return new Indexer()
         {
@@ -152,7 +153,8 @@ public class StubIndex implements Index
         return indexMetadata;
     }
 
-    public void register(IndexRegistry registry){
+    public void register(IndexRegistry registry)
+    {
         registry.registerIndex(this);
     }
 
@@ -161,7 +163,7 @@ public class StubIndex implements Index
         return Optional.empty();
     }
 
-    public Collection<ColumnDefinition> getIndexedColumns()
+    public Collection<ColumnMetadata> getIndexedColumns()
     {
         return Collections.emptySet();
     }
@@ -174,6 +176,14 @@ public class StubIndex implements Index
     public Callable<?> getTruncateTask(long truncatedAt)
     {
         return null;
+    }
+
+    public Callable<?> getPreJoinTask(boolean hadBootstrap)
+    {
+        return () -> {
+            preJoinInvocation = true;
+            return null;
+        };
     }
 
     public Callable<?> getInvalidateTask()
@@ -191,18 +201,40 @@ public class StubIndex implements Index
         return 0;
     }
 
-    public void validate(PartitionUpdate update) throws InvalidRequestException
+    @Override
+    public void validate(PartitionUpdate update, ClientState state) throws InvalidRequestException
     {
 
     }
 
     public Searcher searcherFor(final ReadCommand command)
     {
-        return (orderGroup) -> Util.executeLocally((PartitionRangeReadCommand)command, baseCfs, orderGroup);
+        return new Searcher(command);
     }
 
-    public BiFunction<PartitionIterator, ReadCommand, PartitionIterator> postProcessorFor(ReadCommand readCommand)
+    protected class Searcher implements Index.Searcher
     {
-        return (iter, command) -> iter;
+        private final ReadCommand command;
+
+        Searcher(ReadCommand command)
+        {
+            this.command = command;
+        }
+
+        @Override
+        public ReadCommand command()
+        {
+            return command;
+        }
+
+        @Override
+        public UnfilteredPartitionIterator search(ReadExecutionController controller)
+        {
+            if (command instanceof PartitionRangeReadCommand)
+                return Util.executeLocally((PartitionRangeReadCommand)command, baseCfs, controller);
+            if (command instanceof SinglePartitionReadCommand)
+                return Util.executeLocally((SinglePartitionReadCommand) command, baseCfs, controller);
+            throw new IllegalArgumentException("Unexpected ReadCommand type: " + command.getClass());
+        }
     }
 }

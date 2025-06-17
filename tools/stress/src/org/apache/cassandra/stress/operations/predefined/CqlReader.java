@@ -28,9 +28,9 @@ import java.util.List;
 
 import org.apache.cassandra.stress.generate.PartitionGenerator;
 import org.apache.cassandra.stress.generate.SeedManager;
+import org.apache.cassandra.stress.report.Timer;
 import org.apache.cassandra.stress.settings.Command;
 import org.apache.cassandra.stress.settings.StressSettings;
-import org.apache.cassandra.stress.util.Timer;
 
 public class CqlReader extends CqlOperation<ByteBuffer[][]>
 {
@@ -59,7 +59,7 @@ public class CqlReader extends CqlOperation<ByteBuffer[][]>
             }
         }
 
-        query.append(" FROM ").append(wrapInQuotes(type.table));
+        query.append(" FROM ").append(settings.schema.keyspace).append('.').append(wrapInQuotes(type.table));
         query.append(" WHERE KEY=?");
         return query.toString();
     }
@@ -71,10 +71,10 @@ public class CqlReader extends CqlOperation<ByteBuffer[][]>
     }
 
     @Override
-    protected CqlRunOp<ByteBuffer[][]> buildRunOp(ClientWrapper client, String query, Object queryId, List<Object> params, ByteBuffer key)
+    protected CqlRunOp<ByteBuffer[][]> buildRunOp(QueryExecutor<?> queryExecutor, List<Object> params, ByteBuffer key)
     {
         List<ByteBuffer> expectRow = getColumnValues();
-        return new CqlRunOpMatchResults(client, query, queryId, params, key, Arrays.asList(expectRow));
+        return new CqlRunOpMatchResults(queryExecutor, params, key, Arrays.asList(expectRow));
     }
 
 }

@@ -15,70 +15,107 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
 package org.apache.cassandra.repair;
 
-import java.net.InetAddress;
 import java.util.List;
+import java.util.concurrent.TimeUnit;
 
-import com.google.common.util.concurrent.AbstractFuture;
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Preconditions;
+
+import org.apache.cassandra.utils.concurrent.AsyncFuture;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.dht.Range;
 import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.locator.InetAddressAndPort;
+import org.apache.cassandra.repair.messages.RepairMessage;
+import org.apache.cassandra.repair.messages.SyncRequest;
+import org.apache.cassandra.streaming.PreviewKind;
 import org.apache.cassandra.tracing.Tracing;
 
-/**
- * SyncTask takes the difference of MerkleTrees between two nodes
- * and perform necessary operation to repair replica.
- */
-public abstract class SyncTask extends AbstractFuture<SyncStat> implements Runnable
+import static org.apache.cassandra.net.Verb.SYNC_REQ;
+import static org.apache.cassandra.repair.messages.RepairMessage.notDone;
+
+public abstract class SyncTask extends AsyncFuture<SyncStat> implements Runnable
 {
-    private static Logger logger = LoggerFactory.getLogger(SyncTask.class);
+    private static final Logger logger = LoggerFactory.getLogger(SyncTask.class);
 
+    protected final SharedContext ctx;
     protected final RepairJobDesc desc;
-    protected final InetAddress firstEndpoint;
-    protected final InetAddress secondEndpoint;
+    @VisibleForTesting
+    public final List<Range<Token>> rangesToSync;
+    protected final PreviewKind previewKind;
+    protected final SyncNodePair nodePair;
 
-    private final List<Range<Token>> rangesToSync;
+    protected volatile long startTime = Long.MIN_VALUE;
+    protected final SyncStat stat;
 
-    protected volatile SyncStat stat;
-
-    public SyncTask(RepairJobDesc desc, InetAddress firstEndpoint, InetAddress secondEndpoint, List<Range<Token>> rangesToSync)
+    protected SyncTask(SharedContext ctx, RepairJobDesc desc, InetAddressAndPort primaryEndpoint, InetAddressAndPort peer, List<Range<Token>> rangesToSync, PreviewKind previewKind)
     {
+        Preconditions.checkArgument(!peer.equals(primaryEndpoint), "Sending and receiving node are the same: %s", peer);
+        this.ctx = ctx;
         this.desc = desc;
-        this.firstEndpoint = firstEndpoint;
-        this.secondEndpoint = secondEndpoint;
         this.rangesToSync = rangesToSync;
+        this.nodePair = new SyncNodePair(primaryEndpoint, peer);
+        this.previewKind = previewKind;
+        this.stat = new SyncStat(nodePair, rangesToSync);
+    }
+
+    protected abstract void startSync();
+
+    public SyncNodePair nodePair()
+    {
+        return nodePair;
     }
 
     /**
      * Compares trees, and triggers repairs for any ranges that mismatch.
      */
-    public void run()
+    public final void run()
     {
-        stat = new SyncStat(new NodePair(firstEndpoint, secondEndpoint), rangesToSync.size());
+        startTime = ctx.clock().currentTimeMillis();
 
         // choose a repair method based on the significance of the difference
-        String format = String.format("[repair #%s] Endpoints %s and %s %%s for %s", desc.sessionId, firstEndpoint, secondEndpoint, desc.columnFamily);
+        String format = String.format("%s Endpoints %s and %s %%s for %s", previewKind.logPrefix(desc.sessionId), nodePair.coordinator, nodePair.peer, desc.columnFamily);
         if (rangesToSync.isEmpty())
         {
             logger.info(String.format(format, "are consistent"));
-            Tracing.traceRepair("Endpoint {} is consistent with {} for {}", firstEndpoint, secondEndpoint, desc.columnFamily);
-            set(stat);
+            Tracing.traceRepair("Endpoint {} is consistent with {} for {}", nodePair.coordinator, nodePair.peer, desc.columnFamily);
+            trySuccess(stat);
             return;
         }
 
         // non-0 difference: perform streaming repair
         logger.info(String.format(format, "have " + rangesToSync.size() + " range(s) out of sync"));
-        Tracing.traceRepair("Endpoint {} has {} range(s) out of sync with {} for {}", firstEndpoint, rangesToSync.size(), secondEndpoint, desc.columnFamily);
-        startSync(rangesToSync);
+        Tracing.traceRepair("Endpoint {} has {} range(s) out of sync with {} for {}", nodePair.coordinator, rangesToSync.size(), nodePair.peer, desc.columnFamily);
+        startSync();
     }
 
-    public SyncStat getCurrentStat()
+    public boolean isLocal()
     {
-        return stat;
+        return false;
     }
 
-    protected abstract void startSync(List<Range<Token>> differences);
+    protected void finished()
+    {
+        if (startTime != Long.MIN_VALUE)
+            Keyspace.open(desc.keyspace).getColumnFamilyStore(desc.columnFamily).metric.repairSyncTime.update(ctx.clock().currentTimeMillis() - startTime, TimeUnit.MILLISECONDS);
+    }
+
+    public void abort(Throwable reason)
+    {
+        tryFailure(reason);
+    }
+
+    void sendRequest(SyncRequest request, InetAddressAndPort to)
+    {
+        RepairMessage.sendMessageWithFailureCB(ctx, notDone(this), request,
+                                               SYNC_REQ,
+                                               to,
+                                               this::tryFailure);
+    }
 }

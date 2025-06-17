@@ -33,7 +33,7 @@ import org.apache.cassandra.io.util.DataOutputPlus;
  * to a single interval covering both).
  *
  * The set is stored as a sorted map from interval starts to the corresponding end. The map satisfies
- *   curr().getKey() <= curr().getValue() < next().getKey()
+ *   {@code curr().getKey() <= curr().getValue() < next().getKey()}
  */
 public class IntervalSet<T extends Comparable<T>>
 {
@@ -58,7 +58,7 @@ public class IntervalSet<T extends Comparable<T>>
     @SuppressWarnings("unchecked")
     public static <T extends Comparable<T>> IntervalSet<T> empty()
     {
-        return (IntervalSet<T>) EMPTY;
+        return EMPTY;
     }
 
     public boolean contains(T position)
@@ -123,7 +123,7 @@ public class IntervalSet<T extends Comparable<T>>
                     pointSerializer.serialize(en.getValue(), out);
                 }
             }
-    
+
             public IntervalSet<T> deserialize(DataInputPlus in) throws IOException
             {
                 int count = in.readInt();
@@ -132,7 +132,7 @@ public class IntervalSet<T extends Comparable<T>>
                     ranges.put(pointSerializer.deserialize(in), pointSerializer.deserialize(in));
                 return new IntervalSet<T>(ImmutableSortedMap.copyOfSorted(ranges));
             }
-    
+
             public long serializedSize(IntervalSet<T> intervals)
             {
                 long size = TypeSizes.sizeof(intervals.ranges.size());
@@ -150,7 +150,7 @@ public class IntervalSet<T extends Comparable<T>>
      * Builder of interval sets, applying the necessary normalization while adding ranges.
      *
      * Data is stored as above, as a sorted map from interval starts to the corresponding end, which satisfies
-     *   curr().getKey() <= curr().getValue() < next().getKey()
+     *   {@code curr().getKey() <= curr().getValue() < next().getKey()}
      */
     static public class Builder<T extends Comparable<T>>
     {

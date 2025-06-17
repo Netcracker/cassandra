@@ -18,20 +18,47 @@
 package org.apache.cassandra.tools.nodetool;
 
 import java.io.PrintStream;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import javax.management.openmbean.TabularData;
 
-import io.airlift.command.Command;
+import io.airlift.airline.Command;
+import io.airlift.airline.Option;
 import org.apache.cassandra.io.util.FileUtils;
 import org.apache.cassandra.tools.NodeProbe;
 import org.apache.cassandra.tools.NodeTool.NodeToolCmd;
 import org.apache.cassandra.tools.nodetool.formatter.TableBuilder;
 
-@Command(name = "listsnapshots", description = "Lists all the snapshots along with the size on disk and true size.")
+@Command(name = "listsnapshots", description = "Lists all the snapshots along with the size on disk and true size. True size is the total size of all SSTables which are not backed up to disk. Size on disk is total size of the snapshot on disk. Total TrueDiskSpaceUsed does not make any SSTable deduplication.")
 public class ListSnapshots extends NodeToolCmd
 {
+    @Option(title = "no_ttl",
+    name = { "-nt", "--no-ttl" },
+    description = "Skip snapshots with TTL")
+    private boolean noTTL = false;
+
+    @Option(title = "ephemeral",
+    name = { "-e", "--ephemeral" },
+    description = "Include ephememeral snapshots")
+    private boolean includeEphemeral = false;
+
+    @Option(title = "keyspace",
+    name = { "-k", "--keyspace" },
+    description = "Include snapshots of specified keyspace name")
+    private String keyspace = null;
+
+    @Option(title = "table",
+    name = { "-t", "--table" },
+    description = "Include snapshots of specified table name")
+    private String table = null;
+
+    @Option(title = "snapshot",
+    name = { "-n", "--snapshot"},
+    description = "Include snapshots of specified name")
+    private String snapshotName = null;
+
     @Override
     public void execute(NodeProbe probe)
     {
@@ -40,19 +67,34 @@ public class ListSnapshots extends NodeToolCmd
         {
             out.println("Snapshot Details: ");
 
-            final Map<String,TabularData> snapshotDetails = probe.getSnapshotDetails();
+            Map<String, String> options = new HashMap<>();
+            options.put("no_ttl", Boolean.toString(noTTL));
+            options.put("include_ephemeral", Boolean.toString(includeEphemeral));
+            if (keyspace != null)
+                options.put("keyspace", keyspace);
+            if (table != null)
+                options.put("table", table);
+            if (snapshotName != null)
+                options.put("snapshot", snapshotName);
+
+            final Map<String, TabularData> snapshotDetails = probe.getSnapshotDetails(options);
             if (snapshotDetails.isEmpty())
             {
                 out.println("There are no snapshots");
                 return;
             }
 
-            final long trueSnapshotsSize = probe.trueSnapshotsSize();
-
             TableBuilder table = new TableBuilder();
             // display column names only once
-            final List<String> indexNames = snapshotDetails.entrySet().iterator().next().getValue().getTabularType().getIndexNames();
-            table.add(indexNames.toArray(new String[indexNames.size()]));
+            List<String> indexNames = snapshotDetails.entrySet().iterator().next().getValue().getTabularType().getIndexNames();
+            indexNames.subList(0, indexNames.size() - 1);
+
+            if (includeEphemeral)
+                table.add(indexNames.subList(0, indexNames.size() - 1).toArray(new String[indexNames.size() - 1]));
+            else
+                table.add(indexNames.subList(0, indexNames.size() - 2).toArray(new String[indexNames.size() - 2]));
+
+            long totalTrueDiskSize = 0;
 
             for (final Map.Entry<String, TabularData> snapshotDetail : snapshotDetails.entrySet())
             {
@@ -60,12 +102,17 @@ public class ListSnapshots extends NodeToolCmd
                 for (Object eachValue : values)
                 {
                     final List<?> value = (List<?>) eachValue;
-                    table.add(value.toArray(new String[value.size()]));
+                    if (includeEphemeral)
+                        table.add(value.subList(0, value.size() - 1).toArray(new String[value.size() - 1]));
+                    else
+                        table.add(value.subList(0, value.size() - 2).toArray(new String[value.size() - 2]));
+
+                    totalTrueDiskSize += (Long) value.get(value.size() - 1);
                 }
             }
             table.printTo(out);
 
-            out.println("\nTotal TrueDiskSpaceUsed: " + FileUtils.stringifyFileSize(trueSnapshotsSize) + "\n");
+            out.println("\nTotal TrueDiskSpaceUsed: " + FileUtils.stringifyFileSize(totalTrueDiskSize) + '\n');
         }
         catch (Exception e)
         {

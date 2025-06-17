@@ -20,14 +20,18 @@ package org.apache.cassandra.cql3;
 import java.nio.ByteBuffer;
 import java.util.List;
 
-import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.cql3.functions.Function;
+import org.apache.cassandra.cql3.terms.Term;
 import org.apache.cassandra.db.ExpirationDateOverflowHandling;
+import org.apache.cassandra.db.LivenessInfo;
 import org.apache.cassandra.db.marshal.Int32Type;
 import org.apache.cassandra.db.marshal.LongType;
 import org.apache.cassandra.exceptions.InvalidRequestException;
+import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.serializers.MarshalException;
 import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.commons.lang3.builder.ToStringBuilder;
+import org.apache.commons.lang3.builder.ToStringStyle;
 
 /**
  * Utility class for the Parser to gather attributes for modification
@@ -43,12 +47,14 @@ public class Attributes
      */
     public static final int MAX_TTL = 20 * 365 * 24 * 60 * 60; // 20 years in seconds
 
+    private static final Attributes NONE = new Attributes(null, null);
+
     private final Term timestamp;
     private final Term timeToLive;
 
     public static Attributes none()
     {
-        return new Attributes(null, null);
+        return NONE;
     }
 
     private Attributes(Term timestamp, Term timeToLive)
@@ -99,7 +105,7 @@ public class Attributes
         return LongType.instance.compose(tval);
     }
 
-    public int getTimeToLive(QueryOptions options, CFMetaData metadata) throws InvalidRequestException
+    public int getTimeToLive(QueryOptions options, TableMetadata metadata) throws InvalidRequestException
     {
         if (timeToLive == null)
         {
@@ -109,9 +115,14 @@ public class Attributes
 
         ByteBuffer tval = timeToLive.bindAndGet(options);
         if (tval == null)
-            throw new InvalidRequestException("Invalid null value of TTL");
+            return 0;
 
-        if (tval == ByteBufferUtil.UNSET_BYTE_BUFFER) // treat as unlimited
+        if (tval == ByteBufferUtil.UNSET_BYTE_BUFFER)
+            return metadata.params.defaultTimeToLive;
+
+        // byte[0] and null are the same for Int32Type.  UNSET_BYTE_BUFFER is also byte[0] but we rely on pointer
+        // identity, so need to check this after checking that
+        if (ByteBufferUtil.EMPTY_BYTE_BUFFER.equals(tval))
             return 0;
 
         try
@@ -120,7 +131,7 @@ public class Attributes
         }
         catch (MarshalException e)
         {
-            throw new InvalidRequestException("Invalid timestamp value: " + tval);
+            throw new InvalidRequestException("Invalid TTL value: " + tval);
         }
 
         int ttl = Int32Type.instance.compose(tval);
@@ -129,6 +140,9 @@ public class Attributes
 
         if (ttl > MAX_TTL)
             throw new InvalidRequestException(String.format("ttl is too large. requested (%d) maximum (%d)", ttl, MAX_TTL));
+
+        if (metadata.params.defaultTimeToLive != LivenessInfo.NO_TTL && ttl == LivenessInfo.NO_TTL)
+            return LivenessInfo.NO_TTL;
 
         ExpirationDateOverflowHandling.maybeApplyExpirationDateOverflowPolicy(metadata, ttl, false);
 
@@ -164,5 +178,11 @@ public class Attributes
         {
             return new ColumnSpecification(ksName, cfName, new ColumnIdentifier("[ttl]", true), Int32Type.instance);
         }
+    }
+    
+    @Override
+    public String toString()
+    {
+        return ToStringBuilder.reflectionToString(this, ToStringStyle.SHORT_PREFIX_STYLE);
     }
 }

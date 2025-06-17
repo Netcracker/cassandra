@@ -23,7 +23,8 @@ import com.google.common.base.Objects;
 import com.google.common.collect.Sets;
 import org.apache.commons.lang3.StringUtils;
 
-import org.apache.cassandra.config.Schema;
+import org.apache.cassandra.schema.Schema;
+import org.apache.cassandra.schema.SchemaConstants;
 
 /**
  * The primary type of resource in Cassandra.
@@ -31,13 +32,14 @@ import org.apache.cassandra.config.Schema;
  * Used to represent a table or a keyspace or the root level "data" resource.
  * "data"                                 - the root level data resource.
  * "data/keyspace_name"                   - keyspace-level data resource.
+ * "data/keyspace_name/*"                 - all tables-level data resource.
  * "data/keyspace_name/table_name"        - table-level data resource.
  */
 public class DataResource implements IResource
 {
     enum Level
     {
-        ROOT, KEYSPACE, TABLE
+        ROOT, KEYSPACE, ALL_TABLES, TABLE
     }
 
     // permissions which may be granted on tables
@@ -45,40 +47,46 @@ public class DataResource implements IResource
                                                                                          Permission.DROP,
                                                                                          Permission.SELECT,
                                                                                          Permission.MODIFY,
-                                                                                         Permission.AUTHORIZE);
+                                                                                         Permission.AUTHORIZE,
+                                                                                         Permission.UNMASK,
+                                                                                         Permission.SELECT_MASKED);
+
+    // permissions which may be granted on all tables of a given keyspace
+    private static final Set<Permission> ALL_TABLES_LEVEL_PERMISSIONS = Sets.immutableEnumSet(Permission.CREATE,
+                                                                                              Permission.ALTER,
+                                                                                              Permission.DROP,
+                                                                                              Permission.SELECT,
+                                                                                              Permission.MODIFY,
+                                                                                              Permission.AUTHORIZE,
+                                                                                              Permission.UNMASK,
+                                                                                              Permission.SELECT_MASKED);
+
     // permissions which may be granted on one or all keyspaces
     private static final Set<Permission> KEYSPACE_LEVEL_PERMISSIONS = Sets.immutableEnumSet(Permission.CREATE,
                                                                                             Permission.ALTER,
                                                                                             Permission.DROP,
                                                                                             Permission.SELECT,
                                                                                             Permission.MODIFY,
-                                                                                            Permission.AUTHORIZE);
+                                                                                            Permission.AUTHORIZE,
+                                                                                            Permission.UNMASK,
+                                                                                            Permission.SELECT_MASKED);
     private static final String ROOT_NAME = "data";
-    private static final DataResource ROOT_RESOURCE = new DataResource();
+    private static final DataResource ROOT_RESOURCE = new DataResource(Level.ROOT, null, null);
 
     private final Level level;
     private final String keyspace;
     private final String table;
 
-    private DataResource()
-    {
-        level = Level.ROOT;
-        keyspace = null;
-        table = null;
-    }
+    // memoized hashcode since DataRessource is immutable and used in hashmaps often
+    private final transient int hash;
 
-    private DataResource(String keyspace)
+    private DataResource(Level level, String keyspace, String table)
     {
-        level = Level.KEYSPACE;
-        this.keyspace = keyspace;
-        table = null;
-    }
-
-    private DataResource(String keyspace, String table)
-    {
-        level = Level.TABLE;
+        this.level = level;
         this.keyspace = keyspace;
         this.table = table;
+
+        this.hash = Objects.hashCode(level, keyspace, table);
     }
 
     /**
@@ -97,7 +105,18 @@ public class DataResource implements IResource
      */
     public static DataResource keyspace(String keyspace)
     {
-        return new DataResource(keyspace);
+        return new DataResource(Level.KEYSPACE, keyspace, null);
+    }
+
+    /**
+     * Creates a DataResource representing all tables of a keyspace.
+     *
+     * @param keyspace Name of the keyspace.
+     * @return DataResource instance representing the keyspace.
+     */
+    public static DataResource allTables(String keyspace)
+    {
+        return new DataResource(Level.ALL_TABLES, keyspace, null);
     }
 
     /**
@@ -109,7 +128,7 @@ public class DataResource implements IResource
      */
     public static DataResource table(String keyspace, String table)
     {
-        return new DataResource(keyspace, table);
+        return new DataResource(Level.TABLE, keyspace, table);
     }
 
     /**
@@ -131,6 +150,9 @@ public class DataResource implements IResource
         if (parts.length == 2)
             return keyspace(parts[1]);
 
+        if ("*".equals(parts[2]))
+            return allTables(parts[1]);
+
         return table(parts[1], parts[2]);
     }
 
@@ -145,6 +167,8 @@ public class DataResource implements IResource
                 return ROOT_NAME;
             case KEYSPACE:
                 return String.format("%s/%s", ROOT_NAME, keyspace);
+            case ALL_TABLES:
+                return String.format("%s/%s/*", ROOT_NAME, keyspace);
             case TABLE:
                 return String.format("%s/%s/%s", ROOT_NAME, keyspace, table);
         }
@@ -160,8 +184,10 @@ public class DataResource implements IResource
         {
             case KEYSPACE:
                 return root();
-            case TABLE:
+            case ALL_TABLES:
                 return keyspace(keyspace);
+            case TABLE:
+                return allTables(keyspace);
         }
         throw new IllegalStateException("Root-level resource can't have a parent");
     }
@@ -174,6 +200,11 @@ public class DataResource implements IResource
     public boolean isKeyspaceLevel()
     {
         return level == Level.KEYSPACE;
+    }
+
+    public boolean isAllTablesLevel()
+    {
+        return level == Level.ALL_TABLES;
     }
 
     public boolean isTableLevel()
@@ -218,9 +249,11 @@ public class DataResource implements IResource
             case ROOT:
                 return true;
             case KEYSPACE:
-                return Schema.instance.getKeyspaces().contains(keyspace);
+            case ALL_TABLES:
+                return SchemaConstants.isVirtualSystemKeyspace(keyspace) ||
+                       Schema.instance.getKeyspaces().contains(keyspace);
             case TABLE:
-                return Schema.instance.getCFMetaData(keyspace, table) != null;
+                return Schema.instance.getTableMetadata(keyspace, table) != null;
         }
         throw new AssertionError();
     }
@@ -232,6 +265,8 @@ public class DataResource implements IResource
             case ROOT:
             case KEYSPACE:
                 return KEYSPACE_LEVEL_PERMISSIONS;
+            case ALL_TABLES:
+                return ALL_TABLES_LEVEL_PERMISSIONS;
             case TABLE:
                 return TABLE_LEVEL_PERMISSIONS;
         }
@@ -247,6 +282,8 @@ public class DataResource implements IResource
                 return "<all keyspaces>";
             case KEYSPACE:
                 return String.format("<keyspace %s>", keyspace);
+            case ALL_TABLES:
+                return String.format("<all tables in %s>", keyspace);
             case TABLE:
                 return String.format("<table %s.%s>", keyspace, table);
         }
@@ -272,6 +309,6 @@ public class DataResource implements IResource
     @Override
     public int hashCode()
     {
-        return Objects.hashCode(level, keyspace, table);
+        return hash;
     }
 }

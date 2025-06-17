@@ -18,7 +18,6 @@
 
 package org.apache.cassandra.hints;
 
-import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
@@ -33,18 +32,22 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Stream;
 
-import io.airlift.command.Cli;
-import io.airlift.command.Command;
-import io.airlift.command.Option;
+import io.airlift.airline.Cli;
+import io.airlift.airline.Command;
+import io.airlift.airline.Option;
 import org.apache.cassandra.SchemaLoader;
 import org.apache.cassandra.UpdateBuilder;
 import org.apache.cassandra.Util;
-import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.config.DatabaseDescriptor;
-import org.apache.cassandra.config.Schema;
 import org.apache.cassandra.db.Mutation;
+import org.apache.cassandra.db.marshal.AsciiType;
+import org.apache.cassandra.db.marshal.BytesType;
 import org.apache.cassandra.io.FSWriteError;
+import org.apache.cassandra.io.util.File;
 import org.apache.cassandra.io.util.FileUtils;
+import org.apache.cassandra.schema.KeyspaceParams;
+import org.apache.cassandra.schema.Schema;
+import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.utils.FBUtilities;
 
 public class HintsMaker
@@ -127,7 +130,7 @@ public class HintsMaker
 
                 HintsDescriptor hintsDescriptor = new HintsDescriptor(hostId, descriptorTimestamp);
 
-                final CFMetaData cfMetaData = Schema.instance.getCFMetaData(KEYSPACE, TABLE);
+                final TableMetadata tableMetadata = Schema.instance.getTableMetadata(KEYSPACE, TABLE);
 
                 final AtomicLong counter = new AtomicLong(0);
                 final AtomicInteger hash = new AtomicInteger(0);
@@ -138,7 +141,7 @@ public class HintsMaker
                 Iterator<Mutation> mutationIterator = Stream.generate(() -> {
                     ThreadLocalRandom current = ThreadLocalRandom.current();
                     ByteBuffer key = randomBytes(16, current);
-                    UpdateBuilder builder = UpdateBuilder.create(cfMetaData, Util.dk(key));
+                    UpdateBuilder builder = UpdateBuilder.create(tableMetadata, Util.dk(key));
 
                     for (int i = 0; i < numCells; i++)
                     {
@@ -160,10 +163,10 @@ public class HintsMaker
                 Properties prop = new Properties();
                 prop.setProperty(HOST_ID_PROPERTY, hostId.toString());
                 prop.setProperty(DESCRIPTOR_TIMESTAMP_PROPERTY, Long.toString(descriptorTimestamp));
-                prop.setProperty(CFID_PROPERTY, Schema.instance.getId(KEYSPACE, TABLE).toString());
+                prop.setProperty(CFID_PROPERTY, Schema.instance.getTableMetadata(KEYSPACE, TABLE).id.toString());
                 prop.setProperty(CELLS_PROPERTY, Integer.toString(cells.get()));
                 prop.setProperty(HASH_PROPERTY, Integer.toString(hash.get()));
-                prop.store(new FileOutputStream(new File(dataDir, PROPERTIES_FILE)),
+                prop.store(new FileOutputStream(new File(dataDir, PROPERTIES_FILE).toJavaIOFile()),
                            "Hints, version " + FBUtilities.getReleaseVersionString());
 
                 System.out.println("Done");
@@ -227,9 +230,17 @@ public class HintsMaker
                 dataSource.flip();
             }
 
-            SchemaLoader.prepareServer();
             SchemaLoader.loadSchema();
-            SchemaLoader.schemaDefinition("");
+
+            TableMetadata metadata = TableMetadata.builder(KEYSPACE, TABLE)
+                                                  .addPartitionKeyColumn("key", AsciiType.instance)
+                                                  .addClusteringColumn("col", AsciiType.instance)
+                                                  .addRegularColumn("val", BytesType.instance)
+                                                  .addRegularColumn("val0", BytesType.instance)
+                                                  .compression(SchemaLoader.getCompressionParameters())
+                                                  .build();
+
+            SchemaLoader.createKeyspace(KEYSPACE, KeyspaceParams.simple(1), metadata);
         }
 
         private static ByteBuffer randomBytes(int quantity, ThreadLocalRandom tlr)

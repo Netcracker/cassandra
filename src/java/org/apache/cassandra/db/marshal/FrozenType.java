@@ -20,11 +20,13 @@ package org.apache.cassandra.db.marshal;
 import java.nio.ByteBuffer;
 import java.util.List;
 
-import org.apache.cassandra.cql3.Term;
+import org.apache.cassandra.cql3.terms.Term;
+import org.apache.cassandra.cql3.functions.ArgumentDeserializer;
 import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.exceptions.SyntaxException;
 import org.apache.cassandra.serializers.TypeSerializer;
 import org.apache.cassandra.serializers.MarshalException;
+import org.apache.cassandra.transport.ProtocolVersion;
 
 /**
  * A fake type that is only used for parsing type strings that include frozen types.
@@ -46,7 +48,7 @@ public class FrozenType extends AbstractType<Void>
         return innerType.freeze();
     }
 
-    public String getString(ByteBuffer bytes)
+    public <V> String getString(V value, ValueAccessor<V> accessor)
     {
         throw new UnsupportedOperationException();
     }
@@ -61,12 +63,18 @@ public class FrozenType extends AbstractType<Void>
         throw new UnsupportedOperationException();
     }
 
-    public String toJSONString(ByteBuffer buffer, int protocolVersion)
+    public String toJSONString(ByteBuffer buffer, ProtocolVersion protocolVersion)
     {
         throw new UnsupportedOperationException();
     }
 
     public TypeSerializer<Void> getSerializer()
+    {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public ArgumentDeserializer getArgumentDeserializer()
     {
         throw new UnsupportedOperationException();
     }

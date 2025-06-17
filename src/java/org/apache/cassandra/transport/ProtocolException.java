@@ -25,17 +25,17 @@ import org.apache.cassandra.exceptions.TransportException;
  */
 public class ProtocolException extends RuntimeException implements TransportException
 {
-    private final Integer attemptedLowProtocolVersion;
+    private final ProtocolVersion forcedProtocolVersion;
 
     public ProtocolException(String msg)
     {
         this(msg, null);
     }
 
-    public ProtocolException(String msg, Integer attemptedLowProtocolVersion)
+    public ProtocolException(String msg, ProtocolVersion forcedProtocolVersion)
     {
         super(msg);
-        this.attemptedLowProtocolVersion = attemptedLowProtocolVersion;
+        this.forcedProtocolVersion = forcedProtocolVersion;
     }
 
     public ExceptionCode code()
@@ -43,14 +43,14 @@ public class ProtocolException extends RuntimeException implements TransportExce
         return ExceptionCode.PROTOCOL_ERROR;
     }
 
-    /**
-     * If the ProtocolException is due to a connection being made with a protocol version that is lower
-     * than Server.MIN_SUPPORTED_VERSION, this will return that unsupported protocol version.  Otherwise,
-     * null is returned.
-     */
-    public Integer getAttemptedLowProtocolVersion()
+    public ProtocolVersion getForcedProtocolVersion()
     {
-        return attemptedLowProtocolVersion;
+        return forcedProtocolVersion;
+    }
+
+    public boolean isFatal()
+    {
+        return false;
     }
 
     public boolean isSilent()
@@ -58,16 +58,35 @@ public class ProtocolException extends RuntimeException implements TransportExce
         return false;
     }
 
+    public static ProtocolException toFatalException(ProtocolException e)
+    {
+        return new Fatal(e);
+    }
+
     public static ProtocolException toSilentException(ProtocolException e)
     {
         return new Silent(e);
+    }
+
+    private static class Fatal extends ProtocolException
+    {
+        private Fatal(ProtocolException cause)
+        {
+            super(cause.getMessage(), cause.forcedProtocolVersion);
+        }
+
+        @Override
+        public boolean isFatal()
+        {
+            return true;
+        }
     }
 
     private static class Silent extends ProtocolException
     {
         public Silent(ProtocolException cause)
         {
-            super(cause.getMessage(), cause.attemptedLowProtocolVersion);
+            super(cause.getMessage(), cause.forcedProtocolVersion);
         }
 
         @Override

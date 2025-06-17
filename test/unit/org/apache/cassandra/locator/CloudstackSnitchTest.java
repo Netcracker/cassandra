@@ -19,24 +19,23 @@
 package org.apache.cassandra.locator;
 
 import java.io.IOException;
-import java.net.InetAddress;
-import java.util.EnumMap;
-import java.util.Map;
 
-import org.junit.AfterClass;
+import org.junit.Before;
 import org.junit.BeforeClass;
 import org.junit.Test;
 
-import org.apache.cassandra.SchemaLoader;
-import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.exceptions.ConfigurationException;
-import org.apache.cassandra.gms.ApplicationState;
-import org.apache.cassandra.gms.Gossiper;
-import org.apache.cassandra.gms.VersionedValue;
-import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.locator.AbstractCloudMetadataServiceConnector.DefaultCloudMetadataServiceConnector;
+import org.apache.cassandra.tcm.ClusterMetadataService;
+import org.apache.cassandra.tcm.StubClusterMetadataService;
+import org.apache.cassandra.utils.Pair;
 
+import static org.apache.cassandra.locator.AbstractCloudMetadataServiceConnector.METADATA_URL_PROPERTY;
 import static org.junit.Assert.assertEquals;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.doReturn;
+import static org.mockito.Mockito.spy;
 
 public class CloudstackSnitchTest
 {
@@ -45,70 +44,53 @@ public class CloudstackSnitchTest
     @BeforeClass
     public static void setup() throws Exception
     {
-        System.setProperty(Gossiper.Props.DISABLE_THREAD_VALIDATION, "true");
-        DatabaseDescriptor.setDaemonInitialized();
-        SchemaLoader.mkdirs();
-        SchemaLoader.cleanup();
-        Keyspace.setInitialized();
-        StorageService.instance.initServer(0);
+        DatabaseDescriptor.daemonInitialization();
     }
 
-    private class TestCloudstackSnitch extends CloudstackSnitch
+    @Before
+    public void resetCMS()
     {
-        public TestCloudstackSnitch() throws IOException, ConfigurationException
-        {
-            super();
-        }
-
-        @Override
-        String csMetadataEndpoint() throws ConfigurationException
-        {
-            return "";
-        }
-
-        @Override
-        String csQueryMetadata(String endpoint) throws IOException, ConfigurationException
-        {
-            return az;
-        }
+        ClusterMetadataService.unsetInstance();
+        ClusterMetadataService.setInstance(StubClusterMetadataService.forTesting());
     }
 
     @Test
     public void testRacks() throws IOException, ConfigurationException
     {
         az = "ch-gva-1";
-        CloudstackSnitch snitch = new TestCloudstackSnitch();
-        InetAddress local = InetAddress.getByName("127.0.0.1");
-        InetAddress nonlocal = InetAddress.getByName("127.0.0.7");
 
-        Gossiper.instance.addSavedEndpoint(nonlocal);
-        Map<ApplicationState, VersionedValue> stateMap = new EnumMap<>(ApplicationState.class);
-        stateMap.put(ApplicationState.DC, StorageService.instance.valueFactory.datacenter("ch-zrh"));
-        stateMap.put(ApplicationState.RACK, StorageService.instance.valueFactory.rack("2"));
-        Gossiper.instance.getEndpointStateForEndpoint(nonlocal).addApplicationStates(stateMap);
+        DefaultCloudMetadataServiceConnector spiedConnector = spy(new DefaultCloudMetadataServiceConnector(
+        new SnitchProperties(Pair.create(METADATA_URL_PROPERTY, "http://127.0.0.1"))));
 
-        assertEquals("ch-zrh", snitch.getDatacenter(nonlocal));
-        assertEquals("2", snitch.getRack(nonlocal));
+        doReturn(az).when(spiedConnector).apiCall(any());
 
-        assertEquals("ch-gva", snitch.getDatacenter(local));
-        assertEquals("1", snitch.getRack(local));
+        // for registering a new node, location is obtained from the cloud metadata service
+        CloudstackLocationProvider locationProvider = new CloudstackLocationProvider(spiedConnector);
+        assertEquals("ch-gva", locationProvider.initialLocation().datacenter);
+        assertEquals("1", locationProvider.initialLocation().rack);
 
+        CloudstackSnitch snitch = new CloudstackSnitch(spiedConnector);
+        assertEquals("ch-gva", snitch.getLocalDatacenter());
+        assertEquals("1", snitch.getLocalRack());
     }
 
     @Test
     public void testNewRegions() throws IOException, ConfigurationException
     {
-        az = "ch-gva-1";
-        CloudstackSnitch snitch = new TestCloudstackSnitch();
-        InetAddress local = InetAddress.getByName("127.0.0.1");
+        az = "us-east-1a";
 
-        assertEquals("ch-gva", snitch.getDatacenter(local));
-        assertEquals("1", snitch.getRack(local));
-    }
+        DefaultCloudMetadataServiceConnector spiedConnector = spy(new DefaultCloudMetadataServiceConnector(
+        new SnitchProperties(Pair.create(METADATA_URL_PROPERTY, "http://127.0.0.1"))));
 
-    @AfterClass
-    public static void tearDown()
-    {
-        StorageService.instance.stopClient();
+        doReturn(az).when(spiedConnector).apiCall(any());
+
+        // for registering a new node, location is obtained from the cloud metadata service
+        CloudstackLocationProvider locationProvider = new CloudstackLocationProvider(spiedConnector);
+        assertEquals("us-east", locationProvider.initialLocation().datacenter);
+        assertEquals("1a", locationProvider.initialLocation().rack);
+
+        CloudstackSnitch snitch = new CloudstackSnitch(spiedConnector);
+        assertEquals("us-east", snitch.getLocalDatacenter());
+        assertEquals("1a", snitch.getLocalRack());
     }
 }

@@ -21,10 +21,14 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.MappedByteBuffer;
 import java.nio.channels.FileChannel;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 
+import net.openhft.chronicle.core.util.ThrowingFunction;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.io.FSWriteError;
 import org.apache.cassandra.io.util.FileUtils;
+import org.apache.cassandra.io.util.SimpleCachedBufferPool;
 import org.apache.cassandra.utils.NativeLibrary;
 import org.apache.cassandra.utils.SyncUtil;
 
@@ -35,27 +39,28 @@ import org.apache.cassandra.utils.SyncUtil;
  */
 public class MemoryMappedSegment extends CommitLogSegment
 {
+    private final int fd;
+
     /**
      * Constructs a new segment file.
-     *
-     * @param filePath  if not null, recycles the existing file by renaming it and truncating it to CommitLog.SEGMENT_SIZE.
-     * @param commitLog the commit log it will be used with.
      */
-    MemoryMappedSegment(CommitLog commitLog)
+    MemoryMappedSegment(AbstractCommitLogSegmentManager manager, ThrowingFunction<Path, FileChannel, IOException> channelFactory)
     {
-        super(commitLog);
+        super(manager, channelFactory);
         // mark the initial sync marker as uninitialised
         int firstSync = buffer.position();
         buffer.putInt(firstSync + 0, 0);
         buffer.putInt(firstSync + 4, 0);
+        fd = NativeLibrary.getfd(channel);
     }
 
-    ByteBuffer createBuffer(CommitLog commitLog)
+    @Override
+    protected ByteBuffer createBuffer()
     {
         try
         {
             MappedByteBuffer mappedFile = channel.map(FileChannel.MapMode.READ_WRITE, 0, DatabaseDescriptor.getCommitLogSegmentSize());
-            commitLog.allocator.addSize(DatabaseDescriptor.getCommitLogSegmentSize());
+            manager.addSize(DatabaseDescriptor.getCommitLogSegmentSize());
             return mappedFile;
         }
         catch (IOException e)
@@ -91,7 +96,7 @@ public class MemoryMappedSegment extends CommitLogSegment
         {
             throw new FSWriteError(e, getPath());
         }
-        NativeLibrary.trySkipCache(fd, startMarker, nextMarker, logFile.getAbsolutePath());
+        NativeLibrary.trySkipCache(fd, startMarker, nextMarker, logFile.absolutePath());
     }
 
     @Override
@@ -103,8 +108,28 @@ public class MemoryMappedSegment extends CommitLogSegment
     @Override
     protected void internalClose()
     {
-        if (FileUtils.isCleanerAvailable())
-            FileUtils.clean(buffer);
+        FileUtils.clean(buffer);
         super.internalClose();
+    }
+
+    protected static class MemoryMappedSegmentBuilder extends CommitLogSegment.Builder
+    {
+        public MemoryMappedSegmentBuilder(AbstractCommitLogSegmentManager segmentManager)
+        {
+            super(segmentManager);
+        }
+
+        @Override
+        public MemoryMappedSegment build()
+        {
+            return new MemoryMappedSegment(segmentManager,
+                                           path ->  FileChannel.open(path, StandardOpenOption.WRITE, StandardOpenOption.READ, StandardOpenOption.CREATE));
+        }
+
+        @Override
+        public SimpleCachedBufferPool createBufferPool()
+        {
+            return null;
+        }
     }
 }

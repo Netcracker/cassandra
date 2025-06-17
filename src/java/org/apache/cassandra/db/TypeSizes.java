@@ -27,12 +27,15 @@ public final class TypeSizes
 
     private TypeSizes(){}
 
-    private static final int BOOL_SIZE = 1;
-    private static final int BYTE_SIZE = 1;
-    private static final int SHORT_SIZE = 2;
-    private static final int INT_SIZE = 4;
-    private static final int LONG_SIZE = 8;
-    private static final int UUID_SIZE = 16;
+    public static final int BOOL_SIZE = 1;
+    public static final int BYTE_SIZE = 1;
+    public static final int CHAR_SIZE = 2;
+    public static final int SHORT_SIZE = 2;
+    public static final int INT_SIZE = 4;
+    public static final int LONG_SIZE = 8;
+    public static final int FLOAT_SIZE = 4;
+    public static final int DOUBLE_SIZE = 8;
+    public static final int UUID_SIZE = 16;
 
     /** assumes UTF8 */
     public static int sizeof(String value)
@@ -42,6 +45,16 @@ public final class TypeSizes
         return sizeof((short) length) + length;
     }
 
+    /**
+     * Java uses a Modified UTF-8 (see {@link java.io.DataOutput#writeUTF(String)}), and this method attempts to
+     * calculate the modified utf-8 length; this method only works when the utf-8 writing logic is java's modified utf-8
+     * and will not work when normal utf-8 is written.
+     *
+     * If normal utf-8 is written, then {@link org.apache.cassandra.transport.CBUtil#encodedUTF8Length(String)} should be
+     * used instread of this one.
+     *
+     * @see <a href="https://docs.oracle.com/en/java/javase/23/docs/api/java.base/java/io/DataInput.html#modified-utf-8">Modified UTF 8</a>
+     */
     public static int encodedUTF8Length(String st)
     {
         int strlen = st.length();
@@ -74,31 +87,49 @@ public final class TypeSizes
         return sizeofUnsignedVInt(value.remaining()) + value.remaining();
     }
 
+    @SuppressWarnings("unused")
     public static int sizeof(boolean value)
     {
         return BOOL_SIZE;
     }
 
+    @SuppressWarnings("unused")
     public static int sizeof(byte value)
     {
         return BYTE_SIZE;
     }
 
+    @SuppressWarnings("unused")
     public static int sizeof(short value)
     {
         return SHORT_SIZE;
     }
 
+    @SuppressWarnings("unused")
     public static int sizeof(int value)
     {
         return INT_SIZE;
     }
 
+    @SuppressWarnings("unused")
     public static int sizeof(long value)
     {
         return LONG_SIZE;
     }
 
+    @SuppressWarnings("unused")
+    public static int sizeof(float value)
+    {
+        return FLOAT_SIZE;
+    }
+
+    @SuppressWarnings("unused")
+    public static int sizeof(double value)
+    {
+        return DOUBLE_SIZE;
+    }
+
+    @SuppressWarnings("unused")
     public static int sizeof(UUID value)
     {
         return UUID_SIZE;

@@ -18,7 +18,6 @@
 
 package org.apache.cassandra.db.transform;
 
-import java.net.InetAddress;
 import java.nio.ByteBuffer;
 import java.util.Collections;
 import java.util.HashMap;
@@ -27,17 +26,19 @@ import java.util.Iterator;
 import com.google.common.collect.Iterators;
 import org.junit.*;
 
-import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.db.partitions.*;
 import org.apache.cassandra.db.rows.*;
+import org.apache.cassandra.locator.InetAddressAndPort;
 import org.apache.cassandra.net.*;
+import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.utils.DiagnosticSnapshotService;
 import org.apache.cassandra.utils.FBUtilities;
 
+import static org.apache.cassandra.config.CassandraRelevantProperties.DIAGNOSTIC_SNAPSHOT_INTERVAL_NANOS;
 import static org.apache.cassandra.utils.ByteBufferUtil.bytes;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
@@ -45,42 +46,29 @@ import static org.junit.Assert.assertTrue;
 public class DuplicateRowCheckerTest extends CQLTester
 {
     ColumnFamilyStore cfs;
-    CFMetaData metadata;
-    static HashMap<InetAddress, MessageOut> sentMessages;
+    TableMetadata metadata;
+    static HashMap<InetAddressAndPort, Message<?>> sentMessages;
 
     @BeforeClass
     public static void setupMessaging()
     {
         sentMessages = new HashMap<>();
-        IMessageSink sink = new IMessageSink()
-        {
-            public boolean allowOutgoingMessage(MessageOut message, int id, InetAddress to)
-            {
-                sentMessages.put(to, message);
-                return false;
-            }
-
-            public boolean allowIncomingMessage(MessageIn message, int id)
-            {
-                return false;
-            }
-        };
-        MessagingService.instance().addMessageSink(sink);
+        MessagingService.instance().outboundSink.add((message, to) -> { sentMessages.put(to, message); return false;});
     }
 
     @Before
     public void setup() throws Throwable
     {
         DatabaseDescriptor.setSnapshotOnDuplicateRowDetection(true);
-        System.setProperty("cassandra.diagnostic_snapshot_interval_nanos", "0");
+        DIAGNOSTIC_SNAPSHOT_INTERVAL_NANOS.setLong(0);
         // Create a table and insert some data. The actual rows read in the test will be synthetic
         // but this creates an sstable on disk to be snapshotted.
         createTable("CREATE TABLE %s (pk text, ck1 int, ck2 int, v int, PRIMARY KEY (pk, ck1, ck2))");
         for (int i = 0; i < 10; i++)
             execute("insert into %s (pk, ck1, ck2, v) values (?, ?, ?, ?)", "key", i, i, i);
-        getCurrentColumnFamilyStore().forceBlockingFlush();
+        flush();
 
-        metadata = getCurrentColumnFamilyStore().metadata;
+        metadata = getCurrentColumnFamilyStore().metadata();
         cfs = getCurrentColumnFamilyStore();
         sentMessages.clear();
     }
@@ -168,14 +156,14 @@ public class DuplicateRowCheckerTest extends CQLTester
         assertCommandIssued(sentMessages, true);
     }
 
-    public static void assertCommandIssued(HashMap<InetAddress, MessageOut> sent, boolean isExpected)
+    public static void assertCommandIssued(HashMap<InetAddressAndPort, Message<?>> sent, boolean isExpected)
     {
         assertEquals(isExpected, !sent.isEmpty());
         if (isExpected)
         {
             assertEquals(1, sent.size());
-            assertTrue(sent.containsKey(FBUtilities.getBroadcastAddress()));
-            SnapshotCommand command = (SnapshotCommand) sent.get(FBUtilities.getBroadcastAddress()).payload;
+            assertTrue(sent.containsKey(FBUtilities.getBroadcastAddressAndPort()));
+            SnapshotCommand command = (SnapshotCommand) sent.get(FBUtilities.getBroadcastAddressAndPort()).payload;
             assertTrue(command.snapshot_name.startsWith(DiagnosticSnapshotService.DUPLICATE_ROWS_DETECTED_SNAPSHOT_PREFIX));
         }
     }
@@ -200,41 +188,47 @@ public class DuplicateRowCheckerTest extends CQLTester
         return ((AbstractType<T>) type).decompose(value);
     }
 
-    public static Row makeRow(CFMetaData metadata, Object... clusteringValues)
+    public static Row makeRow(TableMetadata metadata, Object... clusteringValues)
     {
         ByteBuffer[] clusteringByteBuffers = new ByteBuffer[clusteringValues.length];
         for (int i = 0; i < clusteringValues.length; i++)
             clusteringByteBuffers[i] = decompose(metadata.clusteringColumns().get(i).type, clusteringValues[i]);
 
-        return BTreeRow.noCellLiveRow(new Clustering(clusteringByteBuffers), LivenessInfo.create(metadata, 0, 0));
+        return BTreeRow.noCellLiveRow(Clustering.make(clusteringByteBuffers), LivenessInfo.create(0, 0));
     }
 
-    private static PartitionIterator applyChecker(UnfilteredPartitionIterator unfiltered)
+    public static UnfilteredRowIterator partition(TableMetadata metadata,
+                                                  DecoratedKey key,
+                                                  boolean isReversedOrder,
+                                                  Unfiltered... unfiltereds)
     {
-        int nowInSecs = 0;
-        return DuplicateRowChecker.duringRead(FilteredPartitions.filter(unfiltered, nowInSecs),
-                                              Collections.singletonList(FBUtilities.getBroadcastAddress()));
-    }
-
-    public static UnfilteredPartitionIterator iter(CFMetaData metadata, boolean isReversedOrder, Unfiltered... unfiltereds)
-    {
-        DecoratedKey key = metadata.partitioner.decorateKey(bytes("key"));
         Iterator<Unfiltered> iterator = Iterators.forArray(unfiltereds);
-
-        UnfilteredRowIterator rowIter = new AbstractUnfilteredRowIterator(metadata,
-                                                                          key,
-                                                                          DeletionTime.LIVE,
-                                                                          metadata.partitionColumns(),
-                                                                          Rows.EMPTY_STATIC_ROW,
-                                                                          isReversedOrder,
-                                                                          EncodingStats.NO_STATS)
+        return new AbstractUnfilteredRowIterator(metadata,
+                                                 key,
+                                                 DeletionTime.LIVE,
+                                                 metadata.regularAndStaticColumns(),
+                                                 Rows.EMPTY_STATIC_ROW,
+                                                 isReversedOrder,
+                                                 EncodingStats.NO_STATS)
         {
             protected Unfiltered computeNext()
             {
                 return iterator.hasNext() ? iterator.next() : endOfData();
             }
         };
+    }
 
-        return new SingletonUnfilteredPartitionIterator(rowIter, false);
+    private static PartitionIterator applyChecker(UnfilteredPartitionIterator unfiltered)
+    {
+        long nowInSecs = 0;
+        return DuplicateRowChecker.duringRead(FilteredPartitions.filter(unfiltered, nowInSecs),
+                                              Collections.singletonList(FBUtilities.getBroadcastAddressAndPort()));
+    }
+
+    public static UnfilteredPartitionIterator iter(TableMetadata metadata, boolean isReversedOrder, Unfiltered... unfiltereds)
+    {
+        DecoratedKey key = metadata.partitioner.decorateKey(bytes("key"));
+        UnfilteredRowIterator rowIter = partition(metadata, key, isReversedOrder, unfiltereds);
+        return new SingletonUnfilteredPartitionIterator(rowIter);
     }
 }

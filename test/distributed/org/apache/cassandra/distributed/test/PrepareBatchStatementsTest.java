@@ -21,14 +21,15 @@ package org.apache.cassandra.distributed.test;
 import java.util.List;
 import java.util.stream.Collectors;
 
-import com.google.common.collect.Lists;
 import org.junit.Test;
 
+import com.datastax.driver.core.PreparedStatement;
 import com.datastax.driver.core.Session;
 import org.apache.cassandra.cql3.QueryProcessor;
 import org.apache.cassandra.distributed.api.ICluster;
 import org.apache.cassandra.distributed.api.IInvokableInstance;
 import org.apache.cassandra.service.StorageService;
+import org.assertj.core.util.Lists;
 
 import static org.apache.cassandra.distributed.api.Feature.GOSSIP;
 import static org.apache.cassandra.distributed.api.Feature.NATIVE_PROTOCOL;
@@ -65,32 +66,36 @@ public class PrepareBatchStatementsTest extends TestBaseImpl
                                 "APPLY BATCH;";
 
 
-                s.prepare(batch1);
+                PreparedStatement prepared;
+
+                prepared = s.prepare(batch1);
+                s.execute(prepared.bind(1, 1, 1, 1, 1, 1));
                 c.get(1).runOnInstance(() -> {
                     // no USE here, only a fully qualified batch - should get stored ONCE
-                    List<String> stmts = QueryProcessor.getPreparedStatements().stream().map(p -> p.rawCQLStatement).collect(Collectors.toList());
+                    List<String> stmts = StorageService.instance.getPreparedStatements().stream().map(p -> p.right).collect(Collectors.toList());
                     assertEquals(Lists.newArrayList(batch1), stmts);
-                    QueryProcessor.clearPreparedStatementsCache();
+                    QueryProcessor.clearPreparedStatements(false);
                 });
 
                 s.execute("use ks2");
-                s.prepare(batch1);
+                prepared = s.prepare(batch1);
+                s.execute(prepared.bind(1, 1, 1, 1, 1, 1));
                 c.get(1).runOnInstance(() -> {
                     // after USE, fully qualified - should get stored twice! Once with null keyspace (new behaviour) once with ks2 keyspace (old behaviour)
-                    List<String> stmts = QueryProcessor.getPreparedStatements().stream().map(p -> p.rawCQLStatement).collect(Collectors.toList());
+                    List<String> stmts = StorageService.instance.getPreparedStatements().stream().map(p -> p.right).collect(Collectors.toList());
                     assertEquals(Lists.newArrayList(batch1, batch1), stmts);
-                    QueryProcessor.clearPreparedStatementsCache();
+                    QueryProcessor.clearPreparedStatements(false);
                 });
 
-                s.prepare(batch2);
+                prepared = s.prepare(batch2);
+                s.execute(prepared.bind(1, 1, 1, 1, 1, 1));
                 c.get(1).runOnInstance(() -> {
                     // after USE, should get stored twice, once with keyspace, once without
-                    List<String> stmts = QueryProcessor.getPreparedStatements().stream().map(p -> p.rawCQLStatement).collect(Collectors.toList());
+                    List<String> stmts = StorageService.instance.getPreparedStatements().stream().map(p -> p.right).collect(Collectors.toList());
                     assertEquals(Lists.newArrayList(batch2, batch2), stmts);
-                    QueryProcessor.clearPreparedStatementsCache();
+                    QueryProcessor.clearPreparedStatements(false);
                 });
             }
         }
     }
-
 }

@@ -25,7 +25,7 @@ import org.apache.cassandra.db.partitions.PartitionIterator;
 import org.apache.cassandra.db.partitions.UnfilteredPartitionIterator;
 import org.apache.cassandra.db.rows.RowIterator;
 
-public final class FilteredPartitions extends BasePartitions<RowIterator, BasePartitionIterator<?>> implements PartitionIterator
+public class FilteredPartitions extends BasePartitions<RowIterator, BasePartitionIterator<?>> implements PartitionIterator
 {
     // wrap basic iterator for transformation
     FilteredPartitions(PartitionIterator input)
@@ -50,15 +50,10 @@ public final class FilteredPartitions extends BasePartitions<RowIterator, BasePa
     /**
      * Filter any RangeTombstoneMarker from the iterator's iterators, transforming it into a PartitionIterator.
      */
-    public static FilteredPartitions filter(UnfilteredPartitionIterator iterator, int nowInSecs)
+    public static FilteredPartitions filter(UnfilteredPartitionIterator iterator, long nowInSecs)
     {
-        FilteredPartitions filtered = filter(iterator,
-                                             new Filter(nowInSecs,
-                                                        iterator.metadata().enforceStrictLiveness()));
-
-        return iterator.isForThrift()
-             ? filtered
-             : (FilteredPartitions) Transformation.apply(filtered, new EmptyPartitionsDiscarder());
+        FilteredPartitions filtered = filter(iterator, new Filter(nowInSecs, iterator.metadata().enforceStrictLiveness()));
+        return (FilteredPartitions) Transformation.apply(filtered, new EmptyPartitionsDiscarder());
     }
 
     public static FilteredPartitions filter(UnfilteredPartitionIterator iterator, Filter filter)

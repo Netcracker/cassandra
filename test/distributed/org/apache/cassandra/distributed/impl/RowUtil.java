@@ -42,8 +42,8 @@ public class RowUtil
         if (res != null && res.kind == ResultMessage.Kind.ROWS)
         {
             ResultMessage.Rows rows = (ResultMessage.Rows) res;
-            String[] names = getColumnNames(rows.result.metadata.names);
-            Object[][] results = RowUtil.toObjects(rows);
+            String[] names = getColumnNames(rows.result.metadata.requestNames());
+            Object[][] results = toObjects(rows);
             
             // Warnings may be null here, due to ClientWarn#getWarnings() handling of empty warning lists.
             List<String> warnings = res.getWarnings();
@@ -52,7 +52,13 @@ public class RowUtil
         }
         else
         {
-            return QueryResults.empty();
+            if (res != null)
+            {
+                List<String> warnings = res.getWarnings();
+                return new SimpleQueryResult(new String[0], null, warnings == null ? Collections.emptyList() : warnings);
+            }
+            else
+                return QueryResults.empty();
         }
     }
 
@@ -63,7 +69,25 @@ public class RowUtil
 
     public static Object[][] toObjects(ResultMessage.Rows rows)
     {
-        return toObjects(rows.result.metadata.names, rows.result.rows);
+        return toObjects(rows.result.metadata.requestNames(), rows.result.rows);
+    }
+
+    public static Object[][] toObjects(List<ColumnSpecification> specs, List<List<ByteBuffer>> rows)
+    {
+        Object[][] result = new Object[rows.size()][];
+        for (int i = 0; i < rows.size(); i++)
+        {
+            List<ByteBuffer> row = rows.get(i);
+            result[i] = new Object[specs.size()];
+            for (int j = 0; j < specs.size(); j++)
+            {
+                ByteBuffer bb = row.get(j);
+
+                if (bb != null)
+                    result[i][j] = specs.get(j).type.getSerializer().deserialize(bb);
+            }
+        }
+        return result;
     }
 
     public static Iterator<Object[]> toObjects(ResultSet rs)
@@ -79,24 +103,6 @@ public class RowUtil
         });
     }
 
-    public static Object[][] toObjects(List<ColumnSpecification> specs, List<List<ByteBuffer>> rows)
-    {
-        Object[][] result = new Object[rows.size()][];
-        for (int i = 0; i < rows.size(); i++)
-        {
-            List<ByteBuffer> row = rows.get(i);
-            result[i] = new Object[row.size()];
-            for (int j = 0; j < row.size(); j++)
-            {
-                ByteBuffer bb = row.get(j);
-
-                if (bb != null)
-                    result[i][j] = specs.get(j).type.getSerializer().deserialize(bb);
-            }
-        }
-        return result;
-    }
-
     public static Iterator<Object[]> toIter(UntypedResultSet rs)
     {
         return toIter(rs.metadata(), rs.iterator());
@@ -110,15 +116,15 @@ public class RowUtil
     public static Iterator<Object[]> toIter(List<ColumnSpecification> columnSpecs, Iterator<UntypedResultSet.Row> rs)
     {
         Iterator<List<ByteBuffer>> iter = Iterators.transform(rs,
-                                                              (row) -> {
-                                                                  List<ByteBuffer> bbs = new ArrayList<>(columnSpecs.size());
-                                                                  for (int i = 0; i < columnSpecs.size(); i++)
-                                                                  {
-                                                                      ColumnSpecification columnSpec = columnSpecs.get(i);
-                                                                      bbs.add(row.getBytes(columnSpec.name.toString()));
-                                                                  }
-                                                                  return bbs;
-                                                              });
+                                                          (row) -> {
+                                                              List<ByteBuffer> bbs = new ArrayList<>(columnSpecs.size());
+                                                              for (int i = 0; i < columnSpecs.size(); i++)
+                                                              {
+                                                                  ColumnSpecification columnSpec = columnSpecs.get(i);
+                                                                  bbs.add(row.getBytes(columnSpec.name.toString()));
+                                                              }
+                                                              return bbs;
+                                                          });
         return toIterInternal(columnSpecs, Lists.newArrayList(iter));
     }
 

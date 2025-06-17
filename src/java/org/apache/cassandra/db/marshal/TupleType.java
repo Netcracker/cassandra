@@ -20,34 +20,75 @@ package org.apache.cassandra.db.marshal;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collection;
 import java.util.Iterator;
 import java.util.List;
+import java.util.regex.Pattern;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Objects;
+import com.google.common.collect.Lists;
 
 import org.apache.cassandra.cql3.*;
+import org.apache.cassandra.cql3.terms.Constants;
+import org.apache.cassandra.cql3.terms.MultiElements;
+import org.apache.cassandra.cql3.terms.Term;
+import org.apache.cassandra.db.TypeSizes;
+import org.apache.cassandra.db.rows.ComplexColumnData;
 import org.apache.cassandra.exceptions.ConfigurationException;
+import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.exceptions.SyntaxException;
 import org.apache.cassandra.serializers.*;
+import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.utils.JsonUtils;
+import org.apache.cassandra.utils.bytecomparable.ByteComparable;
+import org.apache.cassandra.utils.bytecomparable.ByteSource;
+import org.apache.cassandra.utils.bytecomparable.ByteSourceInverse;
+
+import static com.google.common.collect.Iterables.any;
+import static com.google.common.collect.Iterables.transform;
 
 /**
  * This is essentially like a CompositeType, but it's not primarily meant for comparison, just
  * to pack multiple values together so has a more friendly encoding.
  */
-public class TupleType extends AbstractType<ByteBuffer>
+public class TupleType extends MultiElementType<ByteBuffer>
 {
+    private static final String COLON = ":";
+    private static final Pattern COLON_PAT = Pattern.compile(COLON);
+    private static final String ESCAPED_COLON = "\\\\:";
+    private static final Pattern ESCAPED_COLON_PAT = Pattern.compile(ESCAPED_COLON);
+    private static final String AT = "@";
+    private static final Pattern AT_PAT = Pattern.compile(AT);
+    private static final String ESCAPED_AT = "\\\\@";
+    private static final Pattern ESCAPED_AT_PAT = Pattern.compile(ESCAPED_AT);
+    
     protected final List<AbstractType<?>> types;
 
     private final TupleSerializer serializer;
 
     public TupleType(List<AbstractType<?>> types)
     {
+        this(types, true);
+    }
+
+    @VisibleForTesting
+    public TupleType(List<AbstractType<?>> types, boolean freezeInner)
+    {
         super(ComparisonType.CUSTOM);
-        for (int i = 0; i < types.size(); i++)
-            types.set(i, types.get(i).freeze());
-        this.types = types;
+
+        if (freezeInner)
+            this.types = Lists.newArrayList(transform(types, AbstractType::freeze));
+        else
+            this.types = types;
         this.serializer = new TupleSerializer(fieldSerializers(types));
+    }
+
+    @Override
+    public boolean allowsEmpty()
+    {
+        return true;
     }
 
     private static List<TypeSerializer<?>> fieldSerializers(List<AbstractType<?>> types)
@@ -68,9 +109,29 @@ public class TupleType extends AbstractType<ByteBuffer>
     }
 
     @Override
-    public boolean referencesUserType(String name)
+    public <V> boolean referencesUserType(V name, ValueAccessor<V> accessor)
     {
-        return allTypes().stream().anyMatch(f -> f.referencesUserType(name));
+        return any(types, t -> t.referencesUserType(name, accessor));
+    }
+
+    @Override
+    public TupleType withUpdatedUserType(UserType udt)
+    {
+        return referencesUserType(udt.name)
+             ? new TupleType(Lists.newArrayList(transform(types, t -> t.withUpdatedUserType(udt))))
+             : this;
+    }
+
+    @Override
+    public AbstractType<?> expandUserTypes()
+    {
+        return new TupleType(Lists.newArrayList(transform(types, AbstractType::expandUserTypes)));
+    }
+
+    @Override
+    public boolean referencesDuration()
+    {
+        return allTypes().stream().anyMatch(f -> f.referencesDuration());
     }
 
     public AbstractType<?> type(int i)
@@ -83,130 +144,299 @@ public class TupleType extends AbstractType<ByteBuffer>
         return types.size();
     }
 
+    @Override
+    public List<AbstractType<?>> subTypes()
+    {
+        return types;
+    }
+
     public List<AbstractType<?>> allTypes()
     {
         return types;
     }
 
-    public int compareCustom(ByteBuffer o1, ByteBuffer o2)
+    public boolean isTuple()
     {
-        if (!o1.hasRemaining() || !o2.hasRemaining())
-            return o1.hasRemaining() ? 1 : o2.hasRemaining() ? -1 : 0;
+        return true;
+    }
 
-        ByteBuffer bb1 = o1.duplicate();
-        ByteBuffer bb2 = o2.duplicate();
+    public <VL, VR> int compareCustom(VL left, ValueAccessor<VL> accessorL, VR right, ValueAccessor<VR> accessorR)
+    {
+        if (accessorL.isEmpty(left) || accessorR.isEmpty(right))
+            return Boolean.compare(accessorR.isEmpty(right), accessorL.isEmpty(left));
 
-        for (int i = 0; bb1.remaining() > 0 && bb2.remaining() > 0 && i < types.size(); i++)
+        int offsetL = 0;
+        int offsetR = 0;
+
+        for (int i = 0; !accessorL.isEmptyFromOffset(left, offsetL) && !accessorR.isEmptyFromOffset(right, offsetR) && i < types.size(); i++)
         {
             AbstractType<?> comparator = types.get(i);
 
-            int size1 = bb1.getInt();
-            int size2 = bb2.getInt();
+            int sizeL = accessorL.getInt(left, offsetL);
+            offsetL += TypeSizes.INT_SIZE;
+            int sizeR = accessorR.getInt(right, offsetR);
+            offsetR += TypeSizes.INT_SIZE;
 
             // Handle nulls
-            if (size1 < 0)
+            if (sizeL < 0)
             {
-                if (size2 < 0)
+                if (sizeR < 0)
                     continue;
                 return -1;
             }
-            if (size2 < 0)
+            if (sizeR < 0)
                 return 1;
 
-            ByteBuffer value1 = ByteBufferUtil.readBytes(bb1, size1);
-            ByteBuffer value2 = ByteBufferUtil.readBytes(bb2, size2);
-            int cmp = comparator.compare(value1, value2);
+            VL valueL = accessorL.slice(left, offsetL, sizeL);
+            offsetL += sizeL;
+            VR valueR = accessorR.slice(right, offsetR, sizeR);
+            offsetR += sizeR;
+            int cmp = comparator.compare(valueL, accessorL, valueR, accessorR);
             if (cmp != 0)
                 return cmp;
         }
 
-        if (bb1.remaining() == 0 && bb2.remaining() == 0)
+        if (allRemainingComponentsAreNull(left, accessorL, offsetL) && allRemainingComponentsAreNull(right, accessorR, offsetR))
             return 0;
 
-        if (bb1.remaining() == 0)
-            return allRemainingComponentsAreNull(bb2) ? 0 : -1;
+        if (accessorL.isEmptyFromOffset(left, offsetL))
+            return allRemainingComponentsAreNull(right, accessorR, offsetR) ? 0 : -1;
 
-        // bb1.remaining() > 0 && bb2.remaining() == 0
-        return allRemainingComponentsAreNull(bb1) ? 0 : 1;
+        return allRemainingComponentsAreNull(left, accessorL, offsetL) ? 0 : 1;
     }
 
-    // checks if all remaining components are null (e.g., their size is -1)
-    private static boolean allRemainingComponentsAreNull(ByteBuffer bb)
+    private <T> boolean allRemainingComponentsAreNull(T v, ValueAccessor<T> accessor, int offset)
     {
-        while (bb.hasRemaining())
+        while (!accessor.isEmptyFromOffset(v, offset))
         {
-            int size = bb.getInt();
+            int size = accessor.getInt(v, offset);
+            offset += TypeSizes.INT_SIZE;
             if (size >= 0)
                 return false;
         }
         return true;
     }
 
-    /**
-     * Split a tuple value into its component values.
-     */
-    public ByteBuffer[] split(ByteBuffer value)
+    @Override
+    public <V> ByteSource asComparableBytes(ValueAccessor<V> accessor, V data, ByteComparable.Version version)
     {
-        ByteBuffer[] components = new ByteBuffer[size()];
-        ByteBuffer input = value.duplicate();
-        for (int i = 0; i < size(); i++)
+        switch (version)
         {
-            if (!input.hasRemaining())
-                return Arrays.copyOfRange(components, 0, i);
-
-            int size = input.getInt();
-            components[i] = size < 0 ? null : ByteBufferUtil.readBytes(input, size);
+            case LEGACY:
+                return asComparableBytesLegacy(accessor, data);
+            case OSS50:
+                return asComparableBytesNew(accessor, data, version);
+            default:
+                throw new AssertionError();
         }
+    }
+
+    private <V> ByteSource asComparableBytesLegacy(ValueAccessor<V> accessor, V data)
+    {
+        if (accessor.isEmpty(data))
+            return null;
+
+        List<V> bufs = unpack(data, accessor);  // this may be shorter than types.size -- other srcs remain null in that case
+        ByteSource[] srcs = new ByteSource[types.size()];
+        for (int i = 0; i < bufs.size(); ++i)
+            srcs[i] = bufs.get(i) != null ? types.get(i).asComparableBytes(accessor, bufs.get(i), ByteComparable.Version.LEGACY) : null;
+
+        // We always have a fixed number of sources, with the trailing ones possibly being nulls.
+        // This can only result in a prefix if the last type in the tuple allows prefixes. Since that type is required
+        // to be weakly prefix-free, so is the tuple.
+        return ByteSource.withTerminatorLegacy(ByteSource.END_OF_STREAM, srcs);
+    }
+
+    private <V> ByteSource asComparableBytesNew(ValueAccessor<V> accessor, V data, ByteComparable.Version version)
+    {
+        if (accessor.isEmpty(data))
+            return null;
+
+        List<V> bufs = unpack(data, accessor);
+        int lengthWithoutTrailingNulls = 0;
+        for (int i = 0; i < bufs.size(); ++i)
+            if (bufs.get(i) != null)
+                lengthWithoutTrailingNulls = i + 1;
+
+        ByteSource[] srcs = new ByteSource[lengthWithoutTrailingNulls];
+        for (int i = 0; i < lengthWithoutTrailingNulls; ++i)
+            srcs[i] = bufs.get(i) != null ? types.get(i).asComparableBytes(accessor, bufs.get(i), version) : null;
+
+        // Because we stop early when there are trailing nulls, there needs to be an explicit terminator to make the
+        // type prefix-free.
+        return ByteSource.withTerminator(ByteSource.TERMINATOR, srcs);
+    }
+
+    @Override
+    public <V> V fromComparableBytes(ValueAccessor<V> accessor, ByteSource.Peekable comparableBytes, ByteComparable.Version version)
+    {
+        assert version == ByteComparable.Version.OSS50; // Reverse translation is not supported for the legacy version.
+        if (comparableBytes == null)
+            return accessor.empty();
+
+        V[] componentBuffers = accessor.createArray(types.size());
+        for (int i = 0; i < types.size(); ++i)
+        {
+            if (comparableBytes.peek() == ByteSource.TERMINATOR)
+                break;  // the rest of the fields remain null
+            AbstractType<?> componentType = types.get(i);
+            ByteSource.Peekable component = ByteSourceInverse.nextComponentSource(comparableBytes);
+            if (component != null)
+                componentBuffers[i] = componentType.fromComparableBytes(accessor, component, version);
+            else
+                componentBuffers[i] = null;
+        }
+        // consume terminator
+        int terminator = comparableBytes.next();
+        assert terminator == ByteSource.TERMINATOR : String.format("Expected TERMINATOR (0x%2x) after %d components",
+                                                                   ByteSource.TERMINATOR,
+                                                                   types.size());
+        return pack(accessor, Arrays.asList(componentBuffers));
+    }
+
+    @Override
+    public <V> List<V> unpack(V value, ValueAccessor<V> accessor)
+    {
+        int numberOfElements = size();
+        List<V> components = new ArrayList<>(numberOfElements);
+        int length = accessor.size(value);
+        int position = 0;
+        for (int i = 0; i < numberOfElements; i++)
+        {
+            if (position == length)
+            {
+                return components;
+            }
+
+            if (position + 4 > length)
+                throw new MarshalException(String.format("Not enough bytes to read %dth %s", i, componentOrFieldName(i)));
+
+            int size = accessor.getInt(value, position);
+            position += 4;
+
+            // size < 0 means null value
+            if (size >= 0)
+            {
+                if (length - position < size)
+                    throw new MarshalException(String.format("Not enough bytes to read %dth %s", i, componentOrFieldName(i)));
+
+                components.add(accessor.slice(value, position, size));
+                position += size;
+            }
+            else
+                components.add(null);
+        }
+
+        // error out if we got more values in the tuple/UDT than we expected
+        if (position < length)
+        {
+            throw new MarshalException(String.format("Invalid remaining data after end of %s value", isTuple() ? "tuple" : "UDT"));
+        }
+
         return components;
     }
 
-    public static ByteBuffer buildValue(ByteBuffer[] components)
+    /**
+     * Returns the name used for the specified component or field if the type is a Tuple.
+     * @param i the component/field index
+     * @return the name used for the specified component or field if the type is a Tuple.
+     */
+    protected String componentOrFieldName(int i)
+    {
+        return "component";
+    }
+
+    public static <V> V pack(ValueAccessor<V> accessor, V... components)
+    {
+        return pack(accessor, Arrays.asList(components));
+    }
+
+    public static <V> V pack(ValueAccessor<V> accessor, Collection<V> components)
     {
         int totalLength = 0;
-        for (ByteBuffer component : components)
-            totalLength += 4 + (component == null ? 0 : component.remaining());
+        for (V component : components)
+            totalLength += 4 + (component == null ? 0 : accessor.size(component));
 
-        ByteBuffer result = ByteBuffer.allocate(totalLength);
-        for (ByteBuffer component : components)
+        int offset = 0;
+        V result = accessor.allocate(totalLength);
+        for (V component : components)
         {
             if (component == null)
             {
-                result.putInt(-1);
+                offset += accessor.putInt(result, offset, -1);
+
             }
             else
             {
-                result.putInt(component.remaining());
-                result.put(component.duplicate());
+                offset += accessor.putInt(result, offset, accessor.size(component));
+                offset += accessor.copyTo(component, 0, result, accessor, offset, accessor.size(component));
             }
         }
-        result.rewind();
         return result;
     }
 
     @Override
-    public String getString(ByteBuffer value)
+    public <V> V pack(List<V> elements, ValueAccessor<V> accessor)
     {
+        return pack(accessor, elements);
+    }
+
+    public ByteBuffer pack(ByteBuffer... components)
+    {
+        return pack(Arrays.asList(components));
+    }
+
+    @Override
+    public List<ByteBuffer> filterSortAndValidateElements(List<ByteBuffer> buffers)
+    {
+        if (buffers.size() > size())
+            throw new MarshalException(String.format("Tuple value contains too many fields (expected %s, got %s)", size(), buffers.size()));
+
+        for (int i = 0; i < buffers.size(); i++)
+        {
+            // Since A tuple value is always written in its entirety Cassandra can't preserve a pre-existing value by 'not setting' the new value. Reject the query.
+            ByteBuffer buffer = buffers.get(i);
+            if (buffer == null)
+                continue;
+            if (buffer == ByteBufferUtil.UNSET_BYTE_BUFFER)
+                throw new InvalidRequestException(String.format("Invalid unset value for tuple field number %d", i));
+            type(i).validate(buffer);
+        }
+
+        return buffers;
+    }
+
+    @Override
+    public <V> String getString(V input, ValueAccessor<V> accessor)
+    {
+        if (input == null)
+            return "null";
+
         StringBuilder sb = new StringBuilder();
-        ByteBuffer input = value.duplicate();
+        int offset = 0;
         for (int i = 0; i < size(); i++)
         {
-            if (!input.hasRemaining())
+            if (accessor.isEmptyFromOffset(input, offset))
                 return sb.toString();
 
             if (i > 0)
                 sb.append(":");
 
             AbstractType<?> type = type(i);
-            int size = input.getInt();
+            int size = accessor.getInt(input, offset);
+            offset += TypeSizes.INT_SIZE;
             if (size < 0)
             {
                 sb.append("@");
                 continue;
             }
 
-            ByteBuffer field = ByteBufferUtil.readBytes(input, size);
+            V field = accessor.slice(input, offset, size);
+            offset += size;
             // We use ':' as delimiter, and @ to represent null, so escape them in the generated string
-            sb.append(type.getString(field).replaceAll(":", "\\\\:").replaceAll("@", "\\\\@"));
+            String fld = COLON_PAT.matcher(type.getString(field, accessor)).replaceAll(ESCAPED_COLON);
+            fld = AT_PAT.matcher(fld).replaceAll(ESCAPED_AT);
+            sb.append(fld);
         }
         return sb.toString();
     }
@@ -220,31 +450,37 @@ public class TupleType extends AbstractType<ByteBuffer>
             throw new MarshalException(String.format("Invalid tuple literal: too many elements. Type %s expects %d but got %d",
                                                      asCQL3Type(), size(), fieldStrings.size()));
 
-        ByteBuffer[] fields = new ByteBuffer[fieldStrings.size()];
+        List<ByteBuffer> fields = new ArrayList<>(fieldStrings.size());
         for (int i = 0; i < fieldStrings.size(); i++)
         {
             String fieldString = fieldStrings.get(i);
             // We use @ to represent nulls
             if (fieldString.equals("@"))
-                continue;
-
-            AbstractType<?> type = type(i);
-            fields[i] = type.fromString(fieldString.replaceAll("\\\\:", ":").replaceAll("\\\\@", "@"));
+            {
+                fields.add(null);
+            }
+            else
+            {
+                AbstractType<?> type = type(i);
+                fieldString = ESCAPED_COLON_PAT.matcher(fieldString).replaceAll(COLON);
+                fieldString = ESCAPED_AT_PAT.matcher(fieldString).replaceAll(AT);
+                fields.add(type.fromString(fieldString));
+            }
         }
-        return buildValue(fields);
+        return pack(fields);
     }
 
     @Override
     public Term fromJSONObject(Object parsed) throws MarshalException
     {
         if (parsed instanceof String)
-            parsed = Json.decodeJson((String) parsed);
+            parsed = JsonUtils.decodeJson((String) parsed);
 
         if (!(parsed instanceof List))
             throw new MarshalException(String.format(
                     "Expected a list representation of a tuple, but got a %s: %s", parsed.getClass().getSimpleName(), parsed));
 
-        List list = (List) parsed;
+        List<?> list = (List<?>) parsed;
 
         if (list.size() > types.size())
             throw new MarshalException(String.format("Tuple contains extra items (expected %s): %s", types.size(), parsed));
@@ -266,20 +502,22 @@ public class TupleType extends AbstractType<ByteBuffer>
             }
         }
 
-        return new Tuples.DelayedValue(this, terms);
+        return new MultiElements.DelayedValue(this, terms);
     }
 
     @Override
-    public String toJSONString(ByteBuffer buffer, int protocolVersion)
+    public String toJSONString(ByteBuffer buffer, ProtocolVersion protocolVersion)
     {
         ByteBuffer duplicated = buffer.duplicate();
+        int offset = 0;
         StringBuilder sb = new StringBuilder("[");
         for (int i = 0; i < types.size(); i++)
         {
             if (i > 0)
                 sb.append(", ");
 
-            ByteBuffer value = CollectionSerializer.readValue(duplicated, protocolVersion);
+            ByteBuffer value = CollectionSerializer.readValue(duplicated, ByteBufferAccessor.instance, offset);
+            offset += CollectionSerializer.sizeOfValue(value, ByteBufferAccessor.instance);
             if (value == null)
                 sb.append("null");
             else
@@ -344,7 +582,7 @@ public class TupleType extends AbstractType<ByteBuffer>
     @Override
     public boolean equals(Object o)
     {
-        if(!(o instanceof TupleType))
+        if (o.getClass() != TupleType.class)
             return false;
 
         TupleType that = (TupleType)o;
@@ -363,8 +601,25 @@ public class TupleType extends AbstractType<ByteBuffer>
         return getClass().getName() + TypeParser.stringifyTypeParameters(types, true);
     }
 
-    public boolean isTuple()
+    @Override
+    public ByteBuffer getMaskedValue()
     {
-        return true;
+        List<ByteBuffer> buffers = new ArrayList<>(types.size());
+        for (AbstractType<?> type : types)
+            buffers.add(type.getMaskedValue());
+
+        return serializer.serialize(pack(buffers));
+    }
+
+    @Override
+    public int compareCQL(ComplexColumnData columnData, List<ByteBuffer> fields)
+    {
+        throw new UnsupportedOperationException("Multicell tuples are not supported");
+    }
+
+    @Override
+    public boolean isConstrainable()
+    {
+        return false;
     }
 }

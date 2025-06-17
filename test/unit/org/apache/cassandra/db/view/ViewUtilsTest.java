@@ -18,52 +18,66 @@
 
 package org.apache.cassandra.db.view;
 
-import java.net.InetAddress;
+import java.io.IOException;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Optional;
 
+import org.junit.Assert;
+import org.junit.Before;
 import org.junit.BeforeClass;
 import org.junit.Test;
 
-import junit.framework.Assert;
-import org.apache.cassandra.config.DatabaseDescriptor;
-import org.apache.cassandra.config.Schema;
+import org.apache.cassandra.CassandraTestBase;
+import org.apache.cassandra.CassandraTestBase.DDDaemonInitialization;
+import org.apache.cassandra.CassandraTestBase.UseOrderPreservingPartitioner;
+import org.apache.cassandra.ServerTestUtils;
 import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.dht.OrderPreservingPartitioner.StringToken;
+import org.apache.cassandra.distributed.test.log.ClusterMetadataTestHelper;
 import org.apache.cassandra.exceptions.ConfigurationException;
-import org.apache.cassandra.locator.IEndpointSnitch;
+import org.apache.cassandra.locator.InetAddressAndPort;
 import org.apache.cassandra.locator.NetworkTopologyStrategy;
-import org.apache.cassandra.locator.PropertyFileSnitch;
-import org.apache.cassandra.locator.TokenMetadata;
+import org.apache.cassandra.locator.Replica;
 import org.apache.cassandra.schema.KeyspaceMetadata;
 import org.apache.cassandra.schema.KeyspaceParams;
 import org.apache.cassandra.schema.ReplicationParams;
-import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.schema.SchemaTestUtil;
+import org.apache.cassandra.tcm.ClusterMetadata;
+import org.apache.cassandra.tcm.ClusterMetadataService;
+import org.apache.cassandra.tcm.StubClusterMetadataService;
 
-public class ViewUtilsTest
+@DDDaemonInitialization
+@UseOrderPreservingPartitioner
+public class ViewUtilsTest extends CassandraTestBase
 {
+    private final String KS = "Keyspace1";
+
     @BeforeClass
-    public static void setUp() throws ConfigurationException
+    public static void setUp() throws ConfigurationException, IOException
     {
-        IEndpointSnitch snitch = new PropertyFileSnitch();
-        DatabaseDescriptor.setEndpointSnitch(snitch);
+        ServerTestUtils.cleanupAndLeaveDirs();
         Keyspace.setInitialized();
+    }
+
+    @Before
+    public void beforeEach()
+    {
+        ClusterMetadataService.unsetInstance();
+        ClusterMetadataService.setInstance(StubClusterMetadataService.forTesting());
     }
 
     @Test
     public void testGetIndexNaturalEndpoint() throws Exception
     {
-        TokenMetadata metadata = StorageService.instance.getTokenMetadata();
-        metadata.clearUnsafe();
-
         // DC1
-        metadata.updateNormalToken(new StringToken("A"), InetAddress.getByName("127.0.0.1"));
-        metadata.updateNormalToken(new StringToken("C"), InetAddress.getByName("127.0.0.2"));
+        ClusterMetadataTestHelper.addEndpoint(InetAddressAndPort.getByName("127.0.0.1"), new StringToken("A"), "DC1", "RACK1");
+        ClusterMetadataTestHelper.addEndpoint(InetAddressAndPort.getByName("127.0.0.2"), new StringToken("C"), "DC1", "RACK1");
 
         // DC2
-        metadata.updateNormalToken(new StringToken("B"), InetAddress.getByName("127.0.0.4"));
-        metadata.updateNormalToken(new StringToken("D"), InetAddress.getByName("127.0.0.5"));
+        ClusterMetadataTestHelper.addEndpoint(InetAddressAndPort.getByName("127.0.0.4"), new StringToken("B"), "DC2", "RACK1");
+        ClusterMetadataTestHelper.addEndpoint(InetAddressAndPort.getByName("127.0.0.5"), new StringToken("D"), "DC2", "RACK1");
+
 
         Map<String, String> replicationMap = new HashMap<>();
         replicationMap.put(ReplicationParams.CLASS, NetworkTopologyStrategy.class.getName());
@@ -71,32 +85,28 @@ public class ViewUtilsTest
         replicationMap.put("DC1", "1");
         replicationMap.put("DC2", "1");
 
-        Keyspace.clear("Keyspace1");
-        KeyspaceMetadata meta = KeyspaceMetadata.create("Keyspace1", KeyspaceParams.create(false, replicationMap));
-        Schema.instance.setKeyspaceMetadata(meta);
+        recreateKeyspace(replicationMap);
 
-        Optional<InetAddress> naturalEndpoint = ViewUtils.getViewNaturalEndpoint("Keyspace1",
-                                                                       new StringToken("CA"),
-                                                                       new StringToken("BB"));
+        Optional<Replica> naturalEndpoint = ViewUtils.getViewNaturalEndpoint(ClusterMetadata.current(),
+                                                                             KS,
+                                                                             new StringToken("CA"),
+                                                                             new StringToken("BB"));
 
         Assert.assertTrue(naturalEndpoint.isPresent());
-        Assert.assertEquals(InetAddress.getByName("127.0.0.2"), naturalEndpoint.get());
+        Assert.assertEquals(InetAddressAndPort.getByName("127.0.0.2"), naturalEndpoint.get().endpoint());
     }
 
 
     @Test
     public void testLocalHostPreference() throws Exception
     {
-        TokenMetadata metadata = StorageService.instance.getTokenMetadata();
-        metadata.clearUnsafe();
-
         // DC1
-        metadata.updateNormalToken(new StringToken("A"), InetAddress.getByName("127.0.0.1"));
-        metadata.updateNormalToken(new StringToken("C"), InetAddress.getByName("127.0.0.2"));
+        ClusterMetadataTestHelper.addEndpoint(InetAddressAndPort.getByName("127.0.0.1"), new StringToken("A"), "DC1", "RACK1");
+        ClusterMetadataTestHelper.addEndpoint(InetAddressAndPort.getByName("127.0.0.2"), new StringToken("C"), "DC1", "RACK1");
 
         // DC2
-        metadata.updateNormalToken(new StringToken("B"), InetAddress.getByName("127.0.0.4"));
-        metadata.updateNormalToken(new StringToken("D"), InetAddress.getByName("127.0.0.5"));
+        ClusterMetadataTestHelper.addEndpoint(InetAddressAndPort.getByName("127.0.0.4"), new StringToken("B"), "DC2", "RACK1");
+        ClusterMetadataTestHelper.addEndpoint(InetAddressAndPort.getByName("127.0.0.5"), new StringToken("D"), "DC2", "RACK1");
 
         Map<String, String> replicationMap = new HashMap<>();
         replicationMap.put(ReplicationParams.CLASS, NetworkTopologyStrategy.class.getName());
@@ -104,31 +114,28 @@ public class ViewUtilsTest
         replicationMap.put("DC1", "2");
         replicationMap.put("DC2", "2");
 
-        Keyspace.clear("Keyspace1");
-        KeyspaceMetadata meta = KeyspaceMetadata.create("Keyspace1", KeyspaceParams.create(false, replicationMap));
-        Schema.instance.setKeyspaceMetadata(meta);
+        recreateKeyspace(replicationMap);
 
-        Optional<InetAddress> naturalEndpoint = ViewUtils.getViewNaturalEndpoint("Keyspace1",
-                                                                       new StringToken("CA"),
-                                                                       new StringToken("BB"));
+        Optional<Replica> naturalEndpoint = ViewUtils.getViewNaturalEndpoint(ClusterMetadata.current(),
+                                                                             KS,
+                                                                             new StringToken("CA"),
+                                                                             new StringToken("BB"));
 
         Assert.assertTrue(naturalEndpoint.isPresent());
-        Assert.assertEquals(InetAddress.getByName("127.0.0.1"), naturalEndpoint.get());
+        Assert.assertEquals(InetAddressAndPort.getByName("127.0.0.1"), naturalEndpoint.get().endpoint());
     }
 
     @Test
     public void testBaseTokenDoesNotBelongToLocalReplicaShouldReturnEmpty() throws Exception
     {
-        TokenMetadata metadata = StorageService.instance.getTokenMetadata();
-        metadata.clearUnsafe();
-
         // DC1
-        metadata.updateNormalToken(new StringToken("A"), InetAddress.getByName("127.0.0.1"));
-        metadata.updateNormalToken(new StringToken("C"), InetAddress.getByName("127.0.0.2"));
+        ClusterMetadataTestHelper.addEndpoint(InetAddressAndPort.getByName("127.0.0.1"), new StringToken("A"), "DC1", "RACK1");
+        ClusterMetadataTestHelper.addEndpoint(InetAddressAndPort.getByName("127.0.0.2"), new StringToken("C"), "DC1", "RACK1");
 
         // DC2
-        metadata.updateNormalToken(new StringToken("B"), InetAddress.getByName("127.0.0.4"));
-        metadata.updateNormalToken(new StringToken("D"), InetAddress.getByName("127.0.0.5"));
+        ClusterMetadataTestHelper.addEndpoint(InetAddressAndPort.getByName("127.0.0.4"), new StringToken("B"), "DC2", "RACK1");
+        ClusterMetadataTestHelper.addEndpoint(InetAddressAndPort.getByName("127.0.0.5"), new StringToken("D"), "DC2", "RACK1");
+
 
         Map<String, String> replicationMap = new HashMap<>();
         replicationMap.put(ReplicationParams.CLASS, NetworkTopologyStrategy.class.getName());
@@ -136,14 +143,20 @@ public class ViewUtilsTest
         replicationMap.put("DC1", "1");
         replicationMap.put("DC2", "1");
 
-        Keyspace.clear("Keyspace1");
-        KeyspaceMetadata meta = KeyspaceMetadata.create("Keyspace1", KeyspaceParams.create(false, replicationMap));
-        Schema.instance.setKeyspaceMetadata(meta);
+        recreateKeyspace(replicationMap);
 
-        Optional<InetAddress> naturalEndpoint = ViewUtils.getViewNaturalEndpoint("Keyspace1",
-                                                                       new StringToken("AB"),
-                                                                       new StringToken("BB"));
+        Optional<Replica> naturalEndpoint = ViewUtils.getViewNaturalEndpoint(ClusterMetadata.current(),
+                                                                             KS,
+                                                                             new StringToken("AB"),
+                                                                             new StringToken("BB"));
 
         Assert.assertFalse(naturalEndpoint.isPresent());
+    }
+
+    private void recreateKeyspace(Map<String, String> replicationMap)
+    {
+        SchemaTestUtil.dropKeyspaceIfExist(KS, true);
+        KeyspaceMetadata meta = KeyspaceMetadata.create(KS, KeyspaceParams.create(false, replicationMap));
+        SchemaTestUtil.addOrUpdateKeyspace(meta, true);
     }
 }

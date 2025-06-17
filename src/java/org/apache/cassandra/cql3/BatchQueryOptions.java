@@ -22,10 +22,14 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 
+import com.google.common.collect.ImmutableList;
+
 import org.apache.cassandra.utils.MD5Digest;
 
 import org.apache.cassandra.db.ConsistencyLevel;
 import org.apache.cassandra.service.QueryState;
+import org.apache.commons.lang3.builder.ToStringBuilder;
+import org.apache.commons.lang3.builder.ToStringStyle;
 
 public abstract class BatchQueryOptions
 {
@@ -52,7 +56,7 @@ public abstract class BatchQueryOptions
 
     public abstract QueryOptions forStatement(int i);
 
-    public void prepareStatement(int i, List<ColumnSpecification> boundNames)
+    public void prepareStatement(int i, ImmutableList<ColumnSpecification> boundNames)
     {
         forStatement(i).prepare(boundNames);
     }
@@ -60,6 +64,11 @@ public abstract class BatchQueryOptions
     public ConsistencyLevel getConsistency()
     {
         return wrapped.getConsistency();
+    }
+
+    public String getKeyspace()
+    {
+        return wrapped.getKeyspace();
     }
 
     public ConsistencyLevel getSerialConsistency()
@@ -75,6 +84,11 @@ public abstract class BatchQueryOptions
     public long getTimestamp(QueryState state)
     {
         return wrapped.getTimestamp(state);
+    }
+
+    public long getNowInSeconds(QueryState state)
+    {
+        return wrapped.getNowInSeconds(state);
     }
 
     private static class WithoutPerStatementVariables extends BatchQueryOptions
@@ -116,7 +130,7 @@ public abstract class BatchQueryOptions
         }
 
         @Override
-        public void prepareStatement(int i, List<ColumnSpecification> boundNames)
+        public void prepareStatement(int i, ImmutableList<ColumnSpecification> boundNames)
         {
             if (isPreparedStatement(i))
             {
@@ -135,5 +149,11 @@ public abstract class BatchQueryOptions
         {
             return getQueryOrIdList().get(i) instanceof MD5Digest;
         }
+    }
+    
+    @Override
+    public String toString()
+    {
+        return ToStringBuilder.reflectionToString(this, ToStringStyle.SHORT_PREFIX_STYLE);
     }
 }

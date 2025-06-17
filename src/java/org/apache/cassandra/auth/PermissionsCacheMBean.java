@@ -15,17 +15,12 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
 package org.apache.cassandra.auth;
 
-public interface PermissionsCacheMBean
+public interface PermissionsCacheMBean extends AuthCacheMBean
 {
-    public void invalidate();
+    public static final String CACHE_NAME = "PermissionsCache";
 
-    public void setValidity(int validityPeriod);
-
-    public int getValidity();
-
-    public void setUpdateInterval(int updateInterval);
-
-    public int getUpdateInterval();
+    public void invalidatePermissions(String roleName, String resourceName);
 }

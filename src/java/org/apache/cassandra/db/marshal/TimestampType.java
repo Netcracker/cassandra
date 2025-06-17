@@ -20,15 +20,23 @@ package org.apache.cassandra.db.marshal;
 import java.nio.ByteBuffer;
 import java.util.Date;
 
-import org.apache.cassandra.cql3.Constants;
-import org.apache.cassandra.cql3.Term;
+import org.apache.cassandra.cql3.terms.Constants;
+import org.apache.cassandra.cql3.Duration;
+import org.apache.cassandra.cql3.terms.Term;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.apache.cassandra.cql3.CQL3Type;
 import org.apache.cassandra.serializers.TypeSerializer;
 import org.apache.cassandra.serializers.MarshalException;
 import org.apache.cassandra.serializers.TimestampSerializer;
+import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.utils.bytecomparable.ByteComparable;
+import org.apache.cassandra.utils.bytecomparable.ByteSource;
+import org.apache.cassandra.utils.bytecomparable.ByteSourceInverse;
+
+import static org.apache.cassandra.cql3.statements.RequestValidations.invalidRequest;
 
 /**
  * Type for date-time values.
@@ -37,22 +45,42 @@ import org.apache.cassandra.utils.ByteBufferUtil;
  * pre-unix-epoch dates, sorting them *after* post-unix-epoch ones (due to it's
  * use of unsigned bytes comparison).
  */
-public class TimestampType extends AbstractType<Date>
+public class TimestampType extends TemporalType<Date>
 {
     private static final Logger logger = LoggerFactory.getLogger(TimestampType.class);
 
     public static final TimestampType instance = new TimestampType();
 
+    private static final ByteBuffer MASKED_VALUE = instance.decompose(new Date(0));
+
     private TimestampType() {super(ComparisonType.CUSTOM);} // singleton
+
+    @Override
+    public boolean allowsEmpty()
+    {
+        return true;
+    }
 
     public boolean isEmptyValueMeaningless()
     {
         return true;
     }
 
-    public int compareCustom(ByteBuffer o1, ByteBuffer o2)
+    public <VL, VR> int compareCustom(VL left, ValueAccessor<VL> accessorL, VR right, ValueAccessor<VR> accessorR)
     {
-        return LongType.compareLongs(o1, o2);
+        return LongType.compareLongs(left, accessorL, right, accessorR);
+    }
+
+    @Override
+    public <V> ByteSource asComparableBytes(ValueAccessor<V> accessor, V data, ByteComparable.Version version)
+    {
+        return ByteSource.optionalSignedFixedLengthNumber(accessor, data);
+    }
+
+    @Override
+    public <V> V fromComparableBytes(ValueAccessor<V> accessor, ByteSource.Peekable comparableBytes, ByteComparable.Version version)
+    {
+        return ByteSourceInverse.getOptionalSignedFixedLength(accessor, comparableBytes, 8);
     }
 
     public ByteBuffer fromString(String source) throws MarshalException
@@ -64,9 +92,16 @@ public class TimestampType extends AbstractType<Date>
       return ByteBufferUtil.bytes(TimestampSerializer.dateStringToTimestamp(source));
     }
 
+    @Override
     public ByteBuffer fromTimeInMillis(long millis) throws MarshalException
     {
         return ByteBufferUtil.bytes(millis);
+    }
+
+    @Override
+    public long toTimeInMillis(ByteBuffer value)
+    {
+        return ByteBufferUtil.toLong(value);
     }
 
     @Override
@@ -89,11 +124,11 @@ public class TimestampType extends AbstractType<Date>
 
     private String toString(Date date)
     {
-        return date != null ? TimestampSerializer.getJsonDateFormatter().format(date) : "";
+        return date != null ? TimestampSerializer.getJsonDateFormatter().format(date.toInstant()) : "";
     }
 
     @Override
-    public String toJSONString(ByteBuffer buffer, int protocolVersion)
+    public String toJSONString(ByteBuffer buffer, ProtocolVersion protocolVersion)
     {
         return '"' + toString(TimestampSerializer.instance.deserialize(buffer)) + '"';
     }
@@ -132,8 +167,21 @@ public class TimestampType extends AbstractType<Date>
     }
 
     @Override
-    protected int valueLengthIfFixed()
+    public int valueLengthIfFixed()
     {
         return 8;
+    }
+
+    @Override
+    protected void validateDuration(Duration duration)
+    {
+        if (!duration.hasMillisecondPrecision())
+            throw invalidRequest("The duration must have a millisecond precision. Was: %s", duration);
+    }
+
+    @Override
+    public ByteBuffer getMaskedValue()
+    {
+        return MASKED_VALUE;
     }
 }

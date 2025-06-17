@@ -21,13 +21,14 @@ import java.util.*;
 import javax.management.openmbean.*;
 
 import com.google.common.base.Function;
-import com.google.common.base.Throwables;
 import com.google.common.collect.Iterables;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Sets;
 
 import org.apache.cassandra.streaming.SessionInfo;
 import org.apache.cassandra.streaming.StreamState;
+import org.apache.cassandra.streaming.StreamOperation;
+import org.apache.cassandra.utils.TimeUUID;
 
 /**
  */
@@ -48,7 +49,8 @@ public class StreamStateCompositeData
     private static final OpenType<?>[] ITEM_TYPES;
 
     public static final CompositeType COMPOSITE_TYPE;
-    static  {
+    static
+    {
         try
         {
             ITEM_TYPES = new OpenType[]{SimpleType.STRING,
@@ -64,7 +66,7 @@ public class StreamStateCompositeData
         }
         catch (OpenDataException e)
         {
-            throw Throwables.propagate(e);
+            throw new RuntimeException(e);
         }
     }
 
@@ -72,7 +74,7 @@ public class StreamStateCompositeData
     {
         Map<String, Object> valueMap = new HashMap<>();
         valueMap.put(ITEM_NAMES[0], streamState.planId.toString());
-        valueMap.put(ITEM_NAMES[1], streamState.description);
+        valueMap.put(ITEM_NAMES[1], streamState.streamOperation.getDescription());
 
         CompositeData[] sessions = new CompositeData[streamState.sessions.size()];
         Lists.newArrayList(Iterables.transform(streamState.sessions, new Function<SessionInfo, CompositeData>()
@@ -111,7 +113,7 @@ public class StreamStateCompositeData
         }
         catch (OpenDataException e)
         {
-            throw Throwables.propagate(e);
+            throw new RuntimeException(e);
         }
     }
 
@@ -119,8 +121,8 @@ public class StreamStateCompositeData
     {
         assert cd.getCompositeType().equals(COMPOSITE_TYPE);
         Object[] values = cd.getAll(ITEM_NAMES);
-        UUID planId = UUID.fromString((String) values[0]);
-        String description = (String) values[1];
+        TimeUUID planId = TimeUUID.fromString((String) values[0]);
+        String typeString = (String) values[1];
         Set<SessionInfo> sessions = Sets.newHashSet(Iterables.transform(Arrays.asList((CompositeData[]) values[2]),
                                                                         new Function<CompositeData, SessionInfo>()
                                                                         {
@@ -129,6 +131,6 @@ public class StreamStateCompositeData
                                                                                 return SessionInfoCompositeData.fromCompositeData(input);
                                                                             }
                                                                         }));
-        return new StreamState(planId, description, sessions);
+        return new StreamState(planId, StreamOperation.fromString(typeString), sessions);
     }
 }

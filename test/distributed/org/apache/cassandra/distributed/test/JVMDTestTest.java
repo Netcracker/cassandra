@@ -24,29 +24,27 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
-import java.util.logging.Logger;
 
-import org.junit.Assert;
 import com.google.common.collect.ImmutableMap;
+import org.apache.cassandra.utils.JVMStabilityInspector;
 import org.junit.Test;
 
-import org.slf4j.LoggerFactory;
-
+import org.apache.cassandra.concurrent.Stage;
 import org.apache.cassandra.config.Config;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.distributed.Cluster;
 import org.apache.cassandra.distributed.api.ConsistencyLevel;
 import org.apache.cassandra.distributed.api.Feature;
 import org.apache.cassandra.distributed.api.LogAction;
-import org.apache.cassandra.service.CassandraDaemon;
 import org.apache.cassandra.utils.FBUtilities;
+import org.assertj.core.api.Assertions;
 
-import static org.apache.cassandra.distributed.shared.AssertUtils.assertRows;
 import static org.apache.cassandra.distributed.shared.AssertUtils.row;
+import static org.apache.cassandra.distributed.shared.AssertUtils.assertRows;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
-import static org.junit.Assert.assertTrue;
 
 public class JVMDTestTest extends TestBaseImpl
 {
@@ -76,16 +74,33 @@ public class JVMDTestTest extends TestBaseImpl
         try (Cluster cluster = init(Cluster.build(2).withConfig(c -> c.with(Feature.values())).start()))
         {
             // debug logging is turned on so we will see debug logs
-            assertFalse(cluster.get(1).logs().grep("^DEBUG").getResult().isEmpty());
+            Assertions.assertThat(cluster.get(1).logs().grep("^DEBUG").getResult()).isNotEmpty();
             // make sure an exception is thrown in the cluster
             LogAction logs = cluster.get(2).logs();
             long mark = logs.mark(); // get the current position so watching doesn't see any previous exceptions
             cluster.get(2).runOnInstance(() -> {
                 // pretend that an uncaught exception was thrown
-                LoggerFactory.getLogger(CassandraDaemon.class).error("Error", new RuntimeException("fail without fail"));
+                JVMStabilityInspector.uncaughtException(Thread.currentThread(), new RuntimeException("fail without fail"));
             });
             List<String> errors = logs.watchFor(mark, "^ERROR").getResult();
-            assertFalse(errors.isEmpty());
+            Assertions.assertThat(errors)
+                      // can't check for "fail without fail" since thats on the next line, and watchFor doesn't
+                      // stitch lines together like grepForError does
+                      .allMatch(s -> s.contains("ERROR"))
+                      .allMatch(s -> s.contains("isolatedExecutor"))
+                      .allMatch(s -> s.contains("Exception in thread"))
+                      .as("Unable to find 'ERROR', 'isolatedExecutor', and 'Exception in thread'")
+                      .isNotEmpty();
+        }
+    }
+
+    @Test
+    public void jvmArgumentLoggingTest() throws IOException
+    {
+        try (Cluster cluster = Cluster.build(1).start())
+        {
+            LogAction logs = cluster.get(1).logs();
+            Assertions.assertThat(logs.grep("JVM Arguments").getResult()).isNotEmpty();
         }
     }
 
@@ -107,8 +122,9 @@ public class JVMDTestTest extends TestBaseImpl
                                       }).start())
         {
             cluster.get(1).runOnInstance(() -> {
-                assertEquals(321, DatabaseDescriptor.getConcurrentReaders());
+                assertEquals(321, Stage.READ.getMaximumPoolSize());
                 assertEquals(Config.InternodeCompression.dc, DatabaseDescriptor.internodeCompression());
+                assertEquals(Collections.singletonList("FakeCipher"), DatabaseDescriptor.getNativeProtocolEncryptionOptions().cipher_suites);
                 assertEquals("org.apache.cassandra.io.compress.LZ4Compressor", DatabaseDescriptor.getCommitLogCompression().class_name);
                 assertTrue(DatabaseDescriptor.getCommitLogCompression().parameters.isEmpty());
             });
@@ -157,9 +173,13 @@ public class JVMDTestTest extends TestBaseImpl
             assertRows(cluster.get(2).executeInternal("SELECT table_name FROM system_schema.tables WHERE keyspace_name = ?", KEYSPACE),
                        row("tbl1"), row("tbl2"), row("tbl3"));
 
-            // Finally test schema can be changed with the first node down
-            cluster.get(1).shutdown(true).get(1, TimeUnit.MINUTES);
+            // Finally test schema can be changed with the non-CMS node down
+            cluster.get(2).shutdown(true).get(1, TimeUnit.MINUTES);
             cluster.schemaChangeIgnoringStoppedInstances("CREATE TABLE "+KEYSPACE+".tbl4 (id int primary key, i int)");
+            assertRows(cluster.get(1).executeInternal("SELECT table_name FROM system_schema.tables WHERE keyspace_name = ?", KEYSPACE),
+                       row("tbl1"), row("tbl2"), row("tbl3"), row("tbl4"));
+            // Restart the down node and check it catches up with the new schema
+            cluster.get(2).startup();
             assertRows(cluster.get(2).executeInternal("SELECT table_name FROM system_schema.tables WHERE keyspace_name = ?", KEYSPACE),
                        row("tbl1"), row("tbl2"), row("tbl3"), row("tbl4"));
         }

@@ -27,7 +27,16 @@ public class Hex
 {
     private static final Constructor<String> stringConstructor = getProtectedConstructor(String.class, int.class, int.class, char[].class);
     private final static byte[] charToByte = new byte[256];
-    private static final Logger logger = LoggerFactory.getLogger(Hex.class);
+
+    private static class LoggerHandle
+    {
+        private static final Logger logger = LoggerFactory.getLogger(Hex.class);
+    }
+
+    private static Logger logger()
+    {
+        return LoggerHandle.logger;
+    }
 
     // package protected for use by ByteBufferUtil. Do not modify this array !!
     static final char[] byteToChar = new char[16];
@@ -70,15 +79,37 @@ public class Hex
 
     public static String bytesToHex(byte... bytes)
     {
-        char[] c = new char[bytes.length * 2];
-        for (int i = 0; i < bytes.length; i++)
+        return bytesToHex(bytes, 0, bytes.length);
+    }
+
+    public static String bytesToHex(byte bytes[], int offset, int length)
+    {
+        char[] c = new char[length * 2];
+        for (int i = 0; i < length; i++)
         {
-            int bint = bytes[i];
+            int bint = bytes[i + offset];
             c[i * 2] = byteToChar[(bint & 0xf0) >> 4];
             c[1 + i * 2] = byteToChar[bint & 0x0f];
         }
 
         return wrapCharArray(c);
+    }
+
+    public static long parseLong(String hex, int start, int end)
+    {
+        int len = end - start;
+        if (len > 16)
+            throw new IllegalArgumentException();
+
+        long result = 0;
+        int shift = 4 * (len - 1);
+        for (int i = start ; i < end ; ++i)
+        {
+            char c = hex.charAt(i);
+            result |= (long)(c - (c >= 'a' ? 'a' - 10 : '0')) << shift;
+            shift -= 4;
+        }
+        return result;
     }
 
     /**
@@ -96,11 +127,12 @@ public class Hex
             try
             {
                 s = stringConstructor.newInstance(0, c.length, c);
-            } 
-            catch (InvocationTargetException ite) {
+            }
+            catch (InvocationTargetException ite)
+            {
                 // The underlying constructor failed. Unwrapping the exception.
                 Throwable cause = ite.getCause();
-                logger.error("Underlying string constructor threw an error: {}",
+                logger().error("Underlying string constructor threw an error: {}",
                     cause == null ? ite.getMessage() : cause.getMessage());
             }
             catch (Exception e)

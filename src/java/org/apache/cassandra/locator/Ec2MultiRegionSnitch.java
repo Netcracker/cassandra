@@ -18,15 +18,10 @@
 package org.apache.cassandra.locator;
 
 import java.io.IOException;
-import java.net.InetAddress;
 
 import com.google.common.annotations.VisibleForTesting;
 
-import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.exceptions.ConfigurationException;
-import org.apache.cassandra.gms.ApplicationState;
-import org.apache.cassandra.gms.Gossiper;
-import org.apache.cassandra.service.StorageService;
 
 /**
  * 1) Snitch will automatically set the public IP by querying the AWS API
@@ -38,14 +33,17 @@ import org.apache.cassandra.service.StorageService;
  *
  * Operational: All the nodes in this cluster needs to be able to (modify the
  * Security group settings in AWS) communicate via Public IP's.
+ * @deprecated See CASSANDRA-19488
  */
+@Deprecated(since = "CEP-21")
 public class Ec2MultiRegionSnitch extends Ec2Snitch
 {
+
+    private final Ec2MultiRegionAddressConfig addressConfig;
     @VisibleForTesting
     static final String PUBLIC_IP_QUERY = "/latest/meta-data/public-ipv4";
     @VisibleForTesting
     static final String PRIVATE_IP_QUERY = "/latest/meta-data/local-ipv4";
-    private final String localPrivateAddress;
 
     public Ec2MultiRegionSnitch() throws IOException, ConfigurationException
     {
@@ -54,30 +52,25 @@ public class Ec2MultiRegionSnitch extends Ec2Snitch
 
     public Ec2MultiRegionSnitch(SnitchProperties props) throws IOException, ConfigurationException
     {
-        this(props, Ec2MetadataServiceConnector.create(props));
+        this(Ec2MetadataServiceConnector.create(props));
     }
 
     @VisibleForTesting
-    public Ec2MultiRegionSnitch(SnitchProperties props, Ec2MetadataServiceConnector connector) throws IOException
+    public Ec2MultiRegionSnitch(AbstractCloudMetadataServiceConnector connector) throws IOException
     {
-        super(props, connector);
-        InetAddress localPublicAddress = InetAddress.getByName(connector.apiCall(PUBLIC_IP_QUERY));
-        logger.info("EC2Snitch using publicIP as identifier: {}", localPublicAddress);
-        localPrivateAddress = connector.apiCall(PRIVATE_IP_QUERY);
-        // use the Public IP to broadcast Address to other nodes.
-        DatabaseDescriptor.setBroadcastAddress(localPublicAddress);
-        if (DatabaseDescriptor.getBroadcastRpcAddress() == null)
-        {
-            logger.info("broadcast_rpc_address unset, broadcasting public IP as rpc_address: {}", localPublicAddress);
-            DatabaseDescriptor.setBroadcastRpcAddress(localPublicAddress);
-        }
+        super(connector);
+        addressConfig = new Ec2MultiRegionAddressConfig(connector);
     }
 
     @Override
-    public void gossiperStarting()
+    public void configureAddresses()
     {
-        super.gossiperStarting();
-        Gossiper.instance.addLocalApplicationState(ApplicationState.INTERNAL_IP, StorageService.instance.valueFactory.internalIP(localPrivateAddress));
-        Gossiper.instance.register(new ReconnectableSnitchHelper(this, ec2region, true));
+        addressConfig.configureAddresses();
+    }
+
+    @Override
+    public boolean preferLocalConnections()
+    {
+        return addressConfig.preferLocalConnections();
     }
 }

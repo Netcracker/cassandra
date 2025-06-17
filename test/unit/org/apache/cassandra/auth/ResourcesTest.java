@@ -50,6 +50,9 @@ public class ResourcesTest
         assertEquals(DataResource.keyspace("ks1"), Resources.fromName("data/ks1"));
         assertEquals("data/ks1", DataResource.keyspace("ks1").getName());
 
+        assertEquals(DataResource.allTables("ks1"), Resources.fromName("data/ks1/*"));
+        assertEquals("data/ks1/*", DataResource.allTables("ks1").getName());
+
         assertEquals(DataResource.table("ks1", "t1"), Resources.fromName("data/ks1/t1"));
         assertEquals("data/ks1/t1", DataResource.table("ks1", "t1").getName());
     }
@@ -75,5 +78,17 @@ public class ResourcesTest
                 Resources.fromName("functions/ks1/f1[org.apache.cassandra.db.marshal.Int32Type^org.apache.cassandra.db.marshal.DoubleType]"));
         assertEquals("functions/ks1/f1[org.apache.cassandra.db.marshal.Int32Type^org.apache.cassandra.db.marshal.DoubleType]",
                 FunctionResource.function("ks1", "f1", Arrays.asList(Int32Type.instance, DoubleType.instance)).getName());
+    }
+
+    @Test
+    public void testJMXResourceNameConversion()
+    {
+        assertEquals(JMXResource.root(), Resources.fromName("mbean"));
+        assertEquals("mbean", JMXResource.root().getName());
+
+        assertEquals(JMXResource.mbean("org.apache.cassandra.auth:type=*"),
+                Resources.fromName("mbean/org.apache.cassandra.auth:type=*"));
+        assertEquals("mbean/org.apache.cassandra.auth:type=*",
+                JMXResource.mbean("org.apache.cassandra.auth:type=*").getName());
     }
 }

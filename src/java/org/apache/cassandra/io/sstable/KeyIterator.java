@@ -17,110 +17,106 @@
  */
 package org.apache.cassandra.io.sstable;
 
-import java.io.File;
 import java.io.IOException;
+import java.util.concurrent.locks.ReadWriteLock;
 
-import org.apache.cassandra.utils.AbstractIterator;
-
-import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.db.DecoratedKey;
-import org.apache.cassandra.db.RowIndexEntry;
+import org.apache.cassandra.db.PartitionPosition;
+import org.apache.cassandra.dht.AbstractBounds;
 import org.apache.cassandra.dht.IPartitioner;
-import org.apache.cassandra.io.util.DataInputPlus;
-import org.apache.cassandra.io.util.RandomAccessReader;
-import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.utils.AbstractIterator;
 import org.apache.cassandra.utils.CloseableIterator;
 
 public class KeyIterator extends AbstractIterator<DecoratedKey> implements CloseableIterator<DecoratedKey>
 {
-    private final static class In
-    {
-        private final File path;
-        private RandomAccessReader in;
-
-        public In(File path)
-        {
-            this.path = path;
-        }
-
-        private void maybeInit()
-        {
-            if (in == null)
-                in = RandomAccessReader.open(path);
-        }
-
-        public DataInputPlus get()
-        {
-            maybeInit();
-            return in;
-        }
-
-        public boolean isEOF()
-        {
-            maybeInit();
-            return in.isEOF();
-        }
-
-        public void close()
-        {
-            if (in != null)
-                in.close();
-        }
-
-        public long getFilePointer()
-        {
-            maybeInit();
-            return in.getFilePointer();
-        }
-
-        public long length()
-        {
-            maybeInit();
-            return in.length();
-        }
-    }
-
-    private final Descriptor desc;
-    private final In in;
+    private final AbstractBounds<PartitionPosition> bounds;
     private final IPartitioner partitioner;
+    private final KeyReader it;
+    private final ReadWriteLock fileAccessLock;
+    private final long totalBytes;
 
+    private boolean initialized = false;
 
-    public KeyIterator(Descriptor desc, CFMetaData metadata)
+    public KeyIterator(AbstractBounds<PartitionPosition> bounds, KeyReader it, IPartitioner partitioner, long totalBytes, ReadWriteLock fileAccessLock)
     {
-        this.desc = desc;
-        in = new In(new File(desc.filenameFor(Component.PRIMARY_INDEX)));
-        partitioner = metadata.partitioner;
+        this.bounds = bounds;
+        this.it = it;
+        this.partitioner = partitioner;
+        this.totalBytes = totalBytes;
+        this.fileAccessLock = fileAccessLock;
     }
 
     protected DecoratedKey computeNext()
     {
+        if (fileAccessLock != null)
+            fileAccessLock.readLock().lock();
         try
         {
-            if (in.isEOF())
-                return endOfData();
+            while (true)
+            {
+                if (!initialized)
+                {
+                    initialized = true;
+                    if (it.isExhausted())
+                        break;
+                }
+                else if (!it.advance())
+                    break;
 
-            DecoratedKey key = partitioner.decorateKey(ByteBufferUtil.readWithShortLength(in.get()));
-            RowIndexEntry.Serializer.skip(in.get(), desc.version); // skip remainder of the entry
-            return key;
+                DecoratedKey key = partitioner.decorateKey(it.key());
+                if (bounds == null || bounds.contains(key))
+                    return key;
+
+                if (key.compareTo(bounds.right) >= 0)
+                    break;
+            }
+
+            return endOfData();
         }
         catch (IOException e)
         {
             throw new RuntimeException(e);
         }
+        finally
+        {
+            if (fileAccessLock != null)
+                fileAccessLock.readLock().unlock();
+        }
     }
 
     public void close()
     {
-        in.close();
+        if (fileAccessLock != null)
+            fileAccessLock.writeLock().lock();
+        try
+        {
+            it.close();
+        }
+        finally
+        {
+            if (fileAccessLock != null)
+                fileAccessLock.writeLock().unlock();
+        }
     }
 
     public long getBytesRead()
     {
-        return in.getFilePointer();
+        if (fileAccessLock != null)
+            fileAccessLock.readLock().lock();
+        try
+        {
+            return it.isExhausted() ? totalBytes : it.dataPosition();
+        }
+        finally
+        {
+            if (fileAccessLock != null)
+                fileAccessLock.readLock().unlock();
+        }
     }
 
     public long getTotalBytes()
     {
-        return in.length();
+        return totalBytes;
     }
+
 }

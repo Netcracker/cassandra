@@ -17,7 +17,11 @@
  */
 package org.apache.cassandra.streaming;
 
-import java.util.UUID;
+import java.util.List;
+
+import org.apache.cassandra.dht.Range;
+import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.schema.TableId;
 
 /**
  * StreamTask is an abstraction of the streaming task performed over specific ColumnFamily.
@@ -27,12 +31,12 @@ public abstract class StreamTask
     /** StreamSession that this task belongs */
     protected final StreamSession session;
 
-    protected final UUID cfId;
+    protected final TableId tableId;
 
-    protected StreamTask(StreamSession session, UUID cfId)
+    protected StreamTask(StreamSession session, TableId tableId)
     {
         this.session = session;
-        this.cfId = cfId;
+        this.tableId = tableId;
     }
 
     /**
@@ -51,11 +55,13 @@ public abstract class StreamTask
      */
     public abstract void abort();
 
+    protected abstract List<Range<Token>> ranges();
+
     /**
      * @return StreamSummary that describes this task
      */
     public StreamSummary getSummary()
     {
-        return new StreamSummary(cfId, getTotalNumberOfFiles(), getTotalSize());
+        return new StreamSummary(tableId, ranges(), getTotalNumberOfFiles(), getTotalSize());
     }
 }

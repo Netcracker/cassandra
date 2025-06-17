@@ -43,7 +43,9 @@ import net.bytebuddy.ByteBuddy;
 import net.bytebuddy.dynamic.DynamicType;
 import net.bytebuddy.dynamic.loading.ClassLoadingStrategy;
 import net.bytebuddy.implementation.MethodDelegation;
+import org.apache.cassandra.cql3.QueryHandler.Prepared;
 import org.apache.cassandra.cql3.QueryProcessor;
+import org.apache.cassandra.db.SystemKeyspace;
 import org.apache.cassandra.distributed.api.ConsistencyLevel;
 import org.apache.cassandra.distributed.api.ICluster;
 import org.apache.cassandra.distributed.api.IInvokableInstance;
@@ -155,7 +157,7 @@ public class ReprepareFuzzTest extends TestBaseImpl
                                         throw t;
                                     }
 
-                                break;
+                                    break;
                                 case EXECUTE_UNQUALIFIED:
                                     if (!unqualifiedStatements.containsKey(statementId))
                                         continue;
@@ -224,8 +226,17 @@ public class ReprepareFuzzTest extends TestBaseImpl
                                     break;
                                 case CLEAR_CACHES:
                                     c.get(1).runOnInstance(() -> {
-                                        QueryProcessor.clearPreparedStatementsCache();
+                                        SystemKeyspace.loadPreparedStatements((id, query, keyspace) -> {
+                                            Prepared prepared = QueryProcessor.instance.getPrepared(id);
+                                            if (rng.nextBoolean())
+                                                QueryProcessor.instance.evictPrepared(id);
+                                            return prepared;
+                                        });
                                     });
+                                    break;
+                                case RELOAD_FROM_TABLES:
+                                    c.get(1).runOnInstance(QueryProcessor::clearPreparedStatementsCache);
+                                    c.get(1).runOnInstance(() -> QueryProcessor.instance.preloadPreparedStatements());
                                     break;
                                 case SWITCH_KEYSPACE:
                                     usedKsIdx = ks;
@@ -302,6 +313,7 @@ public class ReprepareFuzzTest extends TestBaseImpl
         PREPARE_UNQUALIFIED,
         CLEAR_CACHES,
         FORGET_PREPARED,
+        RELOAD_FROM_TABLES,
         SWITCH_KEYSPACE,
         RECONNECT
     }
@@ -314,6 +326,7 @@ public class ReprepareFuzzTest extends TestBaseImpl
 
     private static Action[] infrequent = new Action[]{ Action.CLEAR_CACHES,
                                                        Action.FORGET_PREPARED,
+                                                       Action.RELOAD_FROM_TABLES,
                                                        Action.RECONNECT
     };
 

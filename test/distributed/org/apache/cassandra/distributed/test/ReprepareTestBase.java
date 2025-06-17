@@ -41,13 +41,12 @@ import net.bytebuddy.ByteBuddy;
 import net.bytebuddy.dynamic.loading.ClassLoadingStrategy;
 import net.bytebuddy.implementation.FixedValue;
 import net.bytebuddy.implementation.MethodDelegation;
+import org.apache.cassandra.cql3.QueryHandler;
 import org.apache.cassandra.cql3.QueryProcessor;
-import org.apache.cassandra.cql3.statements.ParsedStatement;
 import org.apache.cassandra.distributed.api.ICluster;
 import org.apache.cassandra.distributed.api.IInvokableInstance;
 import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.service.ClientState;
-import org.apache.cassandra.service.QueryState;
 import org.apache.cassandra.transport.messages.ResultMessage;
 import org.apache.cassandra.utils.FBUtilities;
 
@@ -189,7 +188,7 @@ public class ReprepareTestBase extends TestBaseImpl
 
         static void newBehaviour(ClassLoader cl, int nodeNumber)
         {
-            setReleaseVersion(cl, "3.0.19.63");
+            setReleaseVersion(cl, QueryProcessor.NEW_PREPARED_STATEMENT_BEHAVIOUR_SINCE_40.toString());
         }
 
         static void oldBehaviour(ClassLoader cl, int nodeNumber)
@@ -201,30 +200,28 @@ public class ReprepareTestBase extends TestBaseImpl
                                .intercept(MethodDelegation.to(PrepareBehaviour.class))
                                .make()
                                .load(cl, ClassLoadingStrategy.Default.INJECTION);
-                setReleaseVersion(cl, "3.0.19.60");
+                setReleaseVersion(cl, "4.0.0.0");
             }
             else
             {
-                setReleaseVersion(cl, "3.0.19.63");
+                setReleaseVersion(cl, QueryProcessor.NEW_PREPARED_STATEMENT_BEHAVIOUR_SINCE_40.toString());
             }
         }
 
-        public static ResultMessage.Prepared prepare(String queryString, QueryState queryState)
+        public static ResultMessage.Prepared prepare(String queryString, ClientState clientState)
         {
-            ClientState clientState = queryState.getClientState();
-            ResultMessage.Prepared existing = QueryProcessor.getStoredPreparedStatement(queryString, clientState.getRawKeyspace(), false);
+            ResultMessage.Prepared existing = QueryProcessor.getStoredPreparedStatement(queryString, clientState.getRawKeyspace());
             if (existing != null)
                 return existing;
 
-            ParsedStatement.Prepared prepared = QueryProcessor.getStatement(queryString, clientState);
-            int boundTerms = prepared.statement.getBoundTerms();
+            QueryHandler.Prepared prepared = QueryProcessor.parseAndPrepare(queryString, clientState, false);
+
+            int boundTerms = prepared.statement.getBindVariables().size();
             if (boundTerms > FBUtilities.MAX_UNSIGNED_SHORT)
                 throw new InvalidRequestException(String.format("Too many markers(?). %d markers exceed the allowed maximum of %d", boundTerms, FBUtilities.MAX_UNSIGNED_SHORT));
-            assert boundTerms == prepared.boundNames.size();
 
-            return QueryProcessor.storePreparedStatement(queryString, clientState.getRawKeyspace(), prepared, false);
+            return QueryProcessor.storePreparedStatement(queryString, clientState.getRawKeyspace(), prepared);
         }
-
     }
 
     protected static class ForceHostLoadBalancingPolicy implements LoadBalancingPolicy {

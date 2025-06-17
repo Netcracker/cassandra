@@ -21,35 +21,74 @@ import java.nio.ByteBuffer;
 import java.util.Map;
 
 import org.apache.cassandra.cql3.statements.BatchStatement;
-import org.apache.cassandra.cql3.statements.ParsedStatement;
 import org.apache.cassandra.exceptions.RequestExecutionException;
 import org.apache.cassandra.exceptions.RequestValidationException;
+import org.apache.cassandra.service.ClientState;
 import org.apache.cassandra.service.QueryState;
+import org.apache.cassandra.transport.Dispatcher;
 import org.apache.cassandra.transport.messages.ResultMessage;
 import org.apache.cassandra.utils.MD5Digest;
 
 public interface QueryHandler
 {
-    ResultMessage process(String query,
+    CQLStatement parse(String queryString, QueryState queryState, QueryOptions options);
+
+    ResultMessage process(CQLStatement statement,
                           QueryState state,
                           QueryOptions options,
-                          Map<String, ByteBuffer> customPayload) throws RequestExecutionException, RequestValidationException;
+                          Map<String, ByteBuffer> customPayload,
+                          Dispatcher.RequestTime requestTime) throws RequestExecutionException, RequestValidationException;
 
     ResultMessage.Prepared prepare(String query,
-                                   QueryState state,
+                                   ClientState clientState,
                                    Map<String, ByteBuffer> customPayload) throws RequestValidationException;
 
-    ParsedStatement.Prepared getPrepared(MD5Digest id);
-
-    ParsedStatement.Prepared getPreparedForThrift(Integer id);
+    QueryHandler.Prepared getPrepared(MD5Digest id);
 
     ResultMessage processPrepared(CQLStatement statement,
                                   QueryState state,
                                   QueryOptions options,
-                                  Map<String, ByteBuffer> customPayload) throws RequestExecutionException, RequestValidationException;
+                                  Map<String, ByteBuffer> customPayload,
+                                  Dispatcher.RequestTime requestTime) throws RequestExecutionException, RequestValidationException;
 
     ResultMessage processBatch(BatchStatement statement,
                                QueryState state,
                                BatchQueryOptions options,
-                               Map<String, ByteBuffer> customPayload) throws RequestExecutionException, RequestValidationException;
+                               Map<String, ByteBuffer> customPayload,
+                               Dispatcher.RequestTime requestTime) throws RequestExecutionException, RequestValidationException;
+
+    public static class Prepared
+    {
+        // CASSANDRA-19986 Precomputed size might be available
+        public volatile int pstmntSize = -1;
+
+        public final CQLStatement statement;
+
+        public final MD5Digest resultMetadataId;
+
+        /**
+         * Timestamp of when this prepared statement was created.  Used in QueryProcessor.preparedStatements cache
+         * to ensure that the deletion timestamp always succeeds the insert timestamp.
+         */
+        public final long timestamp;
+
+        /**
+         * Contains the CQL statement source if the statement has been "regularly" perpared via
+         * {@link QueryHandler#prepare(String, ClientState, Map)}.
+         * Other usages of this class may or may not contain the CQL statement source.
+         */
+        public final String rawCQLStatement;
+        public final String keyspace;
+        public final boolean fullyQualified;
+
+        public Prepared(CQLStatement statement, String rawCQLStatement, boolean fullyQualified, String keyspace)
+        {
+            this.statement = statement;
+            this.rawCQLStatement = rawCQLStatement;
+            this.resultMetadataId = ResultSet.ResultMetadata.fromPrepared(statement).getResultMetadataId();
+            this.fullyQualified = fullyQualified;
+            this.keyspace = keyspace;
+            this.timestamp = ClientState.getTimestamp();
+        }
+    }
 }

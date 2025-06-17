@@ -18,73 +18,118 @@
 package org.apache.cassandra.db.marshal;
 
 import java.nio.ByteBuffer;
-import java.nio.charset.CharacterCodingException;
-import java.nio.charset.StandardCharsets;
 import java.util.*;
+import java.util.stream.Collectors;
+
+import javax.annotation.Nullable;
 
 import com.google.common.base.Objects;
+import com.google.common.base.Preconditions;
+import com.google.common.collect.Lists;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.cql3.*;
-import org.apache.cassandra.exceptions.ConfigurationException;
-import org.apache.cassandra.exceptions.SyntaxException;
+import org.apache.cassandra.cql3.terms.Constants;
+import org.apache.cassandra.cql3.terms.MultiElements;
+import org.apache.cassandra.cql3.terms.Term;
+import org.apache.cassandra.db.rows.Cell;
+import org.apache.cassandra.db.rows.CellPath;
+import org.apache.cassandra.db.rows.ColumnData;
+import org.apache.cassandra.db.rows.ComplexColumnData;
+import org.apache.cassandra.schema.Difference;
 import org.apache.cassandra.serializers.MarshalException;
 import org.apache.cassandra.serializers.TypeSerializer;
 import org.apache.cassandra.serializers.UserTypeSerializer;
+import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.utils.JsonUtils;
 import org.apache.cassandra.utils.Pair;
+
+import static com.google.common.collect.Iterables.any;
+import static com.google.common.collect.Iterables.transform;
+import static org.apache.cassandra.config.CassandraRelevantProperties.TYPE_UDT_CONFLICT_BEHAVIOR;
+import static org.apache.cassandra.cql3.ColumnIdentifier.maybeQuote;
+import static org.apache.cassandra.utils.LocalizeString.toLowerCaseLocalized;
 
 /**
  * A user defined type.
  *
  * A user type is really just a tuple type on steroids.
  */
-public class UserType extends TupleType
+public class UserType extends TupleType implements SchemaElement
 {
+    private static final Logger logger = LoggerFactory.getLogger(UserType.class);
+
+    private static final ConflictBehavior CONFLICT_BEHAVIOR = ConflictBehavior.get();
+
     public final String keyspace;
     public final ByteBuffer name;
-    private final List<ByteBuffer> fieldNames;
+    private final List<FieldIdentifier> fieldNames;
     private final List<String> stringFieldNames;
+    private final boolean isMultiCell;
     private final UserTypeSerializer serializer;
 
-    public UserType(String keyspace, ByteBuffer name, List<ByteBuffer> fieldNames, List<AbstractType<?>> fieldTypes)
+    public UserType(String keyspace, ByteBuffer name, List<FieldIdentifier> fieldNames, List<AbstractType<?>> fieldTypes, boolean isMultiCell)
     {
-        super(fieldTypes);
+        super(fieldTypes, false);
         assert fieldNames.size() == fieldTypes.size();
         this.keyspace = keyspace;
         this.name = name;
         this.fieldNames = fieldNames;
         this.stringFieldNames = new ArrayList<>(fieldNames.size());
+        this.isMultiCell = isMultiCell;
+
         LinkedHashMap<String , TypeSerializer<?>> fieldSerializers = new LinkedHashMap<>(fieldTypes.size());
         for (int i = 0, m = fieldNames.size(); i < m; i++)
         {
-            ByteBuffer fieldName = fieldNames.get(i);
-            try
-            {
-                String stringFieldName = ByteBufferUtil.string(fieldName, StandardCharsets.UTF_8);
-                stringFieldNames.add(stringFieldName);
-                fieldSerializers.put(stringFieldName, fieldTypes.get(i).getSerializer());
-            }
-            catch (CharacterCodingException ex)
-            {
-                throw new AssertionError("Got non-UTF8 field name for user-defined type: " + ByteBufferUtil.bytesToHex(fieldName), ex);
-            }
+            String stringFieldName = fieldNames.get(i).toString();
+            stringFieldNames.add(stringFieldName);
+            TypeSerializer<?> existing = fieldSerializers.put(stringFieldName, fieldTypes.get(i).getSerializer());
+            if (existing != null)
+                CONFLICT_BEHAVIOR.onConflict(keyspace, getNameAsString(), stringFieldName);
         }
         this.serializer = new UserTypeSerializer(fieldSerializers);
     }
 
-    public static UserType getInstance(TypeParser parser) throws ConfigurationException, SyntaxException
+    public static UserType getInstance(TypeParser parser)
     {
         Pair<Pair<String, ByteBuffer>, List<Pair<ByteBuffer, AbstractType>>> params = parser.getUserTypeParameters();
         String keyspace = params.left.left;
         ByteBuffer name = params.left.right;
-        List<ByteBuffer> columnNames = new ArrayList<>(params.right.size());
+        List<FieldIdentifier> columnNames = new ArrayList<>(params.right.size());
         List<AbstractType<?>> columnTypes = new ArrayList<>(params.right.size());
         for (Pair<ByteBuffer, AbstractType> p : params.right)
         {
-            columnNames.add(p.left);
-            columnTypes.add(p.right.freeze());
+            columnNames.add(new FieldIdentifier(p.left));
+            columnTypes.add(p.right);
         }
-        return new UserType(keyspace, name, columnNames, columnTypes);
+
+        return new UserType(keyspace, name, columnNames, columnTypes, true);
+    }
+
+    @Override
+    public boolean isUDT()
+    {
+        return true;
+    }
+
+    public boolean isTuple()
+    {
+        return false;
+    }
+
+    @Override
+    public boolean isMultiCell()
+    {
+        return isMultiCell;
+    }
+
+    @Override
+    public boolean isFreezable()
+    {
+        return true;
     }
 
     public AbstractType<?> fieldType(int i)
@@ -92,14 +137,25 @@ public class UserType extends TupleType
         return type(i);
     }
 
+    public AbstractType<?> fieldType(CellPath path)
+    {
+        int field = ByteBufferUtil.getUnsignedShort(path.get(0), 0);
+        return fieldType(field);
+    }
+
     public List<AbstractType<?>> fieldTypes()
     {
         return types;
     }
 
-    public ByteBuffer fieldName(int i)
+    public FieldIdentifier fieldName(int i)
     {
         return fieldNames.get(i);
+    }
+
+    public FieldIdentifier fieldName(CellPath path)
+    {
+        return fieldNames.get(fieldPosition(path));
     }
 
     public String fieldNameAsString(int i)
@@ -107,7 +163,7 @@ public class UserType extends TupleType
         return stringFieldNames.get(i);
     }
 
-    public List<ByteBuffer> fieldNames()
+    public List<FieldIdentifier> fieldNames()
     {
         return fieldNames;
     }
@@ -117,11 +173,71 @@ public class UserType extends TupleType
         return UTF8Type.instance.compose(name);
     }
 
+    public int fieldPosition(FieldIdentifier fieldName)
+    {
+        return fieldNames.indexOf(fieldName);
+    }
+
+    public int fieldPosition(CellPath path)
+    {
+        return Preconditions.checkElementIndex(ByteBufferUtil.getUnsignedShort(path.get(0), 0), fieldNames.size());
+    }
+
+    public CellPath cellPathForField(FieldIdentifier fieldName)
+    {
+        // we use the field position instead of the field name to allow for field renaming in ALTER TYPE statements
+        return CellPath.create(ByteBufferUtil.bytes((short)fieldPosition(fieldName)));
+    }
+
+    public ShortType nameComparator()
+    {
+        return ShortType.instance;
+    }
+
+    public ByteBuffer serializeForNativeProtocol(Iterator<Cell<?>> cells)
+    {
+        assert isMultiCell;
+
+        List<ByteBuffer> components = new ArrayList<>(size());
+        while (cells.hasNext())
+        {
+            Cell<?> cell = cells.next();
+
+            // handle null fields that aren't at the end
+            short fieldPositionOfCell = ByteBufferUtil.toShort(cell.path().get(0));
+            while (components.size() < fieldPositionOfCell)
+                components.add(null);
+
+            components.add(cell.buffer());
+        }
+
+        // append trailing nulls for missing cells
+        while (components.size() < size())
+            components.add(null);
+
+        return pack(components);
+    }
+
+    public <V> void validateCell(Cell<V> cell) throws MarshalException
+    {
+        if (isMultiCell)
+        {
+            ByteBuffer path = cell.path().get(0);
+            nameComparator().validate(path);
+            Short fieldPosition = nameComparator().getSerializer().deserialize(path);
+            fieldType(fieldPosition).validate(cell.value(), cell.accessor());
+        }
+        else
+        {
+            validate(cell.value(), cell.accessor());
+        }
+    }
+
     @Override
     public Term fromJSONObject(Object parsed) throws MarshalException
     {
         if (parsed instanceof String)
-            parsed = Json.decodeJson((String) parsed);
+            parsed = JsonUtils.decodeJson((String) parsed);
 
         if (!(parsed instanceof Map))
             throw new MarshalException(String.format(
@@ -129,7 +245,7 @@ public class UserType extends TupleType
 
         Map<String, Object> map = (Map<String, Object>) parsed;
 
-        Json.handleCaseSensitivity(map);
+        JsonUtils.handleCaseSensitivity(map);
 
         List<Term> terms = new ArrayList<>(types.size());
 
@@ -162,13 +278,13 @@ public class UserType extends TupleType
             }
         }
 
-        return new UserTypes.DelayedValue(this, terms);
+        return new MultiElements.DelayedValue(this, terms);
     }
 
     @Override
-    public String toJSONString(ByteBuffer buffer, int protocolVersion)
+    public String toJSONString(ByteBuffer buffer, ProtocolVersion protocolVersion)
     {
-        ByteBuffer[] buffers = split(buffer);
+        List<ByteBuffer> buffers = unpack(buffer);
         StringBuilder sb = new StringBuilder("{");
         for (int i = 0; i < types.size(); i++)
         {
@@ -176,14 +292,14 @@ public class UserType extends TupleType
                 sb.append(", ");
 
             String name = stringFieldNames.get(i);
-            if (!name.equals(name.toLowerCase(Locale.US)))
+            if (!name.equals(toLowerCaseLocalized(name)))
                 name = "\"" + name + "\"";
 
             sb.append('"');
-            sb.append(Json.quoteAsJsonString(name));
+            sb.append(JsonUtils.quoteAsJsonString(name));
             sb.append("\": ");
 
-            ByteBuffer valueBuffer = (i >= buffers.length) ? null : buffers[i];
+            ByteBuffer valueBuffer = (i >= buffers.size()) ? null : buffers.get(i);
             if (valueBuffer == null)
                 sb.append("null");
             else
@@ -193,19 +309,114 @@ public class UserType extends TupleType
     }
 
     @Override
+    public UserType freeze()
+    {
+        return isMultiCell ? new UserType(keyspace, name, fieldNames, fieldTypes(), false) : this;
+    }
+
+    @Override
+    public UserType unfreeze()
+    {
+        return isMultiCell ? this : new UserType(keyspace, name, fieldNames, fieldTypes(), true);
+    }
+
+    @Override
+    public AbstractType<?> freezeNestedMulticellTypes()
+    {
+        if (!isMultiCell())
+            return this;
+
+        // the behavior here doesn't exactly match the method name: we want to freeze everything inside of UDTs
+        List<AbstractType<?>> newTypes = fieldTypes().stream()
+                .map(subtype -> (subtype.isFreezable() && subtype.isMultiCell() ? subtype.freeze() : subtype))
+                .collect(Collectors.toList());
+
+        return new UserType(keyspace, name, fieldNames, newTypes, isMultiCell);
+    }
+
+    @Override
     public int hashCode()
     {
-        return Objects.hashCode(keyspace, name, fieldNames, types);
+        return Objects.hashCode(keyspace, name, fieldNames, types, isMultiCell);
+    }
+
+    @Override
+    public boolean isValueCompatibleWith(AbstractType<?> previous)
+    {
+        if (this == previous)
+            return true;
+
+        if (!(previous instanceof UserType))
+            return false;
+
+        UserType other = (UserType) previous;
+        if (isMultiCell != other.isMultiCell())
+            return false;
+
+        if (!keyspace.equals(other.keyspace))
+            return false;
+
+        Iterator<AbstractType<?>> thisTypeIter = types.iterator();
+        Iterator<AbstractType<?>> previousTypeIter = other.types.iterator();
+        while (thisTypeIter.hasNext() && previousTypeIter.hasNext())
+        {
+            if (!thisTypeIter.next().isCompatibleWith(previousTypeIter.next()))
+                return false;
+        }
+
+        // it's okay for the new type to have additional fields, but not for the old type to have additional fields
+        return !previousTypeIter.hasNext();
     }
 
     @Override
     public boolean equals(Object o)
     {
-        if(!(o instanceof UserType))
+        if (o.getClass() != UserType.class)
             return false;
 
         UserType that = (UserType)o;
-        return keyspace.equals(that.keyspace) && name.equals(that.name) && fieldNames.equals(that.fieldNames) && types.equals(that.types);
+
+        return equalsWithoutTypes(that) && types.equals(that.types);
+    }
+
+    private boolean equalsWithoutTypes(UserType other)
+    {
+        return name.equals(other.name)
+            && fieldNames.equals(other.fieldNames)
+            && keyspace.equals(other.keyspace)
+            && isMultiCell == other.isMultiCell;
+    }
+
+    public boolean equalsWithOutKs(UserType other)
+    {
+        return name.equals(other.name)
+            && fieldNames.equals(other.fieldNames)
+            && types.equals(other.types)
+            && isMultiCell == other.isMultiCell;
+    }
+
+    public Optional<Difference> compare(UserType other)
+    {
+        if (!equalsWithoutTypes(other))
+            return Optional.of(Difference.SHALLOW);
+
+        boolean differsDeeply = false;
+
+        for (int i = 0; i < fieldTypes().size(); i++)
+        {
+            AbstractType<?> thisType = fieldType(i);
+            AbstractType<?> thatType = other.fieldType(i);
+
+            if (!thisType.equals(thatType))
+            {
+                if (thisType.asCQL3Type().toString().equals(thatType.asCQL3Type().toString()))
+                    differsDeeply = true;
+                else
+                    return Optional.of(Difference.SHALLOW);
+            }
+        }
+
+        return differsDeeply ? Optional.of(Difference.DEEP) : Optional.empty();
     }
 
     @Override
@@ -215,16 +426,126 @@ public class UserType extends TupleType
     }
 
     @Override
-    public boolean referencesUserType(String userTypeName)
+    public <V> boolean referencesUserType(V name, ValueAccessor<V> accessor)
     {
-        return getNameAsString().equals(userTypeName) ||
-               fieldTypes().stream().anyMatch(f -> f.referencesUserType(userTypeName));
+        return this.name.equals(name) || any(fieldTypes(), t -> t.referencesUserType(name, accessor));
+    }
+
+    @Override
+    public UserType withUpdatedUserType(UserType udt)
+    {
+        if (!referencesUserType(udt.name))
+            return this;
+
+        // preserve frozen/non-frozen status of the updated UDT
+        if (name.equals(udt.name))
+        {
+            return isMultiCell == udt.isMultiCell
+                 ? udt
+                 : new UserType(keyspace, name, udt.fieldNames(), udt.fieldTypes(), isMultiCell);
+        }
+
+        return new UserType(keyspace,
+                            name,
+                            fieldNames,
+                            Lists.newArrayList(transform(fieldTypes(), t -> t.withUpdatedUserType(udt))),
+                            isMultiCell());
+    }
+
+    @Override
+    public boolean referencesDuration()
+    {
+        return fieldTypes().stream().anyMatch(f -> f.referencesDuration());
+    }
+
+    @Override
+    public int compareCQL(ComplexColumnData columnData, List<ByteBuffer> fields)
+    {
+        Iterator<Cell<?>> cellIter = columnData.iterator();
+        int i = 0;
+        while (cellIter.hasNext())
+        {
+            if (i == fields.size())
+                return 1;
+
+            Cell<?> cell = cellIter.next();
+            short position = ByteBufferUtil.toShort(cell.path().get(0));
+
+            while (i < position)
+            {
+                if (i == fields.size())
+                    return 1;
+
+                if (fields.get(i++) != null)
+                    return -1;
+            }
+
+            ByteBuffer fieldValue = fields.get(i);
+
+            if (fieldValue == null)
+                return 1;
+
+            int comparison = type(i++).compare(cell.buffer(), fieldValue);
+            if (comparison != 0)
+                return comparison;
+        }
+
+        while(i < fields.size())
+        {
+            if (fields.get(i++) != null)
+                return -1;
+        }
+
+        return 0;
+    }
+
+    @Override
+    public AbstractType<?> elementType(ByteBuffer keyOrIndex)
+    {
+        return type(fieldPosition(new FieldIdentifier(keyOrIndex)));
+    }
+
+    @Override
+    public ByteBuffer getElement(@Nullable ColumnData columnData, ByteBuffer keyOrIndex)
+    {
+        if (columnData == null)
+            return null;
+
+        FieldIdentifier field = new FieldIdentifier(keyOrIndex);
+
+        if (isMultiCell())
+        {
+            Cell<?> cell = ((ComplexColumnData) columnData).getCell(cellPathForField(field));
+            return cell == null ? null : cell.buffer();
+        }
+
+        return unpack(((Cell<?>) columnData).buffer()).get(fieldPosition(field));
     }
 
     @Override
     public String toString()
     {
-        return getClass().getName() + TypeParser.stringifyUserTypeParameters(keyspace, name, fieldNames, types);
+        return this.toString(false);
+    }
+
+    @Override
+    public String toString(boolean ignoreFreezing)
+    {
+        boolean includeFrozenType = !ignoreFreezing && !isMultiCell();
+
+        StringBuilder sb = new StringBuilder();
+        if (includeFrozenType)
+            sb.append(FrozenType.class.getName()).append("(");
+        sb.append(getClass().getName());
+        sb.append(TypeParser.stringifyUserTypeParameters(keyspace, name, fieldNames, types, ignoreFreezing || !isMultiCell));
+        if (includeFrozenType)
+            sb.append(")");
+        return sb.toString();
+    }
+
+    public String getCqlTypeName()
+    {
+        return String.format("%s.%s", maybeQuote(keyspace), maybeQuote(getNameAsString()));
     }
 
     @Override
@@ -233,13 +554,119 @@ public class UserType extends TupleType
         return serializer;
     }
 
-    public boolean isTuple()
+    @Override
+    public List<ByteBuffer> filterSortAndValidateElements(List<ByteBuffer> buffers)
+    {
+        if (buffers.size() > size())
+            throw new MarshalException(String.format("UDT value contained too many fields (expected %s, got %s)", size(), buffers.size()));
+
+        for (int i = 0; i < buffers.size(); i++)
+        {
+            // Since a frozen UDT value is always written in its entirety Cassandra can't preserve a pre-existing
+            // value by 'not setting' the new value. Reject the query.
+            ByteBuffer buffer = buffers.get(i);
+            if (buffer == null)
+                continue;
+            if (!isMultiCell() && buffer == ByteBufferUtil.UNSET_BYTE_BUFFER)
+                throw new MarshalException(String.format("Invalid unset value for field '%s' of user defined type %s", fieldNameAsString(i), getNameAsString()));
+            type(i).validate(buffer);
+        }
+
+        return buffers;
+    }
+
+    @Override
+    public SchemaElementType elementType()
+    {
+        return SchemaElementType.TYPE;
+    }
+
+    @Override
+    public String elementKeyspace()
+    {
+        return keyspace;
+    }
+
+    @Override
+    public String elementName()
+    {
+        return getNameAsString();
+    }
+
+    @Override
+    public String toCqlString(boolean withWarnings, boolean withInternals, boolean ifNotExists)
+    {
+        CqlBuilder builder = new CqlBuilder();
+        builder.append("CREATE TYPE ");
+
+        if (ifNotExists)
+        {
+            builder.append("IF NOT EXISTS ");
+        }
+
+        builder.appendQuotingIfNeeded(keyspace)
+               .append('.')
+               .appendQuotingIfNeeded(getNameAsString())
+               .append(" (")
+               .newLine()
+               .increaseIndent();
+
+        for (int i = 0; i < size(); i++)
+        {
+            if (i > 0)
+                builder.append(",")
+                       .newLine();
+
+            builder.appendQuotingIfNeeded(fieldNameAsString(i))
+                   .append(' ')
+                   .append(fieldType(i));
+        }
+
+        builder.newLine()
+               .decreaseIndent()
+               .append(");");
+
+        return builder.toString();
+    }
+
+    @Override
+    protected String componentOrFieldName(int i)
+    {
+        return "field " + fieldName(i);
+    }
+
+    @Override
+    public boolean isConstrainable()
     {
         return false;
     }
 
-    public boolean isUDT()
+    private enum ConflictBehavior
     {
-        return true;
+        LOG {
+            void onConflict(String keyspace, String name, String fieldName)
+            {
+                logger.error("Duplicate names found in UDT {}.{} for column {}",
+                             maybeQuote(keyspace), maybeQuote(name), maybeQuote(fieldName));
+            }
+        },
+        REJECT {
+            @Override
+            void onConflict(String keyspace, String name, String fieldName)
+            {
+
+                throw new AssertionError(String.format("Duplicate names found in UDT %s.%s for column %s; " +
+                                                       "to resolve set -D%s=LOG on startup and remove the type",
+                                                       maybeQuote(keyspace), maybeQuote(name), maybeQuote(fieldName), TYPE_UDT_CONFLICT_BEHAVIOR.getKey()));
+            }
+        };
+
+        abstract void onConflict(String keyspace, String name, String fieldName);
+
+        static ConflictBehavior get()
+        {
+            String value = TYPE_UDT_CONFLICT_BEHAVIOR.getString(REJECT.name());
+            return ConflictBehavior.valueOf(value);
+        }
     }
 }

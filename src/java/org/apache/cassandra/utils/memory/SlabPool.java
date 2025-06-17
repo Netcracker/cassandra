@@ -28,13 +28,8 @@ public class SlabPool extends MemtablePool
         this.allocateOnHeap = maxOffHeapMemory == 0;
     }
 
-    public MemtableAllocator newAllocator()
+    public MemtableAllocator newAllocator(String table)
     {
         return new SlabAllocator(onHeap.newAllocator(), offHeap.newAllocator(), allocateOnHeap);
-    }
-
-    public boolean needToCopyOnHeap()
-    {
-        return !allocateOnHeap;
     }
 }

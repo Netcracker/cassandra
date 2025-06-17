@@ -20,19 +20,21 @@ package org.apache.cassandra.utils.memory;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.ConcurrentLinkedQueue;
-import java.util.concurrent.Semaphore;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
-import org.apache.cassandra.db.DecoratedKey;
-import org.apache.cassandra.db.NativeDecoratedKey;
-import org.apache.cassandra.db.rows.Row;
+import org.apache.cassandra.db.*;
+import org.apache.cassandra.db.rows.*;
 import org.apache.cassandra.utils.concurrent.OpOrder;
+import org.apache.cassandra.utils.concurrent.Semaphore;
+import org.apache.cassandra.utils.concurrent.OpOrder.Group;
+
+import static org.apache.cassandra.utils.concurrent.Semaphore.newSemaphore;
 
 /**
  * This NativeAllocator uses global slab allocation strategy
- * with slab size that scales exponentially from 8kb to 1Mb to
- * serve allocation of up to 128kb.
+ * with slab size that scales exponentially from 8KiB to 1MiB to
+ * serve allocation of up to 128KiB.
  * <p>
  * </p>
  * The slab allocation reduces heap fragmentation from small
@@ -56,21 +58,81 @@ public class NativeAllocator extends MemtableAllocator
 
     private final AtomicReference<Region> currentRegion = new AtomicReference<>();
     private final ConcurrentLinkedQueue<Region> regions = new ConcurrentLinkedQueue<>();
+    private final EnsureOnHeap.CloneToHeap cloneToHeap = new EnsureOnHeap.CloneToHeap();
 
     protected NativeAllocator(NativePool pool)
     {
         super(pool.onHeap.newAllocator(), pool.offHeap.newAllocator());
     }
 
+    private static class CloningBTreeRowBuilder extends BTreeRow.Builder
+    {
+        final OpOrder.Group writeOp;
+        final NativeAllocator allocator;
+        private CloningBTreeRowBuilder(OpOrder.Group writeOp, NativeAllocator allocator)
+        {
+            super(true);
+            this.writeOp = writeOp;
+            this.allocator = allocator;
+        }
+
+        @Override
+        public void newRow(Clustering<?> clustering)
+        {
+            if (clustering != Clustering.STATIC_CLUSTERING)
+                clustering = new NativeClustering(allocator, writeOp, clustering);
+            super.newRow(clustering);
+        }
+
+        @Override
+        public void addCell(Cell<?> cell)
+        {
+            super.addCell(new NativeCell(allocator, writeOp, cell));
+        }
+    }
+
     public Row.Builder rowBuilder(OpOrder.Group opGroup)
     {
-        // TODO
-        throw new UnsupportedOperationException();
+        return new CloningBTreeRowBuilder(opGroup, this);
     }
 
     public DecoratedKey clone(DecoratedKey key, OpOrder.Group writeOp)
     {
         return new NativeDecoratedKey(key.getToken(), this, writeOp, key.getKey());
+    }
+
+    @Override
+    public Cloner cloner(Group opGroup)
+    {
+        return new Cloner()
+                {
+
+                    @Override
+                    public DecoratedKey clone(DecoratedKey key)
+                    {
+                        return NativeAllocator.this.clone(key, opGroup);
+                    }
+
+                    @Override
+                    public Clustering<?> clone(Clustering<?> clustering)
+                    {
+                        if (clustering != Clustering.STATIC_CLUSTERING)
+                            return new NativeClustering(NativeAllocator.this, opGroup, clustering);
+
+                        return Clustering.STATIC_CLUSTERING;
+                    }
+
+                    @Override
+                    public Cell<?> clone(Cell<?> cell)
+                    {
+                        return new NativeCell(NativeAllocator.this, opGroup, cell);
+                    }
+                };
+    }
+
+    public EnsureOnHeap ensureOnHeap()
+    {
+        return cloneToHeap;
     }
 
     public long allocate(int size, OpOrder.Group opGroup)
@@ -139,6 +201,7 @@ public class NativeAllocator extends MemtableAllocator
     {
         for (Region region : regions)
             MemoryUtil.free(region.peer);
+
         super.setDiscarded();
     }
 
@@ -146,10 +209,10 @@ public class NativeAllocator extends MemtableAllocator
     private static class RaceAllocated
     {
         final ConcurrentLinkedQueue<Region> stash = new ConcurrentLinkedQueue<>();
-        final Semaphore permits = new Semaphore(8);
+        final Semaphore permits = newSemaphore(8);
         boolean stash(Region region)
         {
-            if (!permits.tryAcquire())
+            if (!permits.tryAcquire(1))
                 return false;
             stash.add(region);
             return true;
@@ -158,7 +221,7 @@ public class NativeAllocator extends MemtableAllocator
         {
             Region next = stash.poll();
             if (next != null)
-                permits.release();
+                permits.release(1);
             return next;
         }
     }
@@ -184,7 +247,7 @@ public class NativeAllocator extends MemtableAllocator
          * Offset for the next allocation, or the sentinel value -1
          * which implies that the region is still uninitialized.
          */
-        private AtomicInteger nextFreeOffset = new AtomicInteger(0);
+        private final AtomicInteger nextFreeOffset = new AtomicInteger(0);
 
         /**
          * Create an uninitialized region. Note that memory is not allocated yet, so
@@ -221,5 +284,4 @@ public class NativeAllocator extends MemtableAllocator
                     "waste=" + Math.max(0, capacity - nextFreeOffset.get());
         }
     }
-
 }

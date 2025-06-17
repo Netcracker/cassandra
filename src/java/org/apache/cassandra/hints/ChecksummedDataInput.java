@@ -17,14 +17,15 @@
  */
 package org.apache.cassandra.hints;
 
-import java.io.File;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.zip.CRC32;
 
-import org.apache.cassandra.io.util.ChannelProxy;
-import org.apache.cassandra.io.util.DataPosition;
-import org.apache.cassandra.io.util.RandomAccessReader;
+import com.google.common.base.Preconditions;
+
+import org.apache.cassandra.io.compress.BufferType;
+import org.apache.cassandra.io.util.*;
+import org.apache.cassandra.utils.Throwables;
 import org.apache.cassandra.utils.NativeLibrary;
 
 /**
@@ -38,30 +39,53 @@ import org.apache.cassandra.utils.NativeLibrary;
  * corrupted sequence by reading a huge corrupted length of bytes via
  * {@link org.apache.cassandra.utils.ByteBufferUtil#readWithLength(java.io.DataInput)}.
  */
-public class ChecksummedDataInput extends RandomAccessReader.RandomAccessReaderWithOwnChannel
+public class ChecksummedDataInput extends RebufferingInputStream
 {
     private final CRC32 crc;
     private int crcPosition;
     private boolean crcUpdateDisabled;
 
     private long limit;
-    private DataPosition limitMark;
+    private long limitMark;
 
-    protected ChecksummedDataInput(Builder builder)
+    protected long bufferOffset;
+    protected final ChannelProxy channel;
+
+    ChecksummedDataInput(ChannelProxy channel, BufferType bufferType)
     {
-        super(builder);
+        super(bufferType.allocate(RandomAccessReader.DEFAULT_BUFFER_SIZE));
 
         crc = new CRC32();
         crcPosition = 0;
         crcUpdateDisabled = false;
+        this.channel = channel;
+        bufferOffset = 0;
+        buffer.limit(0);
 
         resetLimit();
     }
 
-    @SuppressWarnings("resource")   // channel owned by RandomAccessReaderWithOwnChannel
+    ChecksummedDataInput(ChannelProxy channel)
+    {
+        this(channel, BufferType.OFF_HEAP);
+    }
+
     public static ChecksummedDataInput open(File file)
     {
-        return new Builder(new ChannelProxy(file)).build();
+        ChannelProxy channel = new ChannelProxy(file);
+        try
+        {
+            return new ChecksummedDataInput(channel);
+        }
+        catch (Throwable t)
+        {
+            throw Throwables.cleaned(channel.close(t));
+        }
+    }
+
+    public boolean isEOF()
+    {
+        return getPosition() == channel.size();
     }
 
     static class Position implements InputPosition
@@ -105,8 +129,16 @@ public class ChecksummedDataInput extends RandomAccessReader.RandomAccessReaderW
 
     public void limit(long newLimit)
     {
-        limit = newLimit;
-        limitMark = mark();
+        limitMark = getPosition();
+        limit = limitMark + newLimit;
+    }
+
+    /**
+     * Returns the exact position in the uncompressed view of the file.
+     */
+    protected long getPosition()
+    {
+        return bufferOffset + buffer.position();
     }
 
     /**
@@ -121,22 +153,19 @@ public class ChecksummedDataInput extends RandomAccessReader.RandomAccessReaderW
     public void resetLimit()
     {
         limit = Long.MAX_VALUE;
-        limitMark = null;
+        limitMark = -1;
     }
 
     public void checkLimit(int length) throws IOException
     {
-        if (limitMark == null)
-            return;
-
-        if ((bytesPastLimit() + length) > limit)
+        if (getPosition() + length > limit)
             throw new IOException("Digest mismatch exception");
     }
 
     public long bytesPastLimit()
     {
-        assert limitMark != null;
-        return bytesPastMark(limitMark);
+        assert limitMark != -1;
+        return getPosition() - limitMark;
     }
 
     public boolean checkCrc() throws IOException
@@ -172,11 +201,22 @@ public class ChecksummedDataInput extends RandomAccessReader.RandomAccessReaderW
     }
 
     @Override
-    public void reBuffer()
+    protected void reBuffer()
     {
+        Preconditions.checkState(buffer.remaining() == 0);
         updateCrc();
-        super.reBuffer();
+        bufferOffset += buffer.limit();
+
+        readBuffer();
+
         crcPosition = buffer.position();
+    }
+
+    protected void readBuffer()
+    {
+        buffer.clear();
+        while ((channel.read(buffer, bufferOffset)) == 0) {}
+        buffer.flip();
     }
 
     public void tryUncacheRead()
@@ -198,16 +238,20 @@ public class ChecksummedDataInput extends RandomAccessReader.RandomAccessReaderW
         crc.update(unprocessed);
     }
 
-    public static class Builder extends RandomAccessReader.Builder
+    @Override
+    public void close()
     {
-        public Builder(ChannelProxy channel)
-        {
-            super(channel);
-        }
+        FileUtils.clean(buffer);
+        channel.close();
+    }
 
-        public ChecksummedDataInput build()
-        {
-            return new ChecksummedDataInput(this);
-        }
+    protected String getPath()
+    {
+        return channel.filePath();
+    }
+
+    public ChannelProxy getChannel()
+    {
+        return channel;
     }
 }

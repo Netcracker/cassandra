@@ -21,14 +21,24 @@ import java.net.InetAddress;
 import java.nio.ByteBuffer;
 import java.util.*;
 
-import org.apache.cassandra.config.CFMetaData;
+import com.google.common.collect.ImmutableSet;
+
+import org.apache.cassandra.config.CassandraRelevantProperties;
+import org.apache.cassandra.cql3.statements.schema.CreateTableStatement;
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.Mutation;
-import org.apache.cassandra.db.RowUpdateBuilder;
+import org.apache.cassandra.db.partitions.PartitionUpdate;
+import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.schema.KeyspaceMetadata;
 import org.apache.cassandra.schema.KeyspaceParams;
+import org.apache.cassandra.schema.SchemaConstants;
+import org.apache.cassandra.schema.TableId;
+import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.schema.Tables;
 import org.apache.cassandra.utils.FBUtilities;
-import org.apache.cassandra.utils.UUIDGen;
+
+import static java.lang.String.format;
+import static org.apache.cassandra.utils.TimeUUID.Generator.nextTimeUUID;
 
 public final class TraceKeyspace
 {
@@ -36,7 +46,7 @@ public final class TraceKeyspace
     {
     }
 
-    public static final String NAME = "system_traces";
+    public static final int DEFAULT_RF = CassandraRelevantProperties.SYSTEM_TRACES_DEFAULT_RF.getInt();
 
     /**
      * Generation is used as a timestamp for automatic table creation on startup.
@@ -47,53 +57,56 @@ public final class TraceKeyspace
      *                       will ever start; see the note below for why this is necessary; actual change in 3.0:
      *                       removed default ttl, reduced bloom filter fp chance from 0.1 to 0.01.
      * gen 1577836800000001: (pre-)adds coordinator_port column to sessions and source_port column to events in 3.0, 3.11, 4.0
+     * gen 1577836800000002: compression chunk length reduced to 16KiB, memtable_flush_period_in_ms now unset on all tables in 4.0
      *
      * * Until CASSANDRA-6016 (Oct 13, 2.0.2) and in all of 1.2, we used to create system_traces keyspace and
      *   tables in the same way that we created the purely local 'system' keyspace - using current time on node bounce
      *   (+1). For new definitions to take, we need to bump the generation further than that.
      */
-    public static final long GENERATION = 1577836800000001L;
+    public static final long GENERATION = 1577836800000002L;
 
     public static final String SESSIONS = "sessions";
     public static final String EVENTS = "events";
+    public static final Set<String> TABLE_NAMES = ImmutableSet.of(SESSIONS, EVENTS);
 
-    private static final CFMetaData Sessions =
-        compile(SESSIONS,
-                "tracing sessions",
-                "CREATE TABLE %s ("
-                + "session_id uuid,"
-                + "command text,"
-                + "client inet,"
-                + "coordinator inet,"
-                + "coordinator_port int,"
-                + "duration int,"
-                + "parameters map<text, text>,"
-                + "request text,"
-                + "started_at timestamp,"
-                + "PRIMARY KEY ((session_id)))");
+    public static final String SESSIONS_CQL = "CREATE TABLE IF NOT EXISTS %s ("
+                                              + "session_id uuid,"
+                                              + "command text,"
+                                              + "client inet,"
+                                              + "coordinator inet,"
+                                              + "coordinator_port int,"
+                                              + "duration int,"
+                                              + "parameters map<text, text>,"
+                                              + "request text,"
+                                              + "started_at timestamp,"
+                                              + "PRIMARY KEY ((session_id)))";
+    private static final TableMetadata Sessions =
+        parse(SESSIONS, "tracing sessions", SESSIONS_CQL);
 
-    private static final CFMetaData Events =
-        compile(EVENTS,
-                "tracing events",
-                "CREATE TABLE %s ("
-                + "session_id uuid,"
-                + "event_id timeuuid,"
-                + "activity text,"
-                + "source inet,"
-                + "source_port int,"
-                + "source_elapsed int,"
-                + "thread text,"
-                + "PRIMARY KEY ((session_id), event_id))");
+    public static final String EVENTS_CQL = "CREATE TABLE IF NOT EXISTS %s ("
+                                            + "session_id uuid,"
+                                            + "event_id timeuuid,"
+                                            + "activity text,"
+                                            + "source inet,"
+                                            + "source_port int,"
+                                            + "source_elapsed int,"
+                                            + "thread text,"
+                                            + "PRIMARY KEY ((session_id), event_id))";
+    private static final TableMetadata Events =
+        parse(EVENTS, "tracing events", EVENTS_CQL);
 
-    private static CFMetaData compile(String name, String description, String schema)
+    private static TableMetadata parse(String table, String description, String cql)
     {
-        return CFMetaData.compile(String.format(schema, name), NAME)
-                         .comment(description);
+        return CreateTableStatement.parse(format(cql, table), SchemaConstants.TRACE_KEYSPACE_NAME)
+                                   .id(TableId.forSystemTable(SchemaConstants.TRACE_KEYSPACE_NAME, table))
+                                   .gcGraceSeconds(0)
+                                   .comment(description)
+                                   .build();
     }
 
     public static KeyspaceMetadata metadata()
     {
-        return KeyspaceMetadata.create(NAME, KeyspaceParams.simple(2), Tables.of(Sessions, Events));
+        return KeyspaceMetadata.create(SchemaConstants.TRACE_KEYSPACE_NAME, KeyspaceParams.simple(Math.max(DEFAULT_RF, DatabaseDescriptor.getDefaultKeyspaceRF())), Tables.of(Sessions, Events));
     }
 
     static Mutation makeStartSessionMutation(ByteBuffer sessionId,
@@ -104,36 +117,43 @@ public final class TraceKeyspace
                                              String command,
                                              int ttl)
     {
-        RowUpdateBuilder adder = new RowUpdateBuilder(Sessions, FBUtilities.timestampMicros(), ttl, sessionId)
-                                 .clustering()
-                                 .add("client", client)
-                                 .add("coordinator", FBUtilities.getBroadcastAddress())
-                                 .add("request", request)
-                                 .add("started_at", new Date(startedAt))
-                                 .add("command", command);
+        PartitionUpdate.SimpleBuilder builder = PartitionUpdate.simpleBuilder(Sessions, sessionId);
+        Row.SimpleBuilder rb = builder.row();
+        rb.ttl(ttl)
+          .add("client", client)
+          .add("coordinator", FBUtilities.getBroadcastAddressAndPort().getAddress())
+          .add("coordinator_port", FBUtilities.getBroadcastAddressAndPort().getPort())
+          .add("request", request)
+          .add("started_at", new Date(startedAt))
+          .add("command", command)
+          .appendAll("parameters", parameters);
 
-        for (Map.Entry<String, String> entry : parameters.entrySet())
-            adder.addMapEntry("parameters", entry.getKey(), entry.getValue());
-        return adder.build();
+        return builder.buildAsMutation();
     }
 
     static Mutation makeStopSessionMutation(ByteBuffer sessionId, int elapsed, int ttl)
     {
-        return new RowUpdateBuilder(Sessions, FBUtilities.timestampMicros(), ttl, sessionId)
-               .clustering()
-               .add("duration", elapsed)
-               .build();
+        PartitionUpdate.SimpleBuilder builder = PartitionUpdate.simpleBuilder(Sessions, sessionId);
+        builder.row()
+               .ttl(ttl)
+               .add("duration", elapsed);
+        return builder.buildAsMutation();
     }
 
     static Mutation makeEventMutation(ByteBuffer sessionId, String message, int elapsed, String threadName, int ttl)
     {
-        RowUpdateBuilder adder = new RowUpdateBuilder(Events, FBUtilities.timestampMicros(), ttl, sessionId)
-                                 .clustering(UUIDGen.getTimeUUID());
-        adder.add("activity", message);
-        adder.add("source", FBUtilities.getBroadcastAddress());
-        adder.add("thread", threadName);
+        PartitionUpdate.SimpleBuilder builder = PartitionUpdate.simpleBuilder(Events, sessionId);
+        Row.SimpleBuilder rowBuilder = builder.row(nextTimeUUID())
+                                              .ttl(ttl);
+
+        rowBuilder.add("activity", message)
+                  .add("source", FBUtilities.getBroadcastAddressAndPort().getAddress())
+                  .add("source_port", FBUtilities.getBroadcastAddressAndPort().getPort())
+                  .add("thread", threadName);
+
         if (elapsed >= 0)
-            adder.add("source_elapsed", elapsed);
-        return adder.build();
+            rowBuilder.add("source_elapsed", elapsed);
+
+        return builder.buildAsMutation();
     }
 }

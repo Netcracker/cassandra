@@ -19,12 +19,14 @@
 package org.apache.cassandra.distributed;
 
 import java.io.IOException;
+import java.util.Map;
 import java.util.function.Consumer;
 
 import org.apache.cassandra.distributed.api.IInstanceConfig;
 import org.apache.cassandra.distributed.api.IUpgradeableInstance;
+import org.apache.cassandra.distributed.api.TokenSupplier;
 import org.apache.cassandra.distributed.impl.AbstractCluster;
-import org.apache.cassandra.distributed.shared.AbstractBuilder;
+import org.apache.cassandra.distributed.shared.NetworkTopology;
 import org.apache.cassandra.distributed.shared.Versions;
 
 /**
@@ -41,10 +43,10 @@ public class UpgradeableCluster extends AbstractCluster<IUpgradeableInstance> im
         super(builder);
     }
 
-    protected IUpgradeableInstance newInstanceWrapper(int generation, Versions.Version version, IInstanceConfig config)
+    protected IUpgradeableInstance newInstanceWrapper(Versions.Version version, IInstanceConfig config)
     {
         config.set(Constants.KEY_DTEST_API_CONFIG_CHECK, false);
-        return new Wrapper(generation, version, config);
+        return new Wrapper(version, config);
     }
 
     public static Builder build()
@@ -61,10 +63,29 @@ public class UpgradeableCluster extends AbstractCluster<IUpgradeableInstance> im
     {
         return build(nodeCount).start();
     }
-
     public static UpgradeableCluster create(int nodeCount, Versions.Version version, Consumer<IInstanceConfig> configUpdater) throws IOException
     {
-        return build(nodeCount).withConfig(configUpdater).withVersion(version).start();
+        return create(nodeCount, version, configUpdater, null);
+    }
+
+    public static UpgradeableCluster create(int nodeCount, Versions.Version version, Consumer<IInstanceConfig> configUpdater, Consumer<Builder> builderUpdater) throws IOException
+    {
+        Builder builder = build(nodeCount).withConfig(configUpdater).withVersion(version);
+        if (builderUpdater != null)
+            builderUpdater.accept(builder);
+        return builder.start();
+    }
+
+    public static UpgradeableCluster create(int nodeCount, Versions.Version version, Consumer<IInstanceConfig> configUpdater, Consumer<Builder> builderUpdater, TokenSupplier tokenSupplier, Map<Integer, NetworkTopology.DcAndRack> nodeIdTopology) throws IOException
+    {
+        Builder builder = build(nodeCount).withConfig(configUpdater).withVersion(version);
+        if (tokenSupplier != null)
+            builder = builder.withTokenSupplier(tokenSupplier);
+        if (nodeIdTopology != null)
+            builder = builder.withNodeIdTopology(nodeIdTopology);
+        if (builderUpdater != null)
+            builderUpdater.accept(builder);
+        return builder.start();
     }
 
     public static UpgradeableCluster create(int nodeCount, Versions.Version version) throws Throwable
@@ -81,3 +102,4 @@ public class UpgradeableCluster extends AbstractCluster<IUpgradeableInstance> im
         }
     }
 }
+

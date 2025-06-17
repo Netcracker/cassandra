@@ -17,14 +17,16 @@
  */
 package org.apache.cassandra.db;
 
-import java.io.File;
+import java.io.File; //checkstyle: permit this import
 import java.util.Set;
 
 public interface DisallowedDirectoriesMBean
 {
-
     public Set<File> getUnreadableDirectories();
     
     public Set<File> getUnwritableDirectories();
-    
+
+    public void markUnreadable(String path);
+
+    public void markUnwritable(String path);
 }

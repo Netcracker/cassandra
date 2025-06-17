@@ -20,32 +20,81 @@ package org.apache.cassandra.schema;
 
 import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.exceptions.ConfigurationException;
+import org.apache.cassandra.exceptions.InvalidRequestException;
+import org.apache.cassandra.exceptions.RequestValidationException;
+import org.apache.cassandra.utils.BloomCalculations;
+
 import org.junit.Test;
 
-import static org.junit.Assert.fail;
+import static org.assertj.core.api.Assertions.assertThatExceptionOfType;
 
 public class CreateTableValidationTest extends CQLTester
 {
-    private static final String KEYSPACE1 = "CreateTableValidationTest";
-
     @Test
-    public void testInvalidBloomFilterFPRatio() throws Throwable
+    public void testInvalidBloomFilterFPRatio()
     {
-        try
-        {
-            createTableMayThrow("CREATE TABLE %s (a int PRIMARY KEY, b int) WITH bloom_filter_fp_chance = 0.0000001");
-            fail("Expected an fp chance of 0.0000001 to be rejected");
-        }
-        catch (ConfigurationException exc) { }
-
-        try
-        {
-            createTableMayThrow("CREATE TABLE %s (a int PRIMARY KEY, b int) WITH bloom_filter_fp_chance = 1.1");
-            fail("Expected an fp chance of 1.1 to be rejected");
-        }
-        catch (ConfigurationException exc) { }
-
+        expectedFailure(ConfigurationException.class, "CREATE TABLE %s (a int PRIMARY KEY, b int) WITH bloom_filter_fp_chance = 0.0000001",
+                        "bloom_filter_fp_chance must be larger than " + BloomCalculations.minSupportedBloomFilterFpChance() + " and less than or equal to 1.0 (got 1.0E-7)");
+        expectedFailure(ConfigurationException.class, "CREATE TABLE %s (a int PRIMARY KEY, b int) WITH bloom_filter_fp_chance = 1.1",
+                        "bloom_filter_fp_chance must be larger than " + BloomCalculations.minSupportedBloomFilterFpChance() + " and less than or equal to 1.0 (got 1.1");
         // sanity check
         createTable("CREATE TABLE %s (a int PRIMARY KEY, b int) WITH bloom_filter_fp_chance = 0.1");
+    }
+
+    @Test
+    public void testCreateTableOnSelectedClusteringColumn()
+    {
+        createTable("CREATE TABLE %s (pk int, ck1 int, ck2 int, v int, PRIMARY KEY ((pk),ck1, ck2)) WITH CLUSTERING ORDER BY (ck1 ASC);");
+    }
+
+    @Test
+    public void testCreateTableOnAllClusteringColumns()
+    {
+        createTable("CREATE TABLE %s (pk int, ck1 int, ck2 int, v int, PRIMARY KEY ((pk),ck1, ck2)) WITH CLUSTERING ORDER BY (ck1 ASC, ck2 DESC);");
+    }
+
+    @Test
+    public void testCreateTableErrorOnNonClusteringKey()
+    {
+        String expectedMessage = "Only clustering key columns can be defined in CLUSTERING ORDER directive";
+        expectedFailure(InvalidRequestException.class, "CREATE TABLE %s (pk int, ck1 int, ck2 int, v int, PRIMARY KEY ((pk),ck1, ck2)) WITH CLUSTERING ORDER BY (ck1 ASC, ck2 DESC, v ASC);",
+                        expectedMessage+": [v]");
+        expectedFailure(InvalidRequestException.class, "CREATE TABLE %s (pk int, ck1 int, ck2 int, v int, PRIMARY KEY ((pk),ck1, ck2)) WITH CLUSTERING ORDER BY (v ASC);",
+                        expectedMessage+": [v]");
+        expectedFailure(InvalidRequestException.class, "CREATE TABLE %s (pk int, ck1 int, ck2 int, v int, PRIMARY KEY ((pk),ck1, ck2)) WITH CLUSTERING ORDER BY (pk ASC);",
+                        expectedMessage+": [pk]");
+        expectedFailure(InvalidRequestException.class, "CREATE TABLE %s (pk int, ck1 int, ck2 int, v int, PRIMARY KEY ((pk),ck1, ck2)) WITH CLUSTERING ORDER BY (pk ASC, ck1 DESC);",
+                        expectedMessage+": [pk]");
+        expectedFailure(InvalidRequestException.class, "CREATE TABLE %s (pk int, ck1 int, ck2 int, v int, PRIMARY KEY ((pk),ck1, ck2)) WITH CLUSTERING ORDER BY (ck1 ASC, ck2 DESC, pk DESC);",
+                        expectedMessage+": [pk]");
+        expectedFailure(InvalidRequestException.class, "CREATE TABLE %s (pk int, ck1 int, ck2 int, v int, PRIMARY KEY ((pk),ck1, ck2)) WITH CLUSTERING ORDER BY (pk DESC, v DESC);",
+                        expectedMessage+": [pk, v]");
+        expectedFailure(InvalidRequestException.class, "CREATE TABLE %s (pk int, ck1 int, ck2 int, v int, PRIMARY KEY ((pk),ck1, ck2)) WITH CLUSTERING ORDER BY (pk DESC, v DESC, ck1 DESC);",
+                        expectedMessage+": [pk, v]");
+        expectedFailure(InvalidRequestException.class, "CREATE TABLE %s (pk int, ck1 int, ck2 int, v int, PRIMARY KEY ((pk),ck1, ck2)) WITH CLUSTERING ORDER BY (ck1 ASC, v ASC);",
+                        expectedMessage+": [v]");
+        expectedFailure(InvalidRequestException.class, "CREATE TABLE %s (pk int, ck1 int, ck2 int, v int, PRIMARY KEY ((pk),ck1, ck2)) WITH CLUSTERING ORDER BY (v ASC, ck1 DESC);",
+                        expectedMessage+": [v]");
+    }
+
+    @Test
+    public void testCreateTableInWrongOrder()
+    {
+        expectedFailure(InvalidRequestException.class, "CREATE TABLE %s (pk int, ck1 int, ck2 int, v int, PRIMARY KEY ((pk),ck1, ck2)) WITH CLUSTERING ORDER BY (ck2 ASC, ck1 DESC);",
+                        "The order of columns in the CLUSTERING ORDER directive must match that of the clustering columns");
+    }
+
+    @Test
+    public void testCreateTableWithMissingClusteringColumn()
+    {
+        expectedFailure(InvalidRequestException.class, "CREATE TABLE %s (pk int, ck1 int, ck2 int, v int, PRIMARY KEY ((pk),ck1, ck2)) WITH CLUSTERING ORDER BY (ck2 ASC);",
+                        "Missing CLUSTERING ORDER for column ck1");
+    }
+
+    private void expectedFailure(final Class<? extends RequestValidationException> exceptionType, String statement, String errorMsg)
+    {
+
+        assertThatExceptionOfType(exceptionType)
+        .isThrownBy(() -> createTableMayThrow(statement)) .withMessageContaining(errorMsg);
     }
 }

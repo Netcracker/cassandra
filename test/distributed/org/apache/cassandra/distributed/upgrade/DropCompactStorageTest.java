@@ -18,53 +18,35 @@
 
 package org.apache.cassandra.distributed.upgrade;
 
-import com.vdurmont.semver4j.Semver;
 import org.junit.Test;
 
 import org.apache.cassandra.distributed.api.ConsistencyLevel;
-import org.apache.cassandra.distributed.shared.Versions;
 
 import static org.apache.cassandra.distributed.api.Feature.GOSSIP;
-import static org.apache.cassandra.distributed.api.Feature.NATIVE_PROTOCOL;
 import static org.apache.cassandra.distributed.api.Feature.NETWORK;
-import static org.assertj.core.api.Assertions.assertThat;
-import static org.assertj.core.api.Assertions.catchThrowable;
+import static org.apache.cassandra.distributed.shared.AssertUtils.assertRows;
+import static org.apache.cassandra.distributed.shared.AssertUtils.row;
 
 public class DropCompactStorageTest extends UpgradeTestBase
 {
     @Test
-    public void dropCompactStorageBeforeUpgradesstablesTo30() throws Throwable
-    {
-        dropCompactStorageBeforeUpgradeSstables(v30);
-    }
-
-    /**
-     * Upgrades a node from 2.2 to 3.x and DROP COMPACT just after the upgrade but _before_ upgrading the underlying
-     * sstables.
-     *
-     * <p>This test reproduces the issue from CASSANDRA-15897.
-     */
-    public void dropCompactStorageBeforeUpgradeSstables(Semver upgradeTo) throws Throwable
+    public void testDropCompactStorage() throws Throwable
     {
         new TestCase()
-        .nodes(1)
-        .singleUpgrade(v22, upgradeTo)
-        .withConfig(config -> config.with(GOSSIP, NETWORK, NATIVE_PROTOCOL).set("enable_drop_compact_storage", true))
+        .nodes(2)
+        .nodesToUpgrade(1, 2)
+        .upgradesToCurrentFrom(OLDEST)
+        .withConfig(config -> config.with(GOSSIP, NETWORK).set("enable_drop_compact_storage", true))
         .setup((cluster) -> {
-            cluster.schemaChange("CREATE TABLE " + KEYSPACE + ".tbl (id int, ck int, v int, PRIMARY KEY (id, ck)) WITH COMPACT STORAGE");
-            for (int i = 0; i < 5; i++)
-                cluster.coordinator(1).execute("INSERT INTO "+KEYSPACE+".tbl (id, ck, v) values (1, ?, ?)", ConsistencyLevel.ALL, i, i);
-            cluster.get(1).flush(KEYSPACE);
+            cluster.schemaChange("CREATE TABLE " + KEYSPACE + ".tbl (pk int, ck int, PRIMARY KEY (pk, ck)) WITH COMPACT STORAGE");
+            cluster.coordinator(1).execute("INSERT INTO " + KEYSPACE + ".tbl (pk, ck) VALUES (1,1)", ConsistencyLevel.ALL);
         })
-        .runAfterNodeUpgrade((cluster, node) -> {
-            Throwable thrown = catchThrowable(() -> cluster.schemaChange("ALTER TABLE "+KEYSPACE+".tbl DROP COMPACT STORAGE"));
-            assertThat(thrown).hasMessageContainingAll("Cannot DROP COMPACT STORAGE as some nodes in the cluster",
-                                                       "has some non-upgraded 2.x sstables");
-
-            assertThat(cluster.get(1).nodetool("upgradesstables")).isEqualTo(0);
-            cluster.schemaChange("ALTER TABLE "+KEYSPACE+".tbl DROP COMPACT STORAGE");
-            cluster.coordinator(1).execute("SELECT * FROM " + KEYSPACE + ".tbl", ConsistencyLevel.ALL);
-        })
-        .run();
+        .runAfterClusterUpgrade((cluster) -> {
+            cluster.get(1).nodetoolResult("cms", "initialize").asserts().success();
+            cluster.schemaChange("ALTER TABLE " + KEYSPACE + ".tbl DROP COMPACT STORAGE");
+            assertRows(cluster.coordinator(1).execute("SELECT * FROM " + KEYSPACE + ".tbl WHERE pk = 1",
+                                                      ConsistencyLevel.ALL),
+                       row(1, 1, null));
+        }).run();
     }
 }

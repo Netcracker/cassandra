@@ -19,66 +19,79 @@
 package org.apache.cassandra.repair.messages;
 
 import java.io.IOException;
-import java.net.InetAddress;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
 
-import org.junit.AfterClass;
+import com.google.common.collect.Lists;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.dht.*;
 import org.junit.Assert;
 import org.junit.BeforeClass;
 import org.junit.Test;
 
-import org.apache.cassandra.config.DatabaseDescriptor;
-import org.apache.cassandra.dht.IPartitioner;
-import org.apache.cassandra.dht.Murmur3Partitioner;
+import org.apache.cassandra.CassandraTestBase;
+import org.apache.cassandra.CassandraTestBase.DDDaemonInitialization;
+import org.apache.cassandra.CassandraTestBase.UseMurmur3Partitioner;
 import org.apache.cassandra.dht.Murmur3Partitioner.LongToken;
-import org.apache.cassandra.dht.Range;
-import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.distributed.test.log.ClusterMetadataTestHelper;
 import org.apache.cassandra.io.IVersionedSerializer;
 import org.apache.cassandra.io.util.DataInputBuffer;
 import org.apache.cassandra.io.util.DataInputPlus;
 import org.apache.cassandra.io.util.DataOutputBufferFixed;
 import org.apache.cassandra.io.util.DataOutputPlus;
+import org.apache.cassandra.locator.InetAddressAndPort;
 import org.apache.cassandra.net.MessagingService;
-import org.apache.cassandra.repair.NodePair;
+import org.apache.cassandra.repair.SyncNodePair;
+import org.apache.cassandra.schema.KeyspaceMetadata;
+import org.apache.cassandra.schema.KeyspaceParams;
+import org.apache.cassandra.schema.SchemaTestUtil;
+import org.apache.cassandra.schema.TableMetadata;
+import org.apache.cassandra.streaming.PreviewKind;
 import org.apache.cassandra.repair.RepairJobDesc;
-import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.schema.TableId;
+import org.apache.cassandra.streaming.SessionSummary;
+import org.apache.cassandra.streaming.StreamSummary;
 import org.apache.cassandra.utils.MerkleTrees;
 
-public class RepairMessageSerializationsTest
+import static java.util.Collections.emptyList;
+import static org.apache.cassandra.utils.TimeUUID.Generator.nextTimeUUID;
+
+@UseMurmur3Partitioner
+@DDDaemonInitialization
+public class RepairMessageSerializationsTest extends CassandraTestBase
 {
     private static final int PROTOCOL_VERSION = MessagingService.current_version;
     private static final int GC_BEFORE = 1000000;
 
-    private static IPartitioner originalPartitioner;
 
     @BeforeClass
     public static void before()
     {
-        originalPartitioner = StorageService.instance.setPartitionerUnsafe(Murmur3Partitioner.instance);
-    }
-
-    @AfterClass
-    public static void after()
-    {
-        DatabaseDescriptor.setPartitionerUnsafe(originalPartitioner);
+        ClusterMetadataTestHelper.setInstanceForTest();
+        SchemaTestUtil.addOrUpdateKeyspace(KeyspaceMetadata.create("serializationsTestKeyspace",
+                                                                   KeyspaceParams.simple(3)));
+        SchemaTestUtil.announceNewTable(TableMetadata.minimal("serializationsTestKeyspace", "repairMessages"));
     }
 
     @Test
     public void validationRequestMessage() throws IOException
     {
         RepairJobDesc jobDesc = buildRepairJobDesc();
-        ValidationRequest msg = new ValidationRequest(jobDesc, GC_BEFORE);
+        ValidationRequest msg = new ValidationRequest(jobDesc, GC_BEFORE, false);
         ValidationRequest deserialized = serializeRoundTrip(msg, ValidationRequest.serializer);
+        Assert.assertEquals(jobDesc, deserialized.desc);
+
+        msg = new ValidationRequest(jobDesc, GC_BEFORE, true);
+        deserialized = serializeRoundTrip(msg, ValidationRequest.serializer);
         Assert.assertEquals(jobDesc, deserialized.desc);
     }
 
     private RepairJobDesc buildRepairJobDesc()
     {
         List<Range<Token>> tokenRanges = buildTokenRanges();
-        return new RepairJobDesc(UUID.randomUUID(), UUID.randomUUID(), "serializationsTestKeyspace", "repairMessages", tokenRanges);
+        return new RepairJobDesc(nextTimeUUID(), nextTimeUUID(), "serializationsTestKeyspace", "repairMessages", tokenRanges);
     }
 
     private List<Range<Token>> buildTokenRanges()
@@ -102,7 +115,19 @@ public class RepairMessageSerializationsTest
 
         buf.flip();
         DataInputPlus in = new DataInputBuffer(buf, false);
-        T deserialized = serializer.deserialize(in, PROTOCOL_VERSION);
+
+        T deserialized = null;
+        
+        if (serializer instanceof IPartitionerDependentSerializer)
+        {
+            IPartitionerDependentSerializer<T> pds = (IPartitionerDependentSerializer<T>) serializer;
+            deserialized = pds.deserialize(in, DatabaseDescriptor.getPartitioner(), PROTOCOL_VERSION);
+        }
+        else
+        {
+            deserialized = serializer.deserialize(in, PROTOCOL_VERSION);
+        }
+
         Assert.assertEquals(msg, deserialized);
         Assert.assertEquals(msg.hashCode(), deserialized.hashCode());
         return deserialized;
@@ -111,7 +136,7 @@ public class RepairMessageSerializationsTest
     @Test
     public void validationCompleteMessage_NoMerkleTree() throws IOException
     {
-        ValidationComplete deserialized = validationCompleteMessage(null);
+        ValidationResponse deserialized = validationCompleteMessage(null);
         Assert.assertNull(deserialized.trees);
     }
 
@@ -120,54 +145,54 @@ public class RepairMessageSerializationsTest
     {
         MerkleTrees trees = new MerkleTrees(Murmur3Partitioner.instance);
         trees.addMerkleTree(256, new Range<>(new LongToken(1000), new LongToken(1001)));
-        ValidationComplete deserialized = validationCompleteMessage(trees);
+        ValidationResponse deserialized = validationCompleteMessage(trees);
 
         // a simple check to make sure we got some merkle trees back.
         Assert.assertEquals(trees.size(), deserialized.trees.size());
     }
 
-    private ValidationComplete validationCompleteMessage(MerkleTrees trees) throws IOException
+    private ValidationResponse validationCompleteMessage(MerkleTrees trees) throws IOException
     {
         RepairJobDesc jobDesc = buildRepairJobDesc();
-        ValidationComplete msg = trees == null ?
-                                 new ValidationComplete(jobDesc) :
-                                 new ValidationComplete(jobDesc, trees);
-        ValidationComplete deserialized = serializeRoundTrip(msg, ValidationComplete.serializer);
+        ValidationResponse msg = trees == null ?
+                                 new ValidationResponse(jobDesc) :
+                                 new ValidationResponse(jobDesc, trees);
+        ValidationResponse deserialized = serializeRoundTrip(msg, ValidationResponse.serializer);
         return deserialized;
     }
 
     @Test
     public void syncRequestMessage() throws IOException
     {
-        InetAddress initiator = InetAddress.getByName("127.0.0.1");
-        InetAddress src = InetAddress.getByName("127.0.0.2");
-        InetAddress dst = InetAddress.getByName("127.0.0.3");
+        InetAddressAndPort initiator = InetAddressAndPort.getByName("127.0.0.1");
+        InetAddressAndPort src = InetAddressAndPort.getByName("127.0.0.2");
+        InetAddressAndPort dst = InetAddressAndPort.getByName("127.0.0.3");
 
-        SyncRequest msg = new SyncRequest(buildRepairJobDesc(), initiator, src, dst, buildTokenRanges());
+        SyncRequest msg = new SyncRequest(buildRepairJobDesc(), initiator, src, dst, buildTokenRanges(), PreviewKind.NONE, false);
         serializeRoundTrip(msg, SyncRequest.serializer);
     }
 
     @Test
     public void syncCompleteMessage() throws IOException
     {
-        InetAddress src = InetAddress.getByName("127.0.0.2");
-        InetAddress dst = InetAddress.getByName("127.0.0.3");
-        SyncComplete msg = new SyncComplete(buildRepairJobDesc(), new NodePair(src, dst), true);
-        serializeRoundTrip(msg, SyncComplete.serializer);
-    }
-
-    @Test
-    public void antiCompactionRequestMessage() throws IOException
-    {
-        AnticompactionRequest msg = new AnticompactionRequest(UUID.randomUUID(), buildTokenRanges());
-        serializeRoundTrip(msg, AnticompactionRequest.serializer);
+        InetAddressAndPort src = InetAddressAndPort.getByName("127.0.0.2");
+        InetAddressAndPort dst = InetAddressAndPort.getByName("127.0.0.3");
+        List<SessionSummary> summaries = new ArrayList<>();
+        summaries.add(new SessionSummary(src, dst,
+                                         Lists.newArrayList(new StreamSummary(TableId.fromUUID(UUID.randomUUID()), emptyList(), 5, 100)),
+                                         Lists.newArrayList(new StreamSummary(TableId.fromUUID(UUID.randomUUID()), emptyList(), 500, 10))
+        ));
+        SyncResponse msg = new SyncResponse(buildRepairJobDesc(), new SyncNodePair(src, dst), true, summaries);
+        serializeRoundTrip(msg, SyncResponse.serializer);
     }
 
     @Test
     public void prepareMessage() throws IOException
     {
-        PrepareMessage msg = new PrepareMessage(UUID.randomUUID(), new ArrayList<UUID>() {{add(UUID.randomUUID());}},
-                                                buildTokenRanges(), true, 100000L, false);
+        PrepareMessage msg = new PrepareMessage(nextTimeUUID(), new ArrayList<TableId>() {{add(TableId.generate());}},
+                                                Murmur3Partitioner.instance,
+                                                buildTokenRanges(), true, 100000L, false,
+                                                PreviewKind.NONE);
         serializeRoundTrip(msg, PrepareMessage.serializer);
     }
 
@@ -181,7 +206,7 @@ public class RepairMessageSerializationsTest
     @Test
     public void cleanupMessage() throws IOException
     {
-        CleanupMessage msg = new CleanupMessage(UUID.randomUUID());
+        CleanupMessage msg = new CleanupMessage(nextTimeUUID());
         serializeRoundTrip(msg, CleanupMessage.serializer);
     }
 }

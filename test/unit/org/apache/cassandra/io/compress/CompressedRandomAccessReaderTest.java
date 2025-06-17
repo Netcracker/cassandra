@@ -1,4 +1,4 @@
-/**
+/*
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -19,102 +19,127 @@
 package org.apache.cassandra.io.compress;
 
 import java.io.EOFException;
-import java.io.File;
 import java.io.IOException;
 import java.io.RandomAccessFile;
 import java.util.Arrays;
 import java.util.Random;
 
+import org.junit.BeforeClass;
 import org.junit.Test;
+
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.ClusteringComparator;
 import org.apache.cassandra.db.marshal.BytesType;
 import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.io.sstable.CorruptSSTableException;
 import org.apache.cassandra.io.sstable.metadata.MetadataCollector;
-import org.apache.cassandra.io.util.ChannelProxy;
 import org.apache.cassandra.io.util.DataPosition;
-import org.apache.cassandra.io.util.MmappedRegions;
+import org.apache.cassandra.io.util.File;
+import org.apache.cassandra.io.util.FileHandle;
+import org.apache.cassandra.io.util.FileUtils;
 import org.apache.cassandra.io.util.RandomAccessReader;
 import org.apache.cassandra.io.util.SequentialWriter;
+import org.apache.cassandra.io.util.SequentialWriterOption;
 import org.apache.cassandra.schema.CompressionParams;
-import org.apache.cassandra.utils.ChecksumType;
 import org.apache.cassandra.utils.SyncUtil;
+import org.assertj.core.api.Assertions;
 
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
-import static org.junit.Assert.fail;
 
 public class CompressedRandomAccessReaderTest
 {
+    @BeforeClass
+    public static void setupDD()
+    {
+        DatabaseDescriptor.daemonInitialization();
+    }
+
     @Test
     public void testResetAndTruncate() throws IOException
     {
         // test reset in current buffer or previous one
-        testResetAndTruncate(File.createTempFile("normal", "1"), false, false, 10);
-        testResetAndTruncate(File.createTempFile("normal", "2"), false, false, CompressionParams.DEFAULT_CHUNK_LENGTH);
+        testResetAndTruncate(FileUtils.createTempFile("normal", "1"), false, false, 10, 0);
+        testResetAndTruncate(FileUtils.createTempFile("normal", "2"), false, false, CompressionParams.DEFAULT_CHUNK_LENGTH, 0);
     }
 
     @Test
     public void testResetAndTruncateCompressed() throws IOException
     {
         // test reset in current buffer or previous one
-        testResetAndTruncate(File.createTempFile("compressed", "1"), true, false, 10);
-        testResetAndTruncate(File.createTempFile("compressed", "2"), true, false, CompressionParams.DEFAULT_CHUNK_LENGTH);
+        testResetAndTruncate(FileUtils.createTempFile("compressed", "1"), true, false, 10, 0);
+        testResetAndTruncate(FileUtils.createTempFile("compressed", "2"), true, false, CompressionParams.DEFAULT_CHUNK_LENGTH, 0);
     }
 
     @Test
     public void testResetAndTruncateCompressedMmap() throws IOException
     {
         // test reset in current buffer or previous one
-        testResetAndTruncate(File.createTempFile("compressed_mmap", "1"), true, true, 10);
-        testResetAndTruncate(File.createTempFile("compressed_mmap", "2"), true, true, CompressionParams.DEFAULT_CHUNK_LENGTH);
+        testResetAndTruncate(FileUtils.createTempFile("compressed_mmap", "1"), true, true, 10, 0);
+        testResetAndTruncate(FileUtils.createTempFile("compressed_mmap", "2"), true, true, CompressionParams.DEFAULT_CHUNK_LENGTH, 0);
+    }
+
+    @Test
+    public void testResetAndTruncateCompressedUncompressedChunks() throws IOException
+    {
+        // test reset in current buffer or previous one
+        testResetAndTruncate(FileUtils.createTempFile("compressed_uchunks", "1"), true, false, 10, 3);
+        testResetAndTruncate(FileUtils.createTempFile("compressed_uchunks", "2"), true, false, CompressionParams.DEFAULT_CHUNK_LENGTH, 3);
+    }
+
+    @Test
+    public void testResetAndTruncateCompressedUncompressedChunksMmap() throws IOException
+    {
+        // test reset in current buffer or previous one
+        testResetAndTruncate(FileUtils.createTempFile("compressed_uchunks_mmap", "1"), true, true, 10, 3);
+        testResetAndTruncate(FileUtils.createTempFile("compressed_uchunks_mmap", "2"), true, true, CompressionParams.DEFAULT_CHUNK_LENGTH, 3);
     }
 
     @Test
     public void test6791() throws IOException, ConfigurationException
     {
-        File f = File.createTempFile("compressed6791_", "3");
-        String filename = f.getAbsolutePath();
-        try (ChannelProxy channel = new ChannelProxy(f))
+        File f = FileUtils.createTempFile("compressed6791_", "3");
+        String filename = f.absolutePath();
+        MetadataCollector sstableMetadataCollector = new MetadataCollector(new ClusteringComparator(BytesType.instance));
+        try(CompressedSequentialWriter writer = new CompressedSequentialWriter(f, new File(filename + ".metadata"),
+                                                                               null, SequentialWriterOption.DEFAULT,
+                                                                               CompressionParams.snappy(32),
+                                                                               sstableMetadataCollector))
         {
 
-            MetadataCollector sstableMetadataCollector = new MetadataCollector(new ClusteringComparator(BytesType.instance));
-            try (CompressedSequentialWriter writer = new CompressedSequentialWriter(f, filename + ".metadata", CompressionParams.snappy(32), sstableMetadataCollector))
-            {
+            for (int i = 0; i < 20; i++)
+                writer.write("x".getBytes());
 
-                for (int i = 0; i < 20; i++)
-                    writer.write("x".getBytes());
+            DataPosition mark = writer.mark();
+            // write enough garbage to create new chunks:
+            for (int i = 0; i < 40; ++i)
+                writer.write("y".getBytes());
 
-                DataPosition mark = writer.mark();
-                // write enough garbage to create new chunks:
-                for (int i = 0; i < 40; ++i)
-                    writer.write("y".getBytes());
+            writer.resetAndTruncate(mark);
 
-                writer.resetAndTruncate(mark);
+            for (int i = 0; i < 20; i++)
+                writer.write("x".getBytes());
+            writer.finish();
+        }
 
-                for (int i = 0; i < 20; i++)
-                    writer.write("x".getBytes());
-                writer.finish();
-            }
-
-            try (RandomAccessReader reader = new CompressedRandomAccessReader.Builder(channel,
-                                                                                      new CompressionMetadata(filename + ".metadata", f.length(), ChecksumType.CRC32))
-                    .build())
-            {
-                String res = reader.readLine();
-                assertEquals(res, "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx");
-                assertEquals(40, res.length());
-            }
+        try (CompressionMetadata compressionMetadata = CompressionMetadata.open(new File(filename + ".metadata"), f.length(), true);
+             FileHandle fh = new FileHandle.Builder(f).withCompressionMetadata(compressionMetadata).complete();
+             RandomAccessReader reader = fh.createReader())
+        {
+            String res = reader.readLine();
+            assertEquals(res, "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx");
+            assertEquals(40, res.length());
         }
         finally
         {
             if (f.exists())
-                assertTrue(f.delete());
-            File metadata = new File(filename + ".metadata");
+                assertTrue(f.tryDelete());
+            File metadata = new File(filename+ ".metadata");
             if (metadata.exists())
-                metadata.delete();
+                metadata.tryDelete();
         }
     }
 
@@ -124,89 +149,68 @@ public class CompressedRandomAccessReaderTest
     @Test
     public void testChunkIndexOverflow() throws IOException
     {
-        File file = File.createTempFile("chunk_idx_overflow", "1");
-        String filename = file.getAbsolutePath();
+        File file = FileUtils.createTempFile("chunk_idx_overflow", "1");
+        String filename = file.absolutePath();
         int chunkLength = 4096; // 4k
 
         try
         {
             writeSSTable(file, CompressionParams.snappy(chunkLength), 10);
-            CompressionMetadata metadata = new CompressionMetadata(filename + ".metadata", file.length(), ChecksumType.CRC32);
+            CompressionMetadata metadata = CompressionMetadata.open(new File(filename + ".metadata"), file.length(), true);
 
             long chunks = 2761628520L;
             long midPosition = (chunks / 2L) * chunkLength;
             int idx = 8 * (int) (midPosition / chunkLength); // before patch
             assertTrue("Expect integer overflow", idx < 0);
 
-            try
-            {
-                metadata.chunkFor(midPosition);
-                fail("Expected to throw EOF exception with chunk idx larger than total number of chunks in the sstable");
-            }
-            catch (CorruptSSTableException e)
-            {
-                assertTrue("Expect EOF, but got " + e.getCause(), e.getCause() instanceof EOFException);
-            }
+            Throwable thrown = Assertions.catchThrowable(() -> metadata.chunkFor(midPosition));
+            assertThat(thrown).isInstanceOf(CorruptSSTableException.class)
+                              .hasCauseInstanceOf(EOFException.class);
         }
         finally
         {
             if (file.exists())
-                assertTrue(file.delete());
+                assertTrue(file.tryDelete());
             File metadata = new File(filename + ".metadata");
             if (metadata.exists())
-                metadata.delete();
+                metadata.tryDelete();
         }
     }
 
-    private static void testResetAndTruncate(File f, boolean compressed, boolean usemmap, int junkSize) throws IOException
+    private static void testResetAndTruncate(File f, boolean compressed, boolean usemmap, int junkSize, double minCompressRatio) throws IOException
     {
-        final String filename = f.getAbsolutePath();
-        try(ChannelProxy channel = new ChannelProxy(f))
+        final String filename = f.absolutePath();
+        writeSSTable(f, compressed ? CompressionParams.snappy() : null, junkSize);
+
+        try (CompressionMetadata compressionMetadata = compressed ? CompressionMetadata.open(new File(filename + ".metadata"), f.length(), true) : null;
+             FileHandle fh = new FileHandle.Builder(f).mmapped(usemmap).withCompressionMetadata(compressionMetadata).complete();
+             RandomAccessReader reader = fh.createReader())
         {
-            writeSSTable(f, compressed ? CompressionParams.snappy() : null, junkSize);
-
-            CompressionMetadata compressionMetadata = compressed ? new CompressionMetadata(filename + ".metadata", f.length(), ChecksumType.CRC32) : null;
-            RandomAccessReader.Builder builder = compressed
-                                                 ? new CompressedRandomAccessReader.Builder(channel, compressionMetadata)
-                                                 : new RandomAccessReader.Builder(channel);
-
-            if (usemmap)
-            {
-                if (compressed)
-                    builder.regions(MmappedRegions.map(channel, compressionMetadata));
-                else
-                    builder.regions(MmappedRegions.map(channel, f.length()));
-            }
-
-            try(RandomAccessReader reader = builder.build())
-            {
-                String expected = "The quick brown fox jumps over the lazy dog";
-                assertEquals(expected.length(), reader.length());
-                byte[] b = new byte[expected.length()];
-                reader.readFully(b);
-                assert new String(b).equals(expected) : "Expecting '" + expected + "', got '" + new String(b) + '\'';
-            }
-
-            if (usemmap)
-                builder.regions.close();
+            String expected = "The quick brown fox jumps over the lazy dog";
+            assertEquals(expected.length(), reader.length());
+            byte[] b = new byte[expected.length()];
+            reader.readFully(b);
+            assert new String(b).equals(expected) : "Expecting '" + expected + "', got '" + new String(b) + '\'';
         }
         finally
         {
             if (f.exists())
-                assertTrue(f.delete());
+                assertTrue(f.tryDelete());
             File metadata = new File(filename + ".metadata");
             if (compressed && metadata.exists())
-                metadata.delete();
+                metadata.tryDelete();
         }
     }
 
     private static void writeSSTable(File f, CompressionParams params, int junkSize) throws IOException
     {
-        final String filename = f.getAbsolutePath();
+        final String filename = f.absolutePath();
         MetadataCollector sstableMetadataCollector = new MetadataCollector(new ClusteringComparator(BytesType.instance));
         try(SequentialWriter writer = params != null
-                                      ? new CompressedSequentialWriter(f, filename + ".metadata", params, sstableMetadataCollector)
-                                      : SequentialWriter.open(f))
+                ? new CompressedSequentialWriter(f, new File(filename + ".metadata"),
+                                                 null, SequentialWriterOption.DEFAULT,
+                                                 params, sstableMetadataCollector)
+                : new SequentialWriter(f))
         {
             writer.write("The quick ".getBytes());
             DataPosition mark = writer.mark();
@@ -236,32 +240,30 @@ public class CompressedRandomAccessReaderTest
         File file = new File("testDataCorruptionDetection");
         file.deleteOnExit();
 
-        File metadata = new File(file.getPath() + ".meta");
+        File metadata = new File(file.path() + ".meta");
         metadata.deleteOnExit();
 
-        assertTrue(file.createNewFile());
-        assertTrue(metadata.createNewFile());
+        assertTrue(file.createFileIfNotExists());
+        assertTrue(metadata.createFileIfNotExists());
 
         MetadataCollector sstableMetadataCollector = new MetadataCollector(new ClusteringComparator(BytesType.instance));
-        try (SequentialWriter writer = new CompressedSequentialWriter(file, metadata.getPath(), CompressionParams.snappy(), sstableMetadataCollector))
+        try (SequentialWriter writer = new CompressedSequentialWriter(file, metadata,
+                                                                      null, SequentialWriterOption.DEFAULT,
+                                                                      CompressionParams.snappy(), sstableMetadataCollector))
         {
             writer.write(CONTENT.getBytes());
             writer.finish();
         }
 
-        try(ChannelProxy channel = new ChannelProxy(file))
-        {
-            // open compression metadata and get chunk information
-            CompressionMetadata meta = new CompressionMetadata(metadata.getPath(), file.length(), ChecksumType.CRC32);
-            CompressionMetadata.Chunk chunk = meta.chunkFor(0);
-
-            try(RandomAccessReader reader = new CompressedRandomAccessReader.Builder(channel, meta).build())
-            {// read and verify compressed data
-                assertEquals(CONTENT, reader.readLine());
-            }
-
+        // open compression metadata and get chunk information
+        try (CompressionMetadata meta = CompressionMetadata.open(metadata, file.length(), true);
+             FileHandle fh = new FileHandle.Builder(file).withCompressionMetadata(meta).complete();
+             RandomAccessReader reader = fh.createReader())
+        {// read and verify compressed data
+            assertEquals(CONTENT, reader.readLine());
             Random random = new Random();
-            try(RandomAccessFile checksumModifier = new RandomAccessFile(file, "rw"))
+            CompressionMetadata.Chunk chunk = meta.chunkFor(0);
+            try (RandomAccessFile checksumModifier = new RandomAccessFile(file.toJavaIOFile(), "rw"))
             {
                 byte[] checksum = new byte[4];
 
@@ -278,7 +280,7 @@ public class CompressedRandomAccessReaderTest
 
                 updateChecksum(checksumModifier, chunk.length, corruptChecksum);
 
-                try (final RandomAccessReader r = new CompressedRandomAccessReader.Builder(channel, meta).build())
+                try (final RandomAccessReader r = fh.createReader())
                 {
                     Throwable exception = null;
                     try
@@ -298,7 +300,7 @@ public class CompressedRandomAccessReaderTest
                 updateChecksum(checksumModifier, chunk.length, checksum);
 
                 // read and verify compressed data
-                try (RandomAccessReader cr = new CompressedRandomAccessReader.Builder(channel, meta).build())
+                try (RandomAccessReader cr = fh.createReader())
                 {
                     assertEquals(CONTENT, cr.readLine());
                 }
@@ -310,6 +312,6 @@ public class CompressedRandomAccessReaderTest
     {
         file.seek(checksumOffset);
         file.write(checksum);
-        SyncUtil.sync(file);
+        SyncUtil.sync(file.getFD());
     }
 }

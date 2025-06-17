@@ -17,9 +17,7 @@
  */
 package org.apache.cassandra.cql3;
 
-import java.net.InetAddress;
 import java.util.Iterator;
-import java.util.List;
 
 import org.junit.AfterClass;
 import org.junit.BeforeClass;
@@ -31,18 +29,18 @@ import com.datastax.driver.core.Row;
 import com.datastax.driver.core.Session;
 import com.datastax.driver.core.SimpleStatement;
 import com.datastax.driver.core.Statement;
+import org.apache.cassandra.ServerTestUtils;
 import org.apache.cassandra.config.DatabaseDescriptor;
-
-import org.apache.cassandra.dht.Murmur3Partitioner;
-import org.apache.cassandra.dht.Murmur3Partitioner.LongToken;
-import org.apache.cassandra.locator.AbstractEndpointSnitch;
-import org.apache.cassandra.locator.IEndpointSnitch;
+import org.apache.cassandra.locator.InetAddressAndPort;
+import org.apache.cassandra.locator.Replica;
+import org.apache.cassandra.locator.ReplicaCollection;
+import org.apache.cassandra.locator.NodeProximity;
+import org.apache.cassandra.locator.BaseProximity;
 import org.apache.cassandra.service.EmbeddedCassandraService;
-import org.apache.cassandra.service.StorageService;
-import org.apache.cassandra.utils.FBUtilities;
 
-import static junit.framework.Assert.assertFalse;
+import static org.apache.cassandra.config.CassandraRelevantProperties.CASSANDRA_CONFIG;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 
 
 public class PagingTest
@@ -55,13 +53,14 @@ public class PagingTest
                                                     " WITH REPLICATION = { 'class' : 'SimpleStrategy', 'replication_factor' : 2 };";
 
     private static final String dropKsStatement = "DROP KEYSPACE IF EXISTS " + KEYSPACE;
+    private static EmbeddedCassandraService cassandra;
 
     @BeforeClass
     public static void setup() throws Exception
     {
-        DatabaseDescriptor.setPartitionerUnsafe(Murmur3Partitioner.instance);
-        EmbeddedCassandraService cassandra = new EmbeddedCassandraService();
-        cassandra.start();
+        CASSANDRA_CONFIG.setString("cassandra-murmur.yaml");
+
+        cassandra = ServerTestUtils.startEmbeddedCassandraService();
 
         // Currently the native server start method return before the server is fully binded to the socket, so we need
         // to wait slightly before trying to connect to it. We should fix this but in the meantime using a sleep.
@@ -79,7 +78,10 @@ public class PagingTest
     @AfterClass
     public static void tearDown()
     {
-        cluster.close();
+        if (cluster != null)
+            cluster.close();
+        if (cassandra != null)
+            cassandra.stop();
     }
 
     /**
@@ -100,34 +102,22 @@ public class PagingTest
         String createTableStatement = "CREATE TABLE IF NOT EXISTS " + table + " (id int, id2 int, id3 int, val text, PRIMARY KEY ((id, id2), id3));";
         String dropTableStatement = "DROP TABLE IF EXISTS " + table + ';';
 
-        // custom snitch to avoid merging ranges back together after StorageProxy#getRestrictedRanges splits them up
-        IEndpointSnitch snitch = new AbstractEndpointSnitch()
+        // custom proximity impl to avoid merging ranges back together after StorageProxy#getRestrictedRanges splits them up
+        NodeProximity proximity = new BaseProximity()
         {
-            private IEndpointSnitch oldSnitch = DatabaseDescriptor.getEndpointSnitch();
-            public int compareEndpoints(InetAddress target, InetAddress a1, InetAddress a2)
+            private final NodeProximity oldProximity = DatabaseDescriptor.getNodeProximity();
+            public int compareEndpoints(InetAddressAndPort target, Replica a1, Replica a2)
             {
-                return oldSnitch.compareEndpoints(target, a1, a2);
-            }
-
-            public String getRack(InetAddress endpoint)
-            {
-                return oldSnitch.getRack(endpoint);
-            }
-
-            public String getDatacenter(InetAddress endpoint)
-            {
-                return oldSnitch.getDatacenter(endpoint);
+                return oldProximity.compareEndpoints(target, a1, a2);
             }
 
             @Override
-            public boolean isWorthMergingForRangeQuery(List<InetAddress> merged, List<InetAddress> l1, List<InetAddress> l2)
+            public boolean isWorthMergingForRangeQuery(ReplicaCollection merged, ReplicaCollection l1, ReplicaCollection l2)
             {
                 return false;
             }
         };
-        DatabaseDescriptor.setEndpointSnitch(snitch);
-        StorageService.instance.getTokenMetadata().clearUnsafe();
-        StorageService.instance.getTokenMetadata().updateNormalToken(new LongToken(5097162189738624638L), FBUtilities.getBroadcastAddress());
+        DatabaseDescriptor.setNodeProximity(proximity);
         session.execute(createTableStatement);
 
         for (int i = 0; i < 110; i++)

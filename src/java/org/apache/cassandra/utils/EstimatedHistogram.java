@@ -20,6 +20,7 @@ package org.apache.cassandra.utils;
 import java.io.IOException;
 import java.util.Arrays;
 import java.util.concurrent.atomic.AtomicLongArray;
+import java.util.function.DoubleToLongFunction;
 
 import com.google.common.base.Objects;
 import org.slf4j.Logger;
@@ -30,9 +31,11 @@ import org.apache.cassandra.io.ISerializer;
 import org.apache.cassandra.io.util.DataInputPlus;
 import org.apache.cassandra.io.util.DataOutputPlus;
 
-public class EstimatedHistogram
+public class EstimatedHistogram implements DoubleToLongFunction
 {
     public static final EstimatedHistogramSerializer serializer = new EstimatedHistogramSerializer();
+
+    public static final int DEFAULT_BUCKET_COUNT = 90;
 
     /**
      * The series of values to which the counts in `buckets` correspond:
@@ -52,7 +55,7 @@ public class EstimatedHistogram
 
     public EstimatedHistogram()
     {
-        this(90);
+        this(DEFAULT_BUCKET_COUNT);
     }
 
     public EstimatedHistogram(int bucketCount)
@@ -113,11 +116,7 @@ public class EstimatedHistogram
         return bucketOffsets;
     }
 
-    /**
-     * Increments the count of the bucket closest to n, rounding UP.
-     * @param n
-     */
-    public void add(long n)
+    private int findIndex(long n)
     {
         int index = Arrays.binarySearch(bucketOffsets, n);
         if (index < 0)
@@ -125,8 +124,25 @@ public class EstimatedHistogram
             // inexact match, take the first bucket higher than n
             index = -index - 1;
         }
-        // else exact match; we're good
-        buckets.incrementAndGet(index);
+        return index;
+    }
+
+    /**
+     * Increments the count of the bucket closest to n, rounding UP.
+     * @param n
+     */
+    public void add(long n)
+    {
+        buckets.incrementAndGet(findIndex(n));
+    }
+
+    /**
+     * Increments the count of the bucket closest to n, rounding UP by delta
+     * @param n
+     */
+    public void add(long n, long delta)
+    {
+        buckets.addAndGet(findIndex(n), delta);
     }
 
     /**
@@ -369,6 +385,12 @@ public class EstimatedHistogram
         return Objects.hashCode(getBucketOffsets(), getBuckets(false));
     }
 
+    @Override
+    public long applyAsLong(double value)
+    {
+        return percentile(value);
+    }
+
     public static class EstimatedHistogramSerializer implements ISerializer<EstimatedHistogram>
     {
         private static final Logger logger = LoggerFactory.getLogger(EstimatedHistogramSerializer.class);
@@ -397,7 +419,8 @@ public class EstimatedHistogram
             long[] offsets = new long[size - 1];
             long[] buckets = new long[size];
 
-            for (int i = 0; i < size; i++) {
+            for (int i = 0; i < size; i++)
+            {
                 offsets[i == 0 ? 0 : i - 1] = in.readLong();
                 buckets[i] = in.readLong();
             }
@@ -418,5 +441,11 @@ public class EstimatedHistogram
             }
             return size;
         }
+    }
+
+    @Override
+    public String toString()
+    {
+        return String.valueOf(mean());
     }
 }

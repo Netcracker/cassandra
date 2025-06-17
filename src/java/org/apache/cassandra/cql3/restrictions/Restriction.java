@@ -19,48 +19,44 @@ package org.apache.cassandra.cql3.restrictions;
 
 import java.util.List;
 
-import org.apache.cassandra.config.ColumnDefinition;
+import org.apache.cassandra.index.Index;
+import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.cql3.QueryOptions;
 import org.apache.cassandra.cql3.functions.Function;
-import org.apache.cassandra.cql3.statements.Bound;
-import org.apache.cassandra.db.MultiCBuilder;
 import org.apache.cassandra.db.filter.RowFilter;
-import org.apache.cassandra.exceptions.InvalidRequestException;
-import org.apache.cassandra.index.SecondaryIndexManager;
+import org.apache.cassandra.index.IndexRegistry;
 
 /**
- * A restriction/clause on a column.
- * The goal of this class being to group all conditions for a column in a SELECT.
- *
- * <p>Implementation of this class must be immutable. See {@link #mergeWith(Restriction)} for more explanation.</p>
+ * <p>Implementation of this class must be immutable.</p>
  */
 public interface Restriction
 {
-    public boolean isOnToken();
-    public boolean isSlice();
-    public boolean isEQ();
-    public boolean isIN();
-    public boolean isContains();
-    public boolean isNotNull();
-    public boolean isMultiColumn();
+    /**
+     * Checks if this restriction is a token restriction.
+     * @return {@code true} if this restriction is a token restriction, {@code false} otherwise
+     */
+    default boolean isOnToken()
+    {
+        return false;
+    }
 
     /**
-     * Returns the definition of the first column.
-     * @return the definition of the first column.
+     * Returns the column metadata in position order.
+     * @return the column metadata in position order.
      */
-    public ColumnDefinition getFirstColumn();
+    List<ColumnMetadata> columns();
 
     /**
-     * Returns the definition of the last column.
-     * @return the definition of the last column.
+     * Returns the metadata of the first column.
+     * @return the metadata of the first column.
      */
-    public ColumnDefinition getLastColumn();
+    ColumnMetadata firstColumn();
 
     /**
-     * Returns the column definitions in position order.
-     * @return the column definitions in position order.
+     * Returns the metadata of the last column.
+     * @return the metadata of the last column.
      */
-    public List<ColumnDefinition> getColumnDefs();
+    ColumnMetadata lastColumn();
 
     /**
      * Adds all functions (native and user-defined) used by any component of the restriction
@@ -70,69 +66,47 @@ public interface Restriction
     void addFunctionsTo(List<Function> functions);
 
     /**
-     * Checks if the specified bound is set or not.
-     * @param b the bound type
-     * @return <code>true</code> if the specified bound is set, <code>false</code> otherwise
+     * Checks if this restriction requires filtering or indexing.
+     * @return {@code true} if the restriction will require either filtering or indexing, {@code false} otherwise.
      */
-    public boolean hasBound(Bound b);
+    boolean needsFilteringOrIndexing();
 
     /**
-     * Checks if the specified bound is inclusive or not.
-     * @param b the bound type
-     * @return <code>true</code> if the specified bound is inclusive, <code>false</code> otherwise
-     */
-    public boolean isInclusive(Bound b);
-
-    /**
-     * Merges this restriction with the specified one.
+     * Returns whether this restriction would need filtering if the specified index group were used.
+     * Find the first index supporting this restriction.
      *
-     * <p>Restriction are immutable. Therefore merging two restrictions result in a new one.
-     * The reason behind this choice is that it allow a great flexibility in the way the merging can done while
-     * preventing any side effect.</p>
-     *
-     * @param otherRestriction the restriction to merge into this one
-     * @return the restriction resulting of the merge
-     * @throws InvalidRequestException if the restrictions cannot be merged
+     * @param indexGroup an index group
+     * @return {@code true} if this would need filtering if {@code indexGroup} were used, {@code false} otherwise
      */
-    public Restriction mergeWith(Restriction otherRestriction) throws InvalidRequestException;
+    boolean needsFiltering(Index.Group indexGroup);
 
     /**
      * Check if the restriction is on indexed columns.
      *
-     * @param indexManager the index manager
-     * @return <code>true</code> if the restriction is on indexed columns, <code>false</code>
+     * @param indexes the available indexes
+     * @return <code>true</code> if the restriction is on indexed columns, <code>false</code> otherwise
      */
-    public boolean hasSupportingIndex(SecondaryIndexManager indexManager);
+    default boolean hasSupportingIndex(Iterable<Index> indexes)
+    {
+        return findSupportingIndex(indexes) != null;
+    }
+
+    /**
+     * Find the first index supporting this restriction.
+     *
+     * @param indexes the available indexes
+     * @return an {@code Index} if the restriction is on indexed columns, {@code null} otherwise.
+     */
+    Index findSupportingIndex(Iterable<Index> indexes);
 
     /**
      * Adds to the specified row filter the expressions corresponding to this <code>Restriction</code>.
      *
      * @param filter the row filter to add expressions to
-     * @param indexManager the secondary index manager
+     * @param indexRegistry the index registry
      * @param options the query options
-     * @throws InvalidRequestException if this <code>Restriction</code> cannot be converted into a row filter
      */
-    public void addRowFilterTo(RowFilter filter,
-                               SecondaryIndexManager indexManager,
-                               QueryOptions options)
-                               throws InvalidRequestException;
-
-    /**
-     * Appends the values of this <code>Restriction</code> to the specified builder.
-     *
-     * @param builder the <code>MultiCBuilder</code> to append to.
-     * @param options the query options
-     * @return the <code>MultiCBuilder</code>
-     */
-    public MultiCBuilder appendTo(MultiCBuilder builder, QueryOptions options);
-
-    /**
-     * Appends the values of the <code>Restriction</code> for the specified bound to the specified builder.
-     *
-     * @param builder the <code>MultiCBuilder</code> to append to.
-     * @param bound the bound
-     * @param options the query options
-     * @return the <code>MultiCBuilder</code>
-     */
-    public MultiCBuilder appendBoundTo(MultiCBuilder builder, Bound bound, QueryOptions options);
+    void addToRowFilter(RowFilter filter,
+                        IndexRegistry indexRegistry,
+                        QueryOptions options);
 }

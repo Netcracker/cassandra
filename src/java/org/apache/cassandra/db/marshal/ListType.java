@@ -18,31 +18,41 @@
 package org.apache.cassandra.db.marshal;
 
 import java.nio.ByteBuffer;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Iterator;
+import java.util.List;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Consumer;
 
-import org.apache.cassandra.cql3.Json;
-import org.apache.cassandra.cql3.Lists;
-import org.apache.cassandra.cql3.Term;
+import javax.annotation.Nullable;
+
+import org.apache.cassandra.cql3.terms.MultiElements;
+import org.apache.cassandra.cql3.terms.Term;
 import org.apache.cassandra.db.rows.Cell;
+import org.apache.cassandra.db.rows.ColumnData;
+import org.apache.cassandra.db.rows.ComplexColumnData;
 import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.exceptions.SyntaxException;
-import org.apache.cassandra.serializers.CollectionSerializer;
-import org.apache.cassandra.serializers.MarshalException;
 import org.apache.cassandra.serializers.ListSerializer;
+import org.apache.cassandra.serializers.MarshalException;
+import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.transport.ProtocolVersion;
+import org.apache.cassandra.utils.JsonUtils;
+import org.apache.cassandra.utils.TimeUUID;
+import org.apache.cassandra.utils.bytecomparable.ByteComparable.Version;
+import org.apache.cassandra.utils.bytecomparable.ByteSource;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import static org.apache.cassandra.cql3.statements.RequestValidations.checkFalse;
 
 public class ListType<T> extends CollectionType<List<T>>
 {
-    private static final Logger logger = LoggerFactory.getLogger(ListType.class);
-
     // interning instances
-    private static final Map<AbstractType<?>, ListType> instances = new HashMap<>();
-    private static final Map<AbstractType<?>, ListType> frozenInstances = new HashMap<>();
+    private static final ConcurrentHashMap<AbstractType<?>, ListType> instances = new ConcurrentHashMap<>();
+    private static final ConcurrentHashMap<AbstractType<?>, ListType> frozenInstances = new ConcurrentHashMap<>();
 
     private final AbstractType<T> elements;
-    public final ListSerializer<T> serializer;
+    private final ListSerializer<T> serializer;
     private final boolean isMultiCell;
 
     public static ListType<?> getInstance(TypeParser parser) throws ConfigurationException, SyntaxException
@@ -51,19 +61,16 @@ public class ListType<T> extends CollectionType<List<T>>
         if (l.size() != 1)
             throw new ConfigurationException("ListType takes exactly 1 type parameter");
 
-        return getInstance(l.get(0), true);
+        return getInstance(l.get(0).freeze(), true);
     }
 
-    public static synchronized <T> ListType<T> getInstance(AbstractType<T> elements, boolean isMultiCell)
+    public static <T> ListType<T> getInstance(AbstractType<T> elements, boolean isMultiCell)
     {
-        Map<AbstractType<?>, ListType> internMap = isMultiCell ? instances : frozenInstances;
+        ConcurrentHashMap<AbstractType<?>, ListType> internMap = isMultiCell ? instances : frozenInstances;
         ListType<T> t = internMap.get(elements);
-        if (t == null)
-        {
-            t = new ListType<T>(elements, isMultiCell);
-            internMap.put(elements, t);
-        }
-        return t;
+        return null == t
+             ? internMap.computeIfAbsent(elements, k -> new ListType<>(k, isMultiCell))
+             : t;
     }
 
     private ListType(AbstractType<T> elements, boolean isMultiCell)
@@ -75,9 +82,32 @@ public class ListType<T> extends CollectionType<List<T>>
     }
 
     @Override
-    public boolean referencesUserType(String userTypeName)
+    public <V> boolean referencesUserType(V name, ValueAccessor<V> accessor)
     {
-        return getElementsType().referencesUserType(userTypeName);
+        return elements.referencesUserType(name, accessor);
+    }
+
+    @Override
+    public ListType<?> withUpdatedUserType(UserType udt)
+    {
+        if (!referencesUserType(udt.name))
+            return this;
+
+        (isMultiCell ? instances : frozenInstances).remove(elements);
+
+        return getInstance(elements.withUpdatedUserType(udt), isMultiCell);
+    }
+
+    @Override
+    public AbstractType<?> expandUserTypes()
+    {
+        return getInstance(elements.expandUserTypes(), isMultiCell);
+    }
+
+    @Override
+    public boolean referencesDuration()
+    {
+        return getElementsType().referencesDuration();
     }
 
     public AbstractType<T> getElementsType()
@@ -85,7 +115,7 @@ public class ListType<T> extends CollectionType<List<T>>
         return elements;
     }
 
-    public AbstractType<UUID> nameComparator()
+    public AbstractType<TimeUUID> nameComparator()
     {
         return TimeUUIDType.instance;
     }
@@ -101,12 +131,34 @@ public class ListType<T> extends CollectionType<List<T>>
     }
 
     @Override
-    public AbstractType<?> freeze()
+    public ListType<T> freeze()
     {
-        if (isMultiCell)
-            return getInstance(this.elements, false);
-        else
+        // freeze elements to match org.apache.cassandra.cql3.CQL3Type.Raw.RawCollection.freeze
+        return isMultiCell ? getInstance(this.elements.freeze(), false) : this;
+    }
+
+    @Override
+    public AbstractType<?> unfreeze()
+    {
+        return isMultiCell ? this : getInstance(this.elements, true);
+    }
+
+    @Override
+    public AbstractType<?> freezeNestedMulticellTypes()
+    {
+        if (!isMultiCell())
             return this;
+
+        if (elements.isFreezable() && elements.isMultiCell())
+            return getInstance(elements.freeze(), isMultiCell);
+
+        return getInstance(elements.freezeNestedMulticellTypes(), isMultiCell);
+    }
+
+    @Override
+    public List<AbstractType<?>> subTypes()
+    {
+        return Collections.singletonList(elements);
     }
 
     @Override
@@ -119,44 +171,31 @@ public class ListType<T> extends CollectionType<List<T>>
     public boolean isCompatibleWithFrozen(CollectionType<?> previous)
     {
         assert !isMultiCell;
-        return this.elements.isCompatibleWith(((ListType) previous).elements);
+        return this.elements.isCompatibleWith(((ListType<?>) previous).elements);
     }
 
     @Override
     public boolean isValueCompatibleWithFrozen(CollectionType<?> previous)
     {
         assert !isMultiCell;
-        return this.elements.isValueCompatibleWithInternal(((ListType) previous).elements);
+        return this.elements.isValueCompatibleWithInternal(((ListType<?>) previous).elements);
+    }
+
+    public <VL, VR> int compareCustom(VL left, ValueAccessor<VL> accessorL, VR right, ValueAccessor<VR> accessorR)
+    {
+        return compareListOrSet(elements, left, accessorL, right, accessorR);
     }
 
     @Override
-    public int compareCustom(ByteBuffer o1, ByteBuffer o2)
+    public <V> ByteSource asComparableBytes(ValueAccessor<V> accessor, V data, Version version)
     {
-        return compareListOrSet(elements, o1, o2);
+        return asComparableBytesListOrSet(getElementsType(), accessor, data, version);
     }
 
-    static int compareListOrSet(AbstractType<?> elementsComparator, ByteBuffer o1, ByteBuffer o2)
+    @Override
+    public <V> V fromComparableBytes(ValueAccessor<V> accessor, ByteSource.Peekable comparableBytes, Version version)
     {
-        // Note that this is only used if the collection is frozen
-        if (!o1.hasRemaining() || !o2.hasRemaining())
-            return o1.hasRemaining() ? 1 : o2.hasRemaining() ? -1 : 0;
-
-        ByteBuffer bb1 = o1.duplicate();
-        ByteBuffer bb2 = o2.duplicate();
-
-        int size1 = CollectionSerializer.readCollectionSize(bb1, 3);
-        int size2 = CollectionSerializer.readCollectionSize(bb2, 3);
-
-        for (int i = 0; i < Math.min(size1, size2); i++)
-        {
-            ByteBuffer v1 = CollectionSerializer.readValue(bb1, 3);
-            ByteBuffer v2 = CollectionSerializer.readValue(bb2, 3);
-            int cmp = elementsComparator.compare(v1, v2);
-            if (cmp != 0)
-                return cmp;
-        }
-
-        return size1 == size2 ? 0 : (size1 < size2 ? -1 : 1);
+        return fromComparableBytesListOrSet(accessor, comparableBytes, version, getElementsType());
     }
 
     @Override
@@ -174,12 +213,12 @@ public class ListType<T> extends CollectionType<List<T>>
         return sb.toString();
     }
 
-    public List<ByteBuffer> serializedValues(Iterator<Cell> cells)
+    public List<ByteBuffer> serializedValues(Iterator<Cell<?>> cells)
     {
         assert isMultiCell;
         List<ByteBuffer> bbs = new ArrayList<ByteBuffer>();
         while (cells.hasNext())
-            bbs.add(cells.next().value());
+            bbs.add(cells.next().buffer());
         return bbs;
     }
 
@@ -187,13 +226,13 @@ public class ListType<T> extends CollectionType<List<T>>
     public Term fromJSONObject(Object parsed) throws MarshalException
     {
         if (parsed instanceof String)
-            parsed = Json.decodeJson((String) parsed);
+            parsed = JsonUtils.decodeJson((String) parsed);
 
         if (!(parsed instanceof List))
             throw new MarshalException(String.format(
                     "Expected a list, but got a %s: %s", parsed.getClass().getSimpleName(), parsed));
 
-        List list = (List) parsed;
+        List<?> list = (List<?>) parsed;
         List<Term> terms = new ArrayList<>(list.size());
         for (Object element : list)
         {
@@ -202,26 +241,97 @@ public class ListType<T> extends CollectionType<List<T>>
             terms.add(elements.fromJSONObject(element));
         }
 
-        return new Lists.DelayedValue(terms);
+        return new MultiElements.DelayedValue(this, terms);
     }
 
-    public static String setOrListToJsonString(ByteBuffer buffer, AbstractType elementsType, int protocolVersion)
+    public ByteBuffer getSliceFromSerialized(ByteBuffer collection, ByteBuffer from, ByteBuffer to)
     {
-        ByteBuffer value = buffer.duplicate();
-        StringBuilder sb = new StringBuilder("[");
-        int size = CollectionSerializer.readCollectionSize(value, protocolVersion);
-        for (int i = 0; i < size; i++)
-        {
-            if (i > 0)
-                sb.append(", ");
-            sb.append(elementsType.toJSONString(CollectionSerializer.readValue(value, protocolVersion), protocolVersion));
-        }
-        return sb.append("]").toString();
+        // We don't support slicing on lists so we don't need that function
+        throw new UnsupportedOperationException();
     }
 
     @Override
-    public String toJSONString(ByteBuffer buffer, int protocolVersion)
+    public String toJSONString(ByteBuffer buffer, ProtocolVersion protocolVersion)
     {
         return setOrListToJsonString(buffer, elements, protocolVersion);
+    }
+
+    @Override
+    public void forEach(ByteBuffer input, Consumer<ByteBuffer> action)
+    {
+        serializer.forEach(input, action);
+    }
+
+    @Override
+    public ByteBuffer getMaskedValue()
+    {
+        return decompose(Collections.emptyList());
+    }
+
+    @Override
+    public List<ByteBuffer> filterSortAndValidateElements(List<ByteBuffer> buffers)
+    {
+        for (ByteBuffer buffer: buffers)
+        {
+            if (buffer == null)
+                throw new MarshalException("null is not supported inside collections");
+            elements.validate(buffer);
+        }
+        return buffers;
+    }
+
+    @Override
+    protected int compareNextCell(Iterator<Cell<?>> cellIterator, Iterator<ByteBuffer> elementIter)
+    {
+        return getElementsType().compare(cellIterator.next().buffer(), elementIter.next());
+    }
+
+    @Override
+    public boolean contains(ComplexColumnData columnData, ByteBuffer value)
+    {
+        Iterator<Cell<?>> iter = columnData.iterator();
+        while(iter.hasNext())
+        {
+            ByteBuffer cellValue = iter.next().buffer();
+            if(valueComparator().compare(cellValue, value) == 0)
+                return true;
+        }
+        return false;
+    }
+
+    @Override
+    public AbstractType<?> elementType(ByteBuffer keyOrIndex)
+    {
+        return getElementsType();
+    }
+
+    @Override
+    public ByteBuffer getElement(@Nullable ColumnData columnData, ByteBuffer keyOrIndex)
+    {
+        if (columnData == null)
+            return null;
+
+        int idx = listIndex(keyOrIndex);
+
+        if (isMultiCell())
+        {
+            ComplexColumnData complexColumnData = (ComplexColumnData) columnData;
+
+            if (idx >= complexColumnData.cellsCount())
+                return null;
+
+            Cell<?> cell = complexColumnData.getCellByIndex(idx);
+            return cell == null ? null : cell.buffer();
+        }
+
+        List<ByteBuffer> cells = unpack(((Cell<?>) columnData).buffer());
+        return idx >= cells.size() ? null : cells.get(idx);
+    }
+
+    private int listIndex(ByteBuffer index)
+    {
+        int idx = ByteBufferUtil.toInt(index);
+        checkFalse(idx < 0, "Invalid negative list index %d", idx);
+        return idx;
     }
 }

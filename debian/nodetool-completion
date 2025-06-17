@@ -14,7 +14,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-have nodetool && have cqlsh &&
+#
+_have nodetool && _have cqlsh &&
 {
 
     show_keyspaces()
@@ -70,31 +71,43 @@ have nodetool && have cqlsh &&
 
         local shopt='
             bootstrap
+            clientstats
             compactionhistory
             compactionstats
             decommission
             describecluster
+            disableauditlog
             disablebackup
             disablebinary
+            disablefullquerylog
             disablegossip
             disablehandoff
             disablehintsfordc
-            disablethrift
+            disableoldprotocolversions
             drain
+            enableauditlog
             enablebackup
             enablebinary
+            enablefullquerylog
             enablegossip
             enablehandoff
             enablehintsfordc
-            enablethrift
+            enableoldprotocolversions
             failuredetector
             gcstats
+            getbatchlogreplaythrottle
             getcompactionthroughput
+            getconcurrentcompactors
+            getconcurrentviewbuilders
             getinterdcstreamthroughput
             getlogginglevels
+            getmaxhintwindow
+            getseeds
             getstreamthroughput
+            gettimeout
             gettraceprobability
             gossipinfo
+            handoffwindow
             help
             invalidatecountercache
             invalidatekeycache
@@ -106,20 +119,28 @@ have nodetool && have cqlsh &&
             rangekeysample
             refreshsizeestimates
             reloadlocalschema
+            reloadseeds
+            reloadssl
             reloadtriggers
+            repair_admin
             replaybatchlog
+            resetfullquerylog
             resetlocalschema
             resumehandoff
             ring
+            setbatchlogreplaythrottle
+            setconcurrentcompactors
+            setconcurrentviewbuilders
             sethintedhandoffthrottlekb
             setinterdcstreamthroughput
             setlogginglevel
+            setmaxhintwindow
+            settimeout
             status
             statusbackup
             statusbinary
             statusgossip
             statushandoff
-            statusthrift
             stopdaemon
             tablestats
             tpstats
@@ -135,15 +156,20 @@ have nodetool && have cqlsh &&
             disableautocompaction
             enableautocompaction
             flush
+            garbagecollect
             getcompactionthreshold
             getendpoints
+            getreplicas
             getsstables
+            import
             info
             move
             netstats
+            profileload
             rebuild
             rebuild_index
             refresh
+            relocatesstables
             removenode
             repair
             scrub
@@ -154,12 +180,14 @@ have nodetool && have cqlsh &&
             setstreamthroughput
             settraceprobability
             snapshot
+            statusautocompaction
             stop
             tablehistograms
             toppartitions
             truncatehints
             upgradesstables
             verify
+            viewbuildstatus
 	    '
 
         local optwks='
@@ -168,18 +196,25 @@ have nodetool && have cqlsh &&
             compact
             describering
             flush
+            garbagecollect
             getcompactionthreshold
             getendpoints
+            getreplicas
             getsstables
+            import
+            profileload
             rebuild_index
             refresh
+            relocatesstables
             repair
             scrub
             setcompactionthreshold
             snapshot
+            statusautocompaction
             tablehistograms
             toppartitions
             verify
+            viewbuildstatus
             '
 
         local optwcfs='
@@ -188,8 +223,14 @@ have nodetool && have cqlsh &&
             disableautocompaction
             enableautocompaction
             flush
+            garbagecollect
+            getreplicas
+            import
+            profileload
+            relocatesstables
             repair
             scrub
+            statusautocompaction
             toppartitions
             upgradesstables
             verify
@@ -234,7 +275,7 @@ have nodetool && have cqlsh &&
             fi
         elif [[ $COMP_CWORD -eq 3 ]] ; then
             case "${COMP_WORDS[1]}" in
-                cleanup|compact|flush|getcompactionthreshold|getendpoints|getsstables|rebuild_index|refresh|repair|scrub|setcompactionthreshold|tablehistograms|toppartitions|verify)
+                cleanup|compact|flush|garbagecollect|getcompactionthreshold|getendpoints|getreplicas|getsstables|import|profileload|rebuild_index|refresh|relocatesstables|repair|scrub|setcompactionthreshold|statusautocompaction|tablehistograms|toppartitions|verify)
                     show_cfs ${prev} ${cur}
                     return 0
                     ;;

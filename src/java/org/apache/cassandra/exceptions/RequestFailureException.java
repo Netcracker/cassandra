@@ -17,21 +17,51 @@
  */
 package org.apache.cassandra.exceptions;
 
+import java.util.Map;
+import java.util.stream.Collectors;
+
 import org.apache.cassandra.db.ConsistencyLevel;
+import org.apache.cassandra.locator.InetAddressAndPort;
 
 public class RequestFailureException extends RequestExecutionException
 {
     public final ConsistencyLevel consistency;
     public final int received;
-    public final int failures;
     public final int blockFor;
+    public final Map<InetAddressAndPort, RequestFailureReason> failureReasonByEndpoint;
 
-    protected RequestFailureException(ExceptionCode code, ConsistencyLevel consistency, int received, int failures, int blockFor)
+    protected RequestFailureException(ExceptionCode code, ConsistencyLevel consistency, int received, int blockFor, Map<InetAddressAndPort, RequestFailureReason> failureReasonByEndpoint)
     {
-        super(code, String.format("Operation failed - received %d responses and %d failures", received, failures));
+        this(code, buildErrorMessage(received, failureReasonByEndpoint), consistency, received, blockFor, failureReasonByEndpoint);
+    }
+
+    public RequestFailureException(ExceptionCode code, String msg, ConsistencyLevel consistency, int received, int blockFor, Map<InetAddressAndPort, RequestFailureReason> failureReasonByEndpoint)
+    {
+        super(code, buildErrorMessage(msg, failureReasonByEndpoint));
         this.consistency = consistency;
         this.received = received;
-        this.failures = failures;
         this.blockFor = blockFor;
+        this.failureReasonByEndpoint = failureReasonByEndpoint;
+    }
+
+    private static String buildErrorMessage(int received, Map<InetAddressAndPort, RequestFailureReason> failures)
+    {
+        return String.format("received %d responses and %d failures", received, failures.size());
+    }
+
+    private static String buildFailureString(Map<InetAddressAndPort, RequestFailureReason> failures)
+    {
+        return failures.entrySet().stream()
+                       .map(e -> String.format("%s from %s", e.getValue(), e.getKey()))
+                       .collect(Collectors.joining(", "));
+    }
+
+    private static String buildErrorMessage(CharSequence msg, Map<InetAddressAndPort, RequestFailureReason> failures)
+    {
+        StringBuilder sb = new StringBuilder("Operation failed - ");
+        sb.append(msg);
+        if (failures != null && !failures.isEmpty())
+            sb.append(": ").append(buildFailureString(failures));
+        return sb.toString();
     }
 }

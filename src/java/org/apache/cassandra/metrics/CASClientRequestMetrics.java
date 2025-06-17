@@ -20,30 +20,41 @@ package org.apache.cassandra.metrics;
 
 import com.codahale.metrics.Counter;
 import com.codahale.metrics.Histogram;
+import com.codahale.metrics.Meter;
 
 import static org.apache.cassandra.metrics.CassandraMetricsRegistry.Metrics;
-
 
 public class CASClientRequestMetrics extends ClientRequestMetrics
 {
     public final Histogram contention;
-    /* Used only for write  */
-    public final Counter conditionNotMet;
-
     public final Counter unfinishedCommit;
+    public final Meter unknownResult;
+    // CAS request rejected after Prepare/Promise due to migration from Paxos to Accord
+    public final Meter beginMigrationRejects;
+    // Number of times a CAS request was rejected after Propose/Accept due to migration from Paxos to Accord
+    public final Meter acceptMigrationRejects;
+    // Number of times a key was migrated from Accord to Paxos
+    public final Meter accordKeyMigrations;
 
-    public CASClientRequestMetrics(String scope) {
+    public CASClientRequestMetrics(String scope)
+    {
         super(scope);
         contention = Metrics.histogram(factory.createMetricName("ContentionHistogram"), false);
-        conditionNotMet =  Metrics.counter(factory.createMetricName("ConditionNotMet"));
-        unfinishedCommit =  Metrics.counter(factory.createMetricName("UnfinishedCommit"));
+        unfinishedCommit = Metrics.counter(factory.createMetricName("UnfinishedCommit"));
+        unknownResult = Metrics.meter(factory.createMetricName("UnknownResult"));
+        beginMigrationRejects = Metrics.meter(factory.createMetricName("PaxosBeginMigrationRejects"));
+        acceptMigrationRejects = Metrics.meter(factory.createMetricName("PaxosAcceptMigrationRejects"));
+        accordKeyMigrations = Metrics.meter(factory.createMetricName("AccordKeyMigrations"));
     }
 
     public void release()
     {
         super.release();
         Metrics.remove(factory.createMetricName("ContentionHistogram"));
-        Metrics.remove(factory.createMetricName("ConditionNotMet"));
         Metrics.remove(factory.createMetricName("UnfinishedCommit"));
+        Metrics.remove(factory.createMetricName("UnknownResult"));
+        Metrics.remove(factory.createMetricName("PaxosBeginMigrationRejects"));
+        Metrics.remove(factory.createMetricName("PaxosAcceptMigrationRejects"));
+        Metrics.remove(factory.createMetricName("AccordKeyMigrations"));
     }
 }

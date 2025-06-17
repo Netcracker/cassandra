@@ -26,7 +26,7 @@ import org.apache.cassandra.db.compaction.writers.CompactionAwareWriter;
 import org.apache.cassandra.db.compaction.writers.MajorLeveledCompactionWriter;
 import org.apache.cassandra.db.compaction.writers.MaxSSTableSizeWriter;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
-import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
+import org.apache.cassandra.db.lifecycle.ILifecycleTransaction;
 
 public class LeveledCompactionTask extends CompactionTask
 {
@@ -34,7 +34,7 @@ public class LeveledCompactionTask extends CompactionTask
     private final long maxSSTableBytes;
     private final boolean majorCompaction;
 
-    public LeveledCompactionTask(ColumnFamilyStore cfs, LifecycleTransaction txn, int level, int gcBefore, long maxSSTableBytes, boolean majorCompaction)
+    public LeveledCompactionTask(ColumnFamilyStore cfs, ILifecycleTransaction txn, int level, long gcBefore, long maxSSTableBytes, boolean majorCompaction)
     {
         super(cfs, txn, gcBefore);
         this.level = level;
@@ -45,18 +45,18 @@ public class LeveledCompactionTask extends CompactionTask
     @Override
     public CompactionAwareWriter getCompactionAwareWriter(ColumnFamilyStore cfs,
                                                           Directories directories,
-                                                          LifecycleTransaction txn,
+                                                          ILifecycleTransaction txn,
                                                           Set<SSTableReader> nonExpiredSSTables)
     {
         if (majorCompaction)
-            return new MajorLeveledCompactionWriter(cfs, directories, txn, nonExpiredSSTables, maxSSTableBytes, false, false);
-        return new MaxSSTableSizeWriter(cfs, directories, txn, nonExpiredSSTables, maxSSTableBytes, getLevel(), false, false);
+            return new MajorLeveledCompactionWriter(cfs, directories, txn, nonExpiredSSTables, maxSSTableBytes, false);
+        return new MaxSSTableSizeWriter(cfs, directories, txn, nonExpiredSSTables, maxSSTableBytes, getLevel(), false);
     }
 
     @Override
     protected boolean partialCompactionsAcceptable()
     {
-        throw new UnsupportedOperationException("This is now handled in reduceScopeForLimitedSpace");
+        return level == 0;
     }
 
     protected int getLevel()
@@ -65,9 +65,9 @@ public class LeveledCompactionTask extends CompactionTask
     }
 
     @Override
-    public boolean reduceScopeForLimitedSpace(long expectedSize)
+    public boolean reduceScopeForLimitedSpace(Set<SSTableReader> nonExpiredSSTables, long expectedSize)
     {
-        if (transaction.originals().size() > 1 && level <= 1)
+        if (nonExpiredSSTables.size() > 1 && level <= 1)
         {
             // Try again w/o the largest one.
             logger.warn("insufficient space to do L0 -> L{} compaction. {}MiB required, {} for compaction {}",
@@ -82,7 +82,7 @@ public class LeveledCompactionTask extends CompactionTask
             // This suboptimal but ok since the caller will unmark all the sstables at the end.
             int l0SSTableCount = 0;
             SSTableReader largestL0SSTable = null;
-            for (SSTableReader sstable : transaction.originals())
+            for (SSTableReader sstable : nonExpiredSSTables)
             {
                 if (sstable.getSSTableLevel() == 0)
                 {
@@ -100,6 +100,7 @@ public class LeveledCompactionTask extends CompactionTask
                             largestL0SSTable.onDiskLength(),
                             transaction.opId());
                 transaction.cancel(largestL0SSTable);
+                nonExpiredSSTables.remove(largestL0SSTable);
                 return true;
             }
         }

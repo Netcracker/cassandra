@@ -25,11 +25,14 @@ import java.util.Arrays;
 import org.junit.BeforeClass;
 import org.junit.Test;
 
-import static junit.framework.Assert.assertNull;
-import static org.junit.Assert.assertEquals;
+import org.apache.cassandra.Util;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.cql3.CQLTester;
+import org.apache.cassandra.cql3.restrictions.StatementRestrictions;
 import org.apache.cassandra.dht.ByteOrderedPartitioner;
+
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNull;
 
 /**
  * SELECT statement tests that require a ByteOrderedPartitioner
@@ -43,6 +46,108 @@ public class SelectOrderedPartitionerTest extends CQLTester
     }
 
     @Test
+    public void testTokenAndIndex() throws Throwable
+    {
+        Util.assumeLegacySecondaryIndex();
+        createTable("CREATE TABLE %s (a int, b int, c int, d int, PRIMARY KEY (a, b, c))");
+        createIndex("CREATE INDEX ON %s(c)");
+
+        for (int i = 0; i < 10; i++)
+        {
+            execute("INSERT INTO %s (a,b,c,d) VALUES (?, ?, ?, ?)", i, i, i, i);
+            execute("INSERT INTO %s (a,b,c,d) VALUES (?, ?, ?, ?)", i, i + 10, i + 10, i + 10);
+        }
+
+        beforeAndAfterFlush(() -> {
+            assertRows(execute("SELECT * FROM %s WHERE token(a) > token(8) AND a = 9 AND c = 9 ALLOW FILTERING"),
+                       row(9, 9, 9, 9));
+
+            assertRows(execute("SELECT * FROM %s WHERE token(a) > token(8) AND a > 8 AND c = 9 ALLOW FILTERING"),
+                       row(9, 9, 9, 9));
+        });
+    }
+
+    @Test
+    public void testFilteringOnAllPartitionKeysWithTokenRestriction() throws Throwable
+    {
+        createTable("CREATE TABLE %s (a int, b int, c int, d int, PRIMARY KEY ((a, b), c))");
+
+        for (int i = 0; i < 10; i++)
+        {
+            execute("INSERT INTO %s (a,b,c,d) VALUES (?, ?, ?, ?)", i, i, i, i);
+            execute("INSERT INTO %s (a,b,c,d) VALUES (?, ?, ?, ?)", i, i + 10, i + 10, i + 10);
+        }
+
+        assertEmpty(execute("SELECT * FROM %s WHERE token(a, b) > token(10, 10)"));
+        assertEmpty(execute("SELECT * FROM %s WHERE token(a, b) > token(10, 10) AND a < 8 AND b < 8 ALLOW FILTERING"));
+        assertRows(execute("SELECT * FROM %s WHERE token(a, b) > token(5, 5) AND a < 8 AND b < 8 ALLOW FILTERING"),
+                   row(6, 6, 6, 6),
+                   row(7, 7, 7, 7));
+    }
+
+    @Test
+    public void testFilteringOnPartitionKeyWithToken() throws Throwable
+    {
+        Util.assumeLegacySecondaryIndex();
+        createTable("CREATE TABLE %s (a int, b int, c int, d int, PRIMARY KEY ((a, b), c))");
+        createIndex("CREATE INDEX ON %s(d)");
+
+        for (int i = 0; i < 10; i++)
+        {
+            execute("INSERT INTO %s (a,b,c,d) VALUES (?, ?, ?, ?)", i, i, i, i);
+            execute("INSERT INTO %s (a,b,c,d) VALUES (?, ?, ?, ?)", i, i + 10, i + 10, i + 10);
+        }
+
+        beforeAndAfterFlush(() -> {
+            assertRowsIgnoringOrder(execute("SELECT * FROM %s WHERE token(a, b) > token(5, 10) AND b < 8 ALLOW FILTERING"),
+                                    row(6, 6, 6, 6),
+                                    row(7, 7, 7, 7));
+
+            assertRows(execute("SELECT * FROM %s WHERE token(a, b) > token(8, 10) AND a = 9 ALLOW FILTERING"),
+                       row(9, 9, 9, 9),
+                       row(9, 19, 19, 19));
+
+            assertRows(execute("SELECT * FROM %s WHERE token(a, b) > token(8, 10) AND a = 9 AND d = 9 ALLOW FILTERING"),
+                       row(9, 9, 9, 9));
+
+            assertRows(execute("SELECT * FROM %s WHERE token(a, b) > token(8, 10) AND a > 8 AND b > 8 AND d = 9 ALLOW FILTERING"),
+                       row(9, 9, 9, 9));
+
+            assertRows(execute("SELECT * FROM %s WHERE a = 9 AND b = 9  AND token(a, b) > token(8, 10) AND d = 9 ALLOW FILTERING"),
+                       row(9, 9, 9, 9));
+
+            assertRows(execute("SELECT * FROM %s WHERE token(a, b) > token(8, 10) AND a = 9 AND c = 19 ALLOW FILTERING"),
+                       row(9, 19, 19, 19));
+
+            assertEmpty(execute("SELECT * FROM %s WHERE token(a, b) = token(8, 8) AND b = 9 ALLOW FILTERING"));
+        });
+    }
+
+    @Test
+    public void testTokenAndCollections() throws Throwable
+    {
+        createTable("CREATE TABLE %s (a frozen<map<int, int>>, b int, c int, PRIMARY KEY (a, b))");
+
+        for (int i = 0; i < 10; i++)
+        {
+            execute("INSERT INTO %s (a,b,c) VALUES (?, ?, ?)", map(i, i), i, i);
+            execute("INSERT INTO %s (a,b,c) VALUES (?, ?, ?)", map(i, i, 100, 200), i + 10, i + 10);
+        }
+
+        beforeAndAfterFlush(() -> {
+            assertRows(execute("SELECT * FROM %s WHERE token(a) > token({0: 0}) AND a CONTAINS KEY 9 ALLOW FILTERING"),
+                                    row(map(9, 9), 9, 9),
+                                    row(map(9, 9, 100, 200), 19, 19));
+
+            assertRows(execute("SELECT * FROM %s WHERE token(a) > token({0: 0}) AND a CONTAINS KEY 9 AND a CONTAINS 200 ALLOW FILTERING"),
+                       row(map(9, 9, 100, 200), 19, 19));
+
+            assertRows(execute("SELECT * FROM %s WHERE token(a) > token({0: 0}) AND a CONTAINS KEY 9 AND b = 19 ALLOW FILTERING"),
+                       row(map(9, 9, 100, 200), 19, 19));
+        });
+    }
+
+    @Test
     public void testTokenFunctionWithSingleColumnPartitionKey() throws Throwable
     {
         createTable("CREATE TABLE IF NOT EXISTS %s (a int PRIMARY KEY, b text)");
@@ -50,23 +155,30 @@ public class SelectOrderedPartitionerTest extends CQLTester
 
         assertRows(execute("SELECT * FROM %s WHERE token(a) >= token(?)", 0), row(0, "a"));
         assertRows(execute("SELECT * FROM %s WHERE token(a) >= token(?) and token(a) < token(?)", 0, 1), row(0, "a"));
+        assertRows(execute("SELECT * FROM %s WHERE token(a) BETWEEN token(?) and token(?)", 0, 1), row(0, "a"));
         assertInvalid("SELECT * FROM %s WHERE token(a) > token(?)", "a");
         assertInvalidMessage("The token() function must contains only partition key components",
                              "SELECT * FROM %s WHERE token(a, b) >= token(?, ?)", "b", 0);
         assertInvalidMessage("More than one restriction was found for the start bound on a",
                              "SELECT * FROM %s WHERE token(a) >= token(?) and token(a) >= token(?)", 0, 1);
-        assertInvalidMessage("Columns \"a\" cannot be restricted by both an equality and an inequality relation",
+        assertInvalidMessage("a cannot be restricted by more than one relation if it includes an Equal",
                              "SELECT * FROM %s WHERE token(a) >= token(?) and token(a) = token(?)", 0, 1);
         assertInvalidSyntax("SELECT * FROM %s WHERE token(a) = token(?) and token(a) IN (token(?))", 0, 1);
 
         assertInvalidMessage("More than one restriction was found for the start bound on a",
                              "SELECT * FROM %s WHERE token(a) > token(?) AND token(a) > token(?)", 1, 2);
+        assertInvalidMessage("More than one restriction was found for the start bound on a",
+                             "SELECT * FROM %s WHERE token(a) > token(?) AND token(a) BETWEEN token(?) AND token(?)", 1, 2, 3);
         assertInvalidMessage("More than one restriction was found for the end bound on a",
                              "SELECT * FROM %s WHERE token(a) <= token(?) AND token(a) < token(?)", 1, 2);
-        assertInvalidMessage("Columns \"a\" cannot be restricted by both an equality and an inequality relation",
+        assertInvalidMessage("More than one restriction was found for the end bound on a",
+                             "SELECT * FROM %s WHERE token(a) <= token(?) AND token(a) BETWEEN token(?) AND token(?)", 1, 2, 3);
+        assertInvalidMessage("a cannot be restricted by more than one relation if it includes an Equal",
                              "SELECT * FROM %s WHERE token(a) > token(?) AND token(a) = token(?)", 1, 2);
         assertInvalidMessage("a cannot be restricted by more than one relation if it includes an Equal",
                              "SELECT * FROM %s WHERE  token(a) = token(?) AND token(a) > token(?)", 1, 2);
+        assertInvalidMessage("a cannot be restricted by more than one relation if it includes an Equal",
+                             "SELECT * FROM %s WHERE  token(a) = token(?) AND token(a) BETWEEN token(?) AND token(?)", 1, 2, 3);
     }
 
     @Test
@@ -88,9 +200,10 @@ public class SelectOrderedPartitionerTest extends CQLTester
         assertRows(execute("SELECT * FROM %s WHERE token(a, b) > token(?, ?)", 0, "a"),
                    row(0, "b"),
                    row(0, "c"));
-        assertRows(execute("SELECT * FROM %s WHERE token(a, b) > token(?, ?) and token(a, b) < token(?, ?)",
-                           0, "a",
-                           0, "d"),
+        assertRows(execute("SELECT * FROM %s WHERE token(a, b) > token(?, ?) and token(a, b) < token(?, ?)", 0, "a", 0, "d"),
+                   row(0, "b"),
+                   row(0, "c"));
+        assertRows(execute("SELECT * FROM %s WHERE token(a, b) between token(?, ?) and token(?, ?)", 0, "b", 0, "d"),
                    row(0, "b"),
                    row(0, "c"));
         assertInvalidMessage("The token() function must be applied to all partition key components or none of them",
@@ -98,10 +211,17 @@ public class SelectOrderedPartitionerTest extends CQLTester
         assertInvalidMessage("The token() function must be applied to all partition key components or none of them",
                              "SELECT * FROM %s WHERE token(a) > token(?, ?) and token(a) < token(?, ?) and token(b) > token(?, ?) ",
                              0, "a", 0, "d", 0, "a");
+        assertInvalidMessage("The token() function must be applied to all partition key components or none of them",
+                             "SELECT * FROM %s WHERE token(a) BETWEEN token(?, ?) AND token(?, ?) and token(b) > token(?, ?) ",
+                             0, "a", 0, "d", 0, "a");
         assertInvalidMessage("The token function arguments must be in the partition key order: a, b",
                              "SELECT * FROM %s WHERE token(b, a) > token(0, 'c')");
+        assertInvalidMessage("The token function arguments must be in the partition key order: a, b",
+                             "SELECT * FROM %s WHERE token(b, a) BETWEEN token(0, 'c') AND token(0, 'f')");
         assertInvalidMessage("The token() function must be applied to all partition key components or none of them",
                              "SELECT * FROM %s WHERE token(a, b) > token(?, ?) and token(b) < token(?, ?)", 0, "a", 0, "a");
+        assertInvalidMessage("The token() function must be applied to all partition key components or none of them",
+                             "SELECT * FROM %s WHERE token(a) > token(?, ?) and token(b) > token(?, ?)", 0, "a", 0, "a");
         assertInvalidMessage("The token() function must be applied to all partition key components or none of them",
                              "SELECT * FROM %s WHERE token(a) > token(?, ?) and token(b) > token(?, ?)", 0, "a", 0, "a");
     }
@@ -116,6 +236,17 @@ public class SelectOrderedPartitionerTest extends CQLTester
         execute("INSERT INTO %s (a, b) VALUES (2, 2);");
         execute("INSERT INTO %s (a, b) VALUES (3, 3);");
         execute("INSERT INTO %s (a, b) VALUES (4, 4);");
+
+        assertRows(execute("SELECT * FROM %s WHERE token(a) > token(?);", 1),
+                   row(2, 2),
+                   row(3, 3),
+                   row(4, 4));
+        assertRows(execute("SELECT * FROM %s WHERE token(a) < token(?);", 1),
+                   row(0, 0));
+        assertRows(execute("SELECT * FROM %s WHERE token(a) >= token(?) AND token(a) <= token(?);",1, 1),
+                   row(1, 1));
+        assertRows(execute("SELECT * FROM %s WHERE token(a) > token(?) AND token(a) < token(?);",1, 1));
+
         assertRows(execute("SELECT * FROM %s WHERE a IN (?, ?);", 1, 3),
                    row(1, 1),
                    row(3, 3));
@@ -127,10 +258,11 @@ public class SelectOrderedPartitionerTest extends CQLTester
         assertRows(execute("SELECT * FROM %s WHERE token(a) > token(?) AND token(a) <= token(?) AND a IN (?, ?);",
                            1, 3, 1, 3),
                    row(3, 3));
+        assertRows(execute("SELECT * FROM %s WHERE token(a) < token(?) AND token(a) >= token(?);",
+                           1, 3));
         assertRows(execute("SELECT * FROM %s WHERE token(a) < token(?) AND token(a) >= token(?) AND a IN (?, ?);",
-                           1, 3, 1, 3),
-                   row(3, 3));
-        assertInvalidMessage("Only EQ and IN relation are supported on the partition key (unless you use the token() function)",
+                           1, 3, 1, 3));
+        assertInvalidMessage(StatementRestrictions.REQUIRES_ALLOW_FILTERING_MESSAGE,
                              "SELECT * FROM %s WHERE token(a) > token(?) AND token(a) <= token(?) AND a > ?;", 1, 3, 1);
 
         assertRows(execute("SELECT * FROM %s WHERE token(a) > token(?) AND token(a) <= token(?) AND a IN ?;",
@@ -156,6 +288,8 @@ public class SelectOrderedPartitionerTest extends CQLTester
         assertEmpty(execute("SELECT * FROM %s WHERE token(a) <= token(?) AND a = ?;", 2, 3));
         assertEmpty(execute("SELECT * FROM %s WHERE token(a) = token(?) AND a = ?;", 2, 3));
         assertRows(execute("SELECT * FROM %s WHERE token(a) >= token(?) AND token(a) <= token(?) AND a = ?;", 2, 2, 2),
+                   row(2, 2));
+        assertRows(execute("SELECT * FROM %s WHERE token(a) BETWEEN token(?) AND token(?) AND a = ?;", 2, 2, 2),
                    row(2, 2));
         assertEmpty(execute("SELECT * FROM %s WHERE token(a) >= token(?) AND token(a) < token(?) AND a = ?;", 2, 2, 2));
         assertEmpty(execute("SELECT * FROM %s WHERE token(a) > token(?) AND token(a) <= token(?) AND a = ?;", 2, 2, 2));
@@ -206,13 +340,14 @@ public class SelectOrderedPartitionerTest extends CQLTester
         assertEmpty(execute("SELECT * FROM %s WHERE b IN (?, ?) AND token(a, b) = token(?, ?) AND a = ?;",
                             0, 1, 0, 0, 1));
 
-        assertInvalidMessage("Partition key parts: b must be restricted as other parts are",
+        assertInvalidMessage(StatementRestrictions.REQUIRES_ALLOW_FILTERING_MESSAGE,
                              "SELECT * FROM %s WHERE token(a, b) > token(?, ?) AND a = ?;", 0, 0, 1);
     }
 
     @Test
     public void testMultiColumnPartitionKeyWithIndexAndTokenNonTokenRestrictionsMix() throws Throwable
     {
+        Util.assumeLegacySecondaryIndex();
         createTable("CREATE TABLE %s (a int, b int, c int, primary key((a, b)))");
         createIndex("CREATE INDEX ON %s(b)");
         createIndex("CREATE INDEX ON %s(c)");
@@ -265,7 +400,7 @@ public class SelectOrderedPartitionerTest extends CQLTester
 
         Object[][] rows = getRows(execute("SELECT v2 FROM %s"));
         assertEquals(0, rows[0][0]);
-        assertEquals(null, rows[1][0]);
+        assertNull(rows[1][0]);
         assertEquals(2, rows[2][0]);
 
         rows = getRows(execute("SELECT v2 FROM %s WHERE k = 1"));
@@ -291,19 +426,6 @@ public class SelectOrderedPartitionerTest extends CQLTester
                    row(0, 1),
                    row(1, 0),
                    row(1, 1));
-
-        // Check for dense tables too
-        createTable(" CREATE TABLE %s (k int, c int, PRIMARY KEY (k, c)) WITH COMPACT STORAGE");
-
-        for (int k = 0; k < 2; k++)
-            for (int c = 0; c < 2; c++)
-                execute("INSERT INTO %s (k, c) VALUES (?, ?)", k, c);
-
-        assertRows(execute("SELECT * FROM %s"),
-                   row(0, 0),
-                   row(0, 1),
-                   row(1, 0),
-                   row(1, 1));
     }
 
     /**
@@ -312,6 +434,7 @@ public class SelectOrderedPartitionerTest extends CQLTester
     @Test
     public void testCompositeIndexWithPK() throws Throwable
     {
+        Util.assumeLegacySecondaryIndex();
         createTable("CREATE TABLE %s (blog_id int, time1 int, time2 int, author text, content text, PRIMARY KEY (blog_id, time1, time2))");
 
         createIndex("CREATE INDEX ON %s(author)");
@@ -443,6 +566,7 @@ public class SelectOrderedPartitionerTest extends CQLTester
     @Test
     public void testIndexOnCompositeWithCollections() throws Throwable
     {
+        Util.assumeLegacySecondaryIndex();
         createTable("CREATE TABLE %s (blog_id int, time1 int, time2 int, author text, content set<text>, PRIMARY KEY (blog_id, time1, time2))");
 
         createIndex("CREATE INDEX ON %s (author)");
@@ -503,9 +627,9 @@ public class SelectOrderedPartitionerTest extends CQLTester
     public void testTokenFunctionWithInvalidColumnNames() throws Throwable
     {
         createTable("CREATE TABLE %s (a int, b int, c int, d int, PRIMARY KEY ((a, b), c))");
-        assertInvalidMessage("Undefined name e in where clause ('token(a, e) = token(0, 0)')", "SELECT * FROM %s WHERE token(a, e) = token(0, 0)");
-        assertInvalidMessage("Undefined name e in where clause ('token(a, e) > token(0, 1)')", "SELECT * FROM %s WHERE token(a, e) > token(0, 1)");
-        assertInvalidMessage("Aliases aren't allowed in the where clause ('token(a, e) = token(0, 0)')", "SELECT b AS e FROM %s WHERE token(a, e) = token(0, 0)");
-        assertInvalidMessage("Aliases aren't allowed in the where clause ('token(a, e) > token(0, 1)')", "SELECT b AS e FROM %s WHERE token(a, e) > token(0, 1)");
+        assertInvalidMessage("Undefined column name e", "SELECT * FROM %s WHERE token(a, e) = token(0, 0)");
+        assertInvalidMessage("Undefined column name e", "SELECT * FROM %s WHERE token(a, e) > token(0, 1)");
+        assertInvalidMessage("Undefined column name e", "SELECT b AS e FROM %s WHERE token(a, e) = token(0, 0)");
+        assertInvalidMessage("Undefined column name e", "SELECT b AS e FROM %s WHERE token(a, e) > token(0, 1)");
     }
 }

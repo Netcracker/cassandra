@@ -17,46 +17,59 @@
  */
 package org.apache.cassandra.hints;
 
-import java.net.InetAddress;
-import java.util.Collections;
-import java.util.UUID;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
-
+import java.util.concurrent.atomic.AtomicInteger;
 import javax.annotation.Nullable;
 
 import com.google.common.util.concurrent.Futures;
 import com.google.common.util.concurrent.ListenableFuture;
-
+import com.google.common.util.concurrent.MoreExecutors;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.BeforeClass;
 import org.junit.Test;
 
+import accord.primitives.Keys;
+import accord.primitives.TxnId;
 import com.datastax.driver.core.utils.MoreFutures;
-
 import org.apache.cassandra.SchemaLoader;
-import org.apache.cassandra.UpdateBuilder;
-import org.apache.cassandra.config.CFMetaData;
-import org.apache.cassandra.config.Schema;
-import org.apache.cassandra.db.DecoratedKey;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.db.ConsistencyLevel;
+import org.apache.cassandra.db.IMutation;
 import org.apache.cassandra.db.Mutation;
-import org.apache.cassandra.gms.IFailureDetectionEventListener;
-import org.apache.cassandra.gms.IFailureDetector;
+import org.apache.cassandra.metrics.HintsServiceMetrics;
 import org.apache.cassandra.metrics.StorageMetrics;
-import org.apache.cassandra.net.MessageIn;
 import org.apache.cassandra.net.MessagingService;
 import org.apache.cassandra.net.MockMessagingService;
 import org.apache.cassandra.net.MockMessagingSpy;
 import org.apache.cassandra.schema.KeyspaceParams;
+import org.apache.cassandra.schema.Schema;
+import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.service.StorageService;
-import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.service.accord.AccordResult;
+import org.apache.cassandra.service.accord.AccordTestUtils;
+import org.apache.cassandra.service.accord.IAccordService.IAccordResult;
+import org.apache.cassandra.service.accord.TimeOnlyRequestBookkeeping.LatencyRequestBookkeeping;
+import org.apache.cassandra.service.accord.txn.TxnData;
+import org.apache.cassandra.service.accord.txn.TxnResult;
+import org.apache.cassandra.service.consensus.migration.ConsensusMigrationMutationHelper;
+import org.apache.cassandra.tcm.ClusterMetadata;
+import org.apache.cassandra.transport.Dispatcher;
+import org.apache.cassandra.utils.MockFailureDetector;
 
-import static org.apache.cassandra.Util.dk;
-import static org.apache.cassandra.net.MockMessagingService.verb;
+import static org.apache.cassandra.Util.spinAssertEquals;
+import static org.apache.cassandra.config.CassandraRelevantProperties.HINT_DISPATCH_INTERVAL_MS;
+import static org.apache.cassandra.hints.HintsTestUtil.sendHintsAndResponses;
+import static org.apache.cassandra.hints.HintsTestUtil.sendHintsWithRetryDifferentSystemUUID;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
+import static org.mockito.ArgumentMatchers.notNull;
+import static org.mockito.Mockito.spy;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
 
 public class HintsServiceTest
 {
@@ -64,6 +77,7 @@ public class HintsServiceTest
     private static final String TABLE = "table";
 
     private final MockFailureDetector failureDetector = new MockFailureDetector();
+    private static TableMetadata metadata;
 
     @BeforeClass
     public static void defineSchema()
@@ -73,18 +87,23 @@ public class HintsServiceTest
         SchemaLoader.createKeyspace(KEYSPACE,
                 KeyspaceParams.simple(1),
                 SchemaLoader.standardCFMD(KEYSPACE, TABLE));
+        metadata = Schema.instance.getTableMetadata(KEYSPACE, TABLE);
+        HINT_DISPATCH_INTERVAL_MS.setLong(100);
+        DatabaseDescriptor.setHintsFlushPeriodInMS(100);
     }
 
     @After
     public void cleanup()
     {
         MockMessagingService.cleanup();
+        ConsensusMigrationMutationHelper.resetInstanceForTest();
     }
 
     @Before
-    public void reinstanciateService() throws ExecutionException, InterruptedException
+    public void reinstanciateService() throws Throwable
     {
-        MessagingService.instance().clearMessageSinks();
+        MessagingService.instance().inboundSink.clear();
+        MessagingService.instance().outboundSink.clear();
 
         if (!HintsService.instance.isShutDown())
         {
@@ -93,7 +112,9 @@ public class HintsServiceTest
         }
 
         failureDetector.isAlive = true;
+
         HintsService.instance = new HintsService(failureDetector);
+
         HintsService.instance.startDispatch();
     }
 
@@ -103,7 +124,7 @@ public class HintsServiceTest
         long cnt = StorageMetrics.totalHints.getCount();
 
         // create spy for hint messages
-        MockMessagingSpy spy = sendHintsAndResponses(100, -1);
+        MockMessagingSpy spy = sendHintsAndResponses(metadata, 100, -1);
 
         // metrics should have been updated with number of create hints
         assertEquals(cnt + 100, StorageMetrics.totalHints.getCount());
@@ -119,7 +140,7 @@ public class HintsServiceTest
         HintsService.instance.pauseDispatch();
 
         // create spy for hint messages
-        MockMessagingSpy spy = sendHintsAndResponses(100, -1);
+        MockMessagingSpy spy = sendHintsAndResponses(metadata, 100, -1);
 
         // we should not send any hints while paused
         ListenableFuture<Boolean> noMessagesWhilePaused = spy.interceptNoMsg(15, TimeUnit.SECONDS);
@@ -129,7 +150,7 @@ public class HintsServiceTest
             {
                 HintsService.instance.resumeDispatch();
             }
-        });
+        }, MoreExecutors.directExecutor());
 
         Futures.allAsList(
                 noMessagesWhilePaused,
@@ -142,7 +163,7 @@ public class HintsServiceTest
     public void testPageRetry() throws InterruptedException, ExecutionException, TimeoutException
     {
         // create spy for hint messages, but only create responses for 5 hints
-        MockMessagingSpy spy = sendHintsAndResponses(20, 5);
+        MockMessagingSpy spy = sendHintsAndResponses(metadata, 20, 5);
 
         Futures.allAsList(
                 // the dispatcher will always send all hints within the current page
@@ -163,7 +184,7 @@ public class HintsServiceTest
     public void testPageSeek() throws InterruptedException, ExecutionException
     {
         // create spy for hint messages, stop replying after 12k (should be on 3rd page)
-        MockMessagingSpy spy = sendHintsAndResponses(20000, 12000);
+        MockMessagingSpy spy = sendHintsAndResponses(metadata, 20000, 12000);
 
         // At this point the dispatcher will constantly retry the page we stopped acking,
         // thus we receive the same hints from the page multiple times and in total more than
@@ -181,81 +202,57 @@ public class HintsServiceTest
         assertTrue(((ChecksummedDataInput.Position) dispatchOffset).sourcePosition > 0);
     }
 
-    private MockMessagingSpy sendHintsAndResponses(int noOfHints, int noOfResponses)
+    /*
+     * Make sure that if hints from the batchlog end up needing to be executed without Accord
+     * that they are turned into
+     */
+    @Test
+    public void testHintsNeedingRehinting() throws Throwable
     {
-        // create spy for hint messages, but only create responses for noOfResponses hints
-        MessageIn<HintResponse> messageIn = MessageIn.create(FBUtilities.getBroadcastAddress(),
-                HintResponse.instance,
-                Collections.emptyMap(),
-                MessagingService.Verb.REQUEST_RESPONSE,
-                MessagingService.current_version);
+        ColumnFamilyStore cfs = ColumnFamilyStore.getIfExists(metadata.id);
+        long startWrites =  cfs.metric.writeLatency.latency.getCount();
+        HintsService.instance = spy(HintsService.instance);
+        AtomicInteger accordTxnCount = new AtomicInteger();
+        ConsensusMigrationMutationHelper.replaceInstanceForTest(
+            new ConsensusMigrationMutationHelper()
+                {
+                    int count = 0;
 
-        MockMessagingSpy spy;
-        if (noOfResponses != -1)
-        {
-            spy = MockMessagingService.when(verb(MessagingService.Verb.HINT)).respondN(messageIn, noOfResponses);
-        }
-        else
-        {
-            spy = MockMessagingService.when(verb(MessagingService.Verb.HINT)).respond(messageIn);
-        }
+                    @Override
+                    public <T extends IMutation> SplitMutation<T> splitMutationIntoAccordAndNormal(T mutation, ClusterMetadata cm)
+                    {
+                        if (count > 2)
+                            return super.splitMutationIntoAccordAndNormal(mutation, cm);
 
-        // create and write noOfHints using service
-        UUID hostId = StorageService.instance.getLocalHostUUID();
-        for (int i = 0; i < noOfHints; i++)
-        {
-            long now = System.currentTimeMillis();
-            DecoratedKey dkey = dk(String.valueOf(i));
-            CFMetaData cfMetaData = Schema.instance.getCFMetaData(KEYSPACE, TABLE);
+                        SplitMutation split;
+                        if (count % 2 == 0)
+                            split = new SplitMutation(mutation, null);
+                        else
+                            split = new SplitMutation<>(null, mutation);
+                        count++;
+                        return split;
+                    }
 
-            UpdateBuilder builder = UpdateBuilder.create(cfMetaData, dkey)
-                    .withTimestamp(now)
-                    .newRow("column0")
-                    .add("val", "value0");
-            Hint hint = Hint.create((Mutation) builder.makeMutation(), now);
+                    @Override
+                    public IAccordResult<TxnResult> mutateWithAccordAsync(ClusterMetadata cm, Mutation mutation, @Nullable ConsistencyLevel consistencyLevel, Dispatcher.RequestTime requestTime)
+                    {
+                        accordTxnCount.incrementAndGet();
+                        TxnId txnId = AccordTestUtils.txnId(42, 43, 44);
+                        AccordResult<TxnResult> result = new AccordResult<>(txnId, Keys.EMPTY, new LatencyRequestBookkeeping(null), requestTime.startedAtNanos(), requestTime.startedAtNanos(), true);
+                        result.accept(new TxnData(), null);
+                        return result;
+                    }
+                });
+        sendHintsWithRetryDifferentSystemUUID(metadata);
+        // Two should be Accord transactions
+        spinAssertEquals(2, accordTxnCount::get, 10);
+        Thread.sleep(1000);
+        // An attempt should be made to write to all replicas
+        verify(HintsService.instance, times(1)).writeForAllReplicas(notNull());
+        // And it should be written locally
+        spinAssertEquals(startWrites + 1L, cfs.metric.writeLatency.latency::getCount, 10);
 
-            HintsService.instance.write(hostId, hint);
-        }
-        return spy;
-    }
-
-    private static class MockFailureDetector implements IFailureDetector
-    {
-        private boolean isAlive = true;
-
-        public boolean isAlive(InetAddress ep)
-        {
-            return isAlive;
-        }
-
-        public void interpret(InetAddress ep)
-        {
-            throw new UnsupportedOperationException();
-        }
-
-        public void report(InetAddress ep)
-        {
-            throw new UnsupportedOperationException();
-        }
-
-        public void registerFailureDetectionEventListener(IFailureDetectionEventListener listener)
-        {
-            throw new UnsupportedOperationException();
-        }
-
-        public void unregisterFailureDetectionEventListener(IFailureDetectionEventListener listener)
-        {
-            throw new UnsupportedOperationException();
-        }
-
-        public void remove(InetAddress ep)
-        {
-            throw new UnsupportedOperationException();
-        }
-
-        public void forceConviction(InetAddress ep)
-        {
-            throw new UnsupportedOperationException();
-        }
+        // Hints that are rehinted are treated as succeeding immediately for the ACCORD_HINT_ENDPOINT
+        assertEquals(3, HintsServiceMetrics.getDelayCount(HintsServiceMetrics.ACCORD_HINT_ENDPOINT));
     }
 }

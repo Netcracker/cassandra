@@ -1,4 +1,5 @@
 #!/usr/bin/make -f
+#
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
 # distributed with this work for additional information
@@ -15,22 +16,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
+#
 # Uncomment to enable verbose mode.
 #export DH_VERBOSE=1
 
-include /usr/share/dpatch/dpatch.make
+include /usr/share/quilt/quilt.make
 
 ANT = /usr/bin/ant
 VERSION = $(shell dpkg-parsechangelog | sed -ne 's/^Version: \([^-|~|+]*\).*/\1/p')
-
-test:
-	dh_testdir
-	$(ANT) test
+BUILD_DIR ?= "build"
 
 clean: unpatch
+	dh_clean build-stamp
 	dh_testdir
 	dh_testroot
-	$(ANT) realclean
 	rm -f build-stamp build.properties
 	rm -rf bin/java
 	find -name "*.pyc" -exec rm '{}' ';'
@@ -39,13 +38,13 @@ clean: unpatch
 	dh_clean
 
 build: build-stamp
-build-stamp: patch-stamp
+build-stamp: $(QUILT_STAMPFN)
 	dh_testdir
 	printf "version=%s" $(VERSION) > build.properties
 
 	$(ANT) generate-cql-html
-	$(ANT) jar
-	cd pylib && python setup.py install --no-compile --install-layout deb \
+	$(ANT) jar -Dno-checkstyle=true -Drat.skip=true -Dant.gen-doc.skip=true
+	cd pylib && python3 setup.py install --no-compile --install-layout deb \
 		--root $(CURDIR)/debian/cassandra
 
 	touch build-stamp
@@ -57,13 +56,19 @@ install: build
 	dh_install
 
 	# Copy in the jar and symlink to something stable
-	dh_install build/apache-cassandra-$(VERSION).jar \
-		usr/share/cassandra
-	dh_install build/apache-cassandra-thrift-$(VERSION).jar \
+	dh_install $(BUILD_DIR)/apache-cassandra-$(VERSION).jar \
 		usr/share/cassandra
 
 	# Copy stress jars
-	dh_install build/tools/lib/stress.jar \
+	dh_install $(BUILD_DIR)/tools/lib/stress.jar \
+		usr/share/cassandra
+
+	# Copy fqltool jars
+	dh_install $(BUILD_DIR)/tools/lib/fqltool.jar \
+		usr/share/cassandra
+
+	# Copy sstableloader jars
+	dh_install $(BUILD_DIR)/tools/lib/sstableloader.jar \
 		usr/share/cassandra
 
 	dh_link usr/share/cassandra/apache-cassandra-$(VERSION).jar \
@@ -77,7 +82,7 @@ binary-indep: build install
 	dh_testroot
 	dh_installchangelogs
 	dh_installinit -u'start 50 2 3 4 5 . stop 50 0 1 6 .'
-	dh_installdocs README.asc CHANGES.txt NEWS.txt doc/cql3/CQL.css doc/cql3/CQL.html CASSANDRA-14092.txt
+	dh_installdocs README.asc CHANGES.txt NEWS.txt doc/cql3/CQL.css doc/cql3/CQL.html CASSANDRA-14092.txt .snyk
 	dh_installexamples tools/*.yaml
 	dh_bash-completion
 	dh_compress

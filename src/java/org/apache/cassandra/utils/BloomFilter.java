@@ -17,16 +17,22 @@
  */
 package org.apache.cassandra.utils;
 
+import java.io.IOException;
+
 import com.google.common.annotations.VisibleForTesting;
 
+import io.netty.util.concurrent.FastThreadLocal;
+import net.nicoulaj.compilecommand.annotations.Inline;
+import org.apache.cassandra.io.util.DataOutputStreamPlus;
 import org.apache.cassandra.utils.concurrent.Ref;
 import org.apache.cassandra.utils.concurrent.WrappedSharedCloseable;
 import org.apache.cassandra.utils.obs.IBitSet;
 
 public class BloomFilter extends WrappedSharedCloseable implements IFilter
 {
-    private static final ThreadLocal<long[]> reusableIndexes = new ThreadLocal<long[]>()
+    private final static FastThreadLocal<long[]> reusableIndexes = new FastThreadLocal<long[]>()
     {
+        @Override
         protected long[] initialValue()
         {
             return new long[21];
@@ -35,18 +41,12 @@ public class BloomFilter extends WrappedSharedCloseable implements IFilter
 
     public final IBitSet bitset;
     public final int hashCount;
-    /**
-     * CASSANDRA-8413: 3.0 (inverted) bloom filters have no 'static' bits caused by using the same upper bits
-     * for both bloom filter and token distribution.
-     */
-    public final boolean oldBfHashOrder;
 
-    BloomFilter(int hashCount, IBitSet bitset, boolean oldBfHashOrder)
+    BloomFilter(int hashCount, IBitSet bitset)
     {
         super(bitset);
         this.hashCount = hashCount;
         this.bitset = bitset;
-        this.oldBfHashOrder = oldBfHashOrder;
     }
 
     private BloomFilter(BloomFilter copy)
@@ -54,17 +54,22 @@ public class BloomFilter extends WrappedSharedCloseable implements IFilter
         super(copy);
         this.hashCount = copy.hashCount;
         this.bitset = copy.bitset;
-        this.oldBfHashOrder = copy.oldBfHashOrder;
     }
 
-    public long serializedSize()
+    public long serializedSize(boolean old)
     {
-        return BloomFilterSerializer.serializedSize(this);
+        return BloomFilterSerializer.forVersion(old).serializedSize(this);
+    }
+
+    @Override
+    public void serialize(DataOutputStreamPlus out, boolean old) throws IOException
+    {
+        BloomFilterSerializer.forVersion(old).serialize(this, out);
     }
 
     // Murmur is faster than an SHA-based approach and provides as-good collision
     // resistance.  The combinatorial generation approach described in
-    // http://www.eecs.harvard.edu/~kirsch/pubs/bbbf/esa06.pdf
+    // https://www.eecs.harvard.edu/~michaelm/postscripts/tr-02-05.pdf
     // does prove to work in actual tests, and is obviously faster
     // than performing further iterations of murmur.
 
@@ -84,25 +89,21 @@ public class BloomFilter extends WrappedSharedCloseable implements IFilter
     // to avoid generating a lot of garbage since stack allocation currently does not support stores
     // (CASSANDRA-6609).  it returns the array so that the caller does not need to perform
     // a second threadlocal lookup.
+    @Inline
     private long[] indexes(FilterKey key)
     {
         // we use the same array both for storing the hash result, and for storing the indexes we return,
         // so that we do not need to allocate two arrays.
         long[] indexes = reusableIndexes.get();
+
         key.filterHash(indexes);
         setIndexes(indexes[1], indexes[0], hashCount, bitset.capacity(), indexes);
         return indexes;
     }
 
+    @Inline
     private void setIndexes(long base, long inc, int count, long max, long[] results)
     {
-        if (oldBfHashOrder)
-        {
-            long x = inc;
-            inc = base;
-            base = x;
-        }
-
         for (int i = 0; i < count; i++)
         {
             results[i] = FBUtilities.abs(base % max);
@@ -110,6 +111,7 @@ public class BloomFilter extends WrappedSharedCloseable implements IFilter
         }
     }
 
+    @Override
     public void add(FilterKey key)
     {
         long[] indexes = indexes(key);
@@ -119,6 +121,7 @@ public class BloomFilter extends WrappedSharedCloseable implements IFilter
         }
     }
 
+    @Override
     public final boolean isPresent(FilterKey key)
     {
         long[] indexes = indexes(key);
@@ -132,12 +135,14 @@ public class BloomFilter extends WrappedSharedCloseable implements IFilter
         return true;
     }
 
+    @Override
     public void clear()
     {
         bitset.clear();
     }
 
-    public IFilter sharedCopy()
+    @Override
+    public BloomFilter sharedCopy()
     {
         return new BloomFilter(this);
     }
@@ -148,11 +153,19 @@ public class BloomFilter extends WrappedSharedCloseable implements IFilter
         return bitset.offHeapSize();
     }
 
-    public String toString()
+    @Override
+    public boolean isInformative()
     {
-        return "BloomFilter[hashCount=" + hashCount + ";oldBfHashOrder=" + oldBfHashOrder + ";capacity=" + bitset.capacity() + ']';
+        return bitset.offHeapSize() > 0;
     }
 
+    @Override
+    public String toString()
+    {
+        return "BloomFilter[hashCount=" + hashCount + ";capacity=" + bitset.capacity() + ']';
+    }
+
+    @Override
     public void addTo(Ref.IdentityCollection identities)
     {
         super.addTo(identities);

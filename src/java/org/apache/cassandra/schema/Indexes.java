@@ -15,16 +15,23 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package org.apache.cassandra.schema;
 
+import java.io.IOException;
 import java.util.*;
+import java.util.stream.Stream;
 
 import com.google.common.collect.ImmutableMap;
 
-import org.apache.cassandra.config.Schema;
+import org.apache.cassandra.io.util.DataInputPlus;
+import org.apache.cassandra.io.util.DataOutputPlus;
+import org.apache.cassandra.tcm.serialization.MetadataSerializer;
+import org.apache.cassandra.tcm.serialization.Version;
+
+import static java.lang.String.format;
 
 import static com.google.common.collect.Iterables.filter;
+import static org.apache.cassandra.db.TypeSizes.sizeof;
 
 /**
  * For backwards compatibility, in the first instance an IndexMetadata must have
@@ -35,8 +42,10 @@ import static com.google.common.collect.Iterables.filter;
  * support is added for multiple target columns per-index and for indexes with
  * TargetType.ROW
  */
-public class Indexes implements Iterable<IndexMetadata>
+public final class Indexes implements Iterable<IndexMetadata>
 {
+    public static final Serializer serializer = new Serializer();
+
     private final ImmutableMap<String, IndexMetadata> indexesByName;
     private final ImmutableMap<UUID, IndexMetadata> indexesById;
 
@@ -56,9 +65,24 @@ public class Indexes implements Iterable<IndexMetadata>
         return builder().build();
     }
 
+    public static Indexes of(IndexMetadata... indexes)
+    {
+        return builder().add(indexes).build();
+    }
+
+    public static Indexes of(Iterable<IndexMetadata> indexes)
+    {
+        return builder().add(indexes).build();
+    }
+
     public Iterator<IndexMetadata> iterator()
     {
         return indexesByName.values().iterator();
+    }
+
+    public Stream<IndexMetadata> stream()
+    {
+        return indexesById.values().stream();
     }
 
     public int size()
@@ -95,7 +119,7 @@ public class Indexes implements Iterable<IndexMetadata>
     /**
      * Get the index with the specified id
      *
-     * @param name a UUID which identifies an index
+     * @param id a UUID which identifies an index
      * @return an empty {@link Optional} if no index with the specified id is found; a non-empty optional of
      *         {@link IndexMetadata} otherwise
      */
@@ -107,7 +131,7 @@ public class Indexes implements Iterable<IndexMetadata>
 
     /**
      * Answer true if contains an index with the specified id.
-     * @param name a UUID which identifies an index.
+     * @param id a UUID which identifies an index.
      * @return true if an index with the specified id is found; false otherwise
      */
     public boolean has(UUID id)
@@ -121,7 +145,7 @@ public class Indexes implements Iterable<IndexMetadata>
     public Indexes with(IndexMetadata index)
     {
         if (get(index.name).isPresent())
-            throw new IllegalStateException(String.format("Index %s already exists", index.name));
+            throw new IllegalStateException(format("Index %s already exists", index.name));
 
         return builder().add(this).add(index).build();
     }
@@ -131,7 +155,7 @@ public class Indexes implements Iterable<IndexMetadata>
      */
     public Indexes without(String name)
     {
-        IndexMetadata index = get(name).orElseThrow(() -> new IllegalStateException(String.format("Index %s doesn't exist", name)));
+        IndexMetadata index = get(name).orElseThrow(() -> new IllegalStateException(format("Index %s doesn't exist", name)));
         return builder().add(filter(this, v -> v != index)).build();
     }
 
@@ -149,6 +173,11 @@ public class Indexes implements Iterable<IndexMetadata>
         return this == o || (o instanceof Indexes && indexesByName.equals(((Indexes) o).indexesByName));
     }
 
+    public void validate(TableMetadata table)
+    {
+        indexesByName.values().forEach(i -> i.validate(table));
+    }
+
     @Override
     public int hashCode()
     {
@@ -159,20 +188,6 @@ public class Indexes implements Iterable<IndexMetadata>
     public String toString()
     {
         return indexesByName.values().toString();
-    }
-
-    public static String getAvailableIndexName(String ksName, String cfName, String indexNameRoot)
-    {
-
-        KeyspaceMetadata ksm = Schema.instance.getKSMetaData(ksName);
-        Set<String> existingNames = ksm == null ? new HashSet<>() : ksm.existingIndexNames(null);
-        String baseName = IndexMetadata.getDefaultIndexName(cfName, indexNameRoot);
-        String acceptedName = baseName;
-        int i = 0;
-        while (existingNames.contains(acceptedName))
-            acceptedName = baseName + '_' + (++i);
-
-        return acceptedName;
     }
 
     public static final class Builder
@@ -196,10 +211,44 @@ public class Indexes implements Iterable<IndexMetadata>
             return this;
         }
 
+        public Builder add(IndexMetadata... indexes)
+        {
+            for (IndexMetadata index : indexes)
+                add(index);
+            return this;
+        }
+
         public Builder add(Iterable<IndexMetadata> indexes)
         {
             indexes.forEach(this::add);
             return this;
+        }
+    }
+
+    public static class Serializer implements MetadataSerializer<Indexes>
+    {
+        public void serialize(Indexes t, DataOutputPlus out, Version version) throws IOException
+        {
+            out.writeInt(t.size());
+            for (IndexMetadata im : t.indexesById.values())
+                IndexMetadata.metadataSerializer.serialize(im, out, version);
+        }
+
+        public Indexes deserialize(DataInputPlus in, Version version) throws IOException
+        {
+            int size = in.readInt();
+            Indexes.Builder builder = Indexes.builder();
+            for (int i = 0; i < size; i++)
+                builder.add(IndexMetadata.metadataSerializer.deserialize(in, version));
+            return builder.build();
+        }
+
+        public long serializedSize(Indexes t, Version version)
+        {
+            int size = sizeof(t.size());
+            for (IndexMetadata metadata : t.indexesById.values())
+                size += IndexMetadata.metadataSerializer.serializedSize(metadata, version);
+            return size;
         }
     }
 }

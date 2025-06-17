@@ -28,19 +28,13 @@ import java.util.concurrent.TimeUnit;
 import com.google.common.collect.HashMultimap;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Iterables;
-
-
 import org.junit.BeforeClass;
 import org.junit.Test;
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertFalse;
-import static org.junit.Assert.assertNotNull;
-import static org.junit.Assert.assertNull;
-import static org.junit.Assert.assertTrue;
-import static org.junit.Assert.fail;
 
 import org.apache.cassandra.SchemaLoader;
+import org.apache.cassandra.ServerTestUtils;
 import org.apache.cassandra.Util;
+import org.apache.cassandra.config.CassandraRelevantProperties;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.Keyspace;
@@ -48,13 +42,20 @@ import org.apache.cassandra.db.RowUpdateBuilder;
 import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.schema.KeyspaceParams;
+import org.apache.cassandra.schema.MockSchema;
 import org.apache.cassandra.utils.Pair;
-import org.apache.cassandra.MockSchema;
 
+import static org.apache.cassandra.config.CassandraRelevantProperties.ALLOW_UNSAFE_AGGRESSIVE_SSTABLE_EXPIRATION;
 import static org.apache.cassandra.db.compaction.TimeWindowCompactionStrategy.getWindowBoundsInMillis;
 import static org.apache.cassandra.db.compaction.TimeWindowCompactionStrategy.newestBucket;
 import static org.apache.cassandra.db.compaction.TimeWindowCompactionStrategy.validateOptions;
 import static org.apache.cassandra.utils.FBUtilities.nowInSeconds;
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
 
 public class TimeWindowCompactionStrategyTest extends SchemaLoader
 {
@@ -66,10 +67,9 @@ public class TimeWindowCompactionStrategyTest extends SchemaLoader
     public static void defineSchema() throws ConfigurationException
     {
         // Disable tombstone histogram rounding for tests
-        System.setProperty("cassandra.streaminghistogram.roundseconds", "1");
-
-        SchemaLoader.prepareServer();
-
+        CassandraRelevantProperties.STREAMING_HISTOGRAM_ROUND_SECONDS.setInt(1);
+        ALLOW_UNSAFE_AGGRESSIVE_SSTABLE_EXPIRATION.setBoolean(true);
+        ServerTestUtils.prepareServer();
         SchemaLoader.createKeyspace(KEYSPACE1,
                                     KeyspaceParams.simple(1),
                                     SchemaLoader.standardCFMD(KEYSPACE1, CF_STANDARD1));
@@ -117,6 +117,26 @@ public class TimeWindowCompactionStrategyTest extends SchemaLoader
             options.put(TimeWindowCompactionStrategyOptions.COMPACTION_WINDOW_UNIT_KEY, "MINUTES");
         }
 
+        try
+        {
+            options.put(TimeWindowCompactionStrategyOptions.UNSAFE_AGGRESSIVE_SSTABLE_EXPIRATION_KEY, "not-a-boolean");
+            validateOptions(options);
+            fail(String.format("Invalid %s should be rejected", TimeWindowCompactionStrategyOptions.UNSAFE_AGGRESSIVE_SSTABLE_EXPIRATION_KEY));
+        }
+        catch (ConfigurationException e)
+        {
+            options.put(TimeWindowCompactionStrategyOptions.UNSAFE_AGGRESSIVE_SSTABLE_EXPIRATION_KEY, "true");
+        }
+        
+        options.put(AbstractCompactionStrategy.UNCHECKED_TOMBSTONE_COMPACTION_OPTION, "true");
+        Keyspace keyspace = Keyspace.open(KEYSPACE1);
+        ColumnFamilyStore cfs = keyspace.getColumnFamilyStore(CF_STANDARD1);
+        TimeWindowCompactionStrategy twcs = new TimeWindowCompactionStrategy(cfs, options);
+        assertFalse(twcs.disableTombstoneCompactions);
+        options.put(AbstractCompactionStrategy.UNCHECKED_TOMBSTONE_COMPACTION_OPTION, "false");
+        twcs = new TimeWindowCompactionStrategy(cfs, options);
+        assertTrue(twcs.disableTombstoneCompactions);
+
         options.put("bad_option", "1.0");
         unvalidated = validateOptions(options);
         assertTrue(unvalidated.containsKey("bad_option"));
@@ -159,24 +179,24 @@ public class TimeWindowCompactionStrategyTest extends SchemaLoader
         for (int r = 0; r < 3; r++)
         {
             DecoratedKey key = Util.dk(String.valueOf(r));
-            new RowUpdateBuilder(cfs.metadata, r, key.getKey())
+            new RowUpdateBuilder(cfs.metadata(), r, key.getKey())
                 .clustering("column")
                 .add("val", value).build().applyUnsafe();
 
-            cfs.forceBlockingFlush();
+            Util.flush(cfs);
         }
         // Decrement the timestamp to simulate a timestamp in the past hour
         for (int r = 3; r < 5; r++)
         {
             // And add progressively more cells into each sstable
             DecoratedKey key = Util.dk(String.valueOf(r));
-            new RowUpdateBuilder(cfs.metadata, r, key.getKey())
+            new RowUpdateBuilder(cfs.metadata(), r, key.getKey())
                 .clustering("column")
                 .add("val", value).build().applyUnsafe();
-            cfs.forceBlockingFlush();
+            Util.flush(cfs);
         }
 
-        cfs.forceBlockingFlush();
+        Util.flush(cfs);
 
         HashMultimap<Long, SSTableReader> buckets = HashMultimap.create();
         List<SSTableReader> sstrs = new ArrayList<>(cfs.getLiveSSTables());
@@ -184,19 +204,23 @@ public class TimeWindowCompactionStrategyTest extends SchemaLoader
         // We'll put 3 sstables into the newest bucket
         for (int i = 0; i < 3; i++)
         {
-            Pair<Long, Long> bounds = getWindowBoundsInMillis(TimeUnit.HOURS, 1, tstamp );
+            Pair<Long, Long> bounds = getWindowBoundsInMillis(TimeUnit.HOURS, 1, tstamp);
             buckets.put(bounds.left, sstrs.get(i));
         }
-        List<SSTableReader> newBucket = newestBucket(buckets, 4, 32, TimeUnit.HOURS, 1, new SizeTieredCompactionStrategyOptions(), getWindowBoundsInMillis(TimeUnit.HOURS, 1, System.currentTimeMillis()).left );
-        assertTrue("incoming bucket should not be accepted when it has below the min threshold SSTables", newBucket.isEmpty());
 
-        newBucket = newestBucket(buckets, 2, 32, TimeUnit.HOURS, 1, new SizeTieredCompactionStrategyOptions(), getWindowBoundsInMillis(TimeUnit.HOURS, 1, System.currentTimeMillis()).left);
-        assertFalse("incoming bucket should be accepted when it is larger than the min threshold SSTables", newBucket.isEmpty());
+        TimeWindowCompactionStrategy.NewestBucket newBucket = newestBucket(buckets, 4, 32, new SizeTieredCompactionStrategyOptions(), getWindowBoundsInMillis(TimeUnit.HOURS, 1, System.currentTimeMillis()).left);
+        assertTrue("incoming bucket should not be accepted when it has below the min threshold SSTables", newBucket.sstables.isEmpty());
+        assertEquals("there should be no estimated remaining tasks when bucket is below min threshold SSTables", 0, newBucket.estimatedRemainingTasks);
+
+
+        newBucket = newestBucket(buckets, 2, 32, new SizeTieredCompactionStrategyOptions(), getWindowBoundsInMillis(TimeUnit.HOURS, 1, System.currentTimeMillis()).left);
+        assertFalse("incoming bucket should be accepted when it is larger than the min threshold SSTables", newBucket.sstables.isEmpty());
+        assertEquals("there should be one estimated remaining task when bucket is larger than the min threshold SSTables", 1, newBucket.estimatedRemainingTasks);
 
         // And 2 into the second bucket (1 hour back)
         for (int i = 3; i < 5; i++)
         {
-            Pair<Long, Long> bounds = getWindowBoundsInMillis(TimeUnit.HOURS, 1, tstamp2 );
+            Pair<Long, Long> bounds = getWindowBoundsInMillis(TimeUnit.HOURS, 1, tstamp2);
             buckets.put(bounds.left, sstrs.get(i));
         }
 
@@ -209,13 +233,13 @@ public class TimeWindowCompactionStrategyTest extends SchemaLoader
         for (int r = 5; r < numSSTables; r++)
         {
             DecoratedKey key = Util.dk(String.valueOf(r));
-            for(int i = 0; i < r; i++)
+            for (int i = 0; i < r; i++)
             {
-                new RowUpdateBuilder(cfs.metadata, tstamp + r, key.getKey())
+                new RowUpdateBuilder(cfs.metadata(), tstamp + r, key.getKey())
                     .clustering("column")
                     .add("val", value).build().applyUnsafe();
             }
-            cfs.forceBlockingFlush();
+            Util.flush(cfs);
         }
 
         // Reset the buckets, overfill it now
@@ -226,8 +250,11 @@ public class TimeWindowCompactionStrategyTest extends SchemaLoader
             buckets.put(bounds.left, sstrs.get(i));
         }
 
-        newBucket = newestBucket(buckets, 4, 32, TimeUnit.DAYS, 1, new SizeTieredCompactionStrategyOptions(), getWindowBoundsInMillis(TimeUnit.HOURS, 1, System.currentTimeMillis()).left);
-        assertEquals("new bucket should be trimmed to max threshold of 32", newBucket.size(),  32);
+        newBucket = newestBucket(buckets, 4, 32, new SizeTieredCompactionStrategyOptions(), getWindowBoundsInMillis(TimeUnit.HOURS, 1, System.currentTimeMillis()).left);
+        assertEquals("new bucket should be trimmed to max threshold of 32", newBucket.sstables.size(), 32);
+
+        // one per bucket because they are all eligible and one more for the sstables that were trimmed
+        assertEquals("there should be one estimated remaining task per eligible bucket", buckets.keySet().size() + 1, newBucket.estimatedRemainingTasks);
     }
 
 
@@ -243,21 +270,21 @@ public class TimeWindowCompactionStrategyTest extends SchemaLoader
 
         // Create a expiring sstable with a TTL
         DecoratedKey key = Util.dk("expired");
-        new RowUpdateBuilder(cfs.metadata, System.currentTimeMillis(), TTL_SECONDS, key.getKey())
+        new RowUpdateBuilder(cfs.metadata(), System.currentTimeMillis(), TTL_SECONDS, key.getKey())
             .clustering("column")
             .add("val", value).build().applyUnsafe();
 
-        cfs.forceBlockingFlush();
+        Util.flush(cfs);
         SSTableReader expiredSSTable = cfs.getLiveSSTables().iterator().next();
         Thread.sleep(10);
 
         // Create a second sstable without TTL
         key = Util.dk("nonexpired");
-        new RowUpdateBuilder(cfs.metadata, System.currentTimeMillis(), key.getKey())
+        new RowUpdateBuilder(cfs.metadata(), System.currentTimeMillis(), key.getKey())
             .clustering("column")
             .add("val", value).build().applyUnsafe();
 
-        cfs.forceBlockingFlush();
+        Util.flush(cfs);
         assertEquals(cfs.getLiveSSTables().size(), 2);
 
         Map<String, String> options = new HashMap<>();
@@ -270,15 +297,84 @@ public class TimeWindowCompactionStrategyTest extends SchemaLoader
             twcs.addSSTable(sstable);
 
         twcs.startup();
-        assertNull(twcs.getNextBackgroundTask(nowInSeconds()));
+        long gcBefore1 = nowInSeconds();
+        assertNull(Iterables.<AbstractCompactionTask>getOnlyElement(twcs.getNextBackgroundTasks(gcBefore1), null));
 
         // Wait for the expiration of the first sstable
         Thread.sleep(TimeUnit.SECONDS.toMillis(TTL_SECONDS + 1));
-        AbstractCompactionTask t = twcs.getNextBackgroundTask(nowInSeconds());
+        long gcBefore = nowInSeconds();
+        AbstractCompactionTask t = Iterables.getOnlyElement(twcs.getNextBackgroundTasks(gcBefore), null);
         assertNotNull(t);
         assertEquals(1, Iterables.size(t.transaction.originals()));
         SSTableReader sstable = t.transaction.originals().iterator().next();
         assertEquals(sstable, expiredSSTable);
+        t.transaction.abort();
+    }
+
+    @Test
+    public void testDropOverlappingExpiredSSTables() throws InterruptedException
+    {
+        Keyspace keyspace = Keyspace.open(KEYSPACE1);
+        ColumnFamilyStore cfs = keyspace.getColumnFamilyStore(CF_STANDARD1);
+        cfs.truncateBlocking();
+        cfs.disableAutoCompaction();
+
+        long timestamp = System.currentTimeMillis();
+        ByteBuffer value = ByteBuffer.wrap(new byte[100]);
+
+        // Create a expiring sstable with a TTL
+        DecoratedKey key = Util.dk("expired");
+        new RowUpdateBuilder(cfs.metadata(), timestamp, TTL_SECONDS, key.getKey())
+            .clustering("column")
+            .add("val", value).build().applyUnsafe();
+
+        Util.flush(cfs);
+        SSTableReader expiredSSTable = cfs.getLiveSSTables().iterator().next();
+        Thread.sleep(10);
+
+        // Create a second sstable without TTL and with a row superceded by the expiring row
+        new RowUpdateBuilder(cfs.metadata(), timestamp - 1000, key.getKey())
+            .clustering("column")
+            .add("val", value).build().applyUnsafe();
+        key = Util.dk("nonexpired");
+        new RowUpdateBuilder(cfs.metadata(), timestamp, key.getKey())
+            .clustering("column")
+            .add("val", value).build().applyUnsafe();
+
+        Util.flush(cfs);
+        assertEquals(cfs.getLiveSSTables().size(), 2);
+
+        Map<String, String> options = new HashMap<>();
+        options.put(TimeWindowCompactionStrategyOptions.COMPACTION_WINDOW_SIZE_KEY, "30");
+        options.put(TimeWindowCompactionStrategyOptions.COMPACTION_WINDOW_UNIT_KEY, "SECONDS");
+        options.put(TimeWindowCompactionStrategyOptions.TIMESTAMP_RESOLUTION_KEY, "MILLISECONDS");
+        options.put(TimeWindowCompactionStrategyOptions.EXPIRED_SSTABLE_CHECK_FREQUENCY_SECONDS_KEY, "0");
+        TimeWindowCompactionStrategy twcs = new TimeWindowCompactionStrategy(cfs, options);
+        for (SSTableReader sstable : cfs.getLiveSSTables())
+            twcs.addSSTable(sstable);
+
+        twcs.startup();
+        long gcBefore2 = nowInSeconds();
+        assertNull(Iterables.<AbstractCompactionTask>getOnlyElement(twcs.getNextBackgroundTasks(gcBefore2), null));
+
+        // Wait for the expiration of the first sstable
+        Thread.sleep(TimeUnit.SECONDS.toMillis(TTL_SECONDS + 1));
+        long gcBefore1 = nowInSeconds();
+        assertNull(Iterables.<AbstractCompactionTask>getOnlyElement(twcs.getNextBackgroundTasks(gcBefore1), null));
+
+        options.put(TimeWindowCompactionStrategyOptions.UNSAFE_AGGRESSIVE_SSTABLE_EXPIRATION_KEY, "true");
+        twcs = new TimeWindowCompactionStrategy(cfs, options);
+        for (SSTableReader sstable : cfs.getLiveSSTables())
+            twcs.addSSTable(sstable);
+
+        twcs.startup();
+        long gcBefore = nowInSeconds();
+        AbstractCompactionTask t = Iterables.getOnlyElement(twcs.getNextBackgroundTasks(gcBefore), null);
+        assertNotNull(t);
+        assertEquals(1, Iterables.size(t.transaction.originals()));
+        SSTableReader sstable = t.transaction.originals().iterator().next();
+        assertEquals(sstable, expiredSSTable);
+        twcs.shutdown();
         t.transaction.abort();
     }
 
@@ -297,7 +393,7 @@ public class TimeWindowCompactionStrategyTest extends SchemaLoader
             sstables.add(MockSchema.sstableWithTimestamp(i, curr + TimeUnit.MILLISECONDS.convert(i, TimeUnit.MINUTES), cfs));
 
         cfs.addSSTables(sstables);
-        Collection<Collection<SSTableReader>> groups = cfs.getCompactionStrategyManager().getStrategies().get(1).groupSSTablesForAntiCompaction(sstables);
+        Collection<Collection<SSTableReader>> groups = cfs.getCompactionStrategyManager().getCompactionStrategyFor(sstables.get(0)).groupSSTablesForAntiCompaction(sstables);
         assertTrue(groups.size() > 0);
         for (Collection<SSTableReader> group : groups)
             assertEquals(1, group.size());

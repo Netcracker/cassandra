@@ -27,9 +27,9 @@ import java.util.List;
 
 import org.apache.cassandra.stress.generate.PartitionGenerator;
 import org.apache.cassandra.stress.generate.SeedManager;
+import org.apache.cassandra.stress.report.Timer;
 import org.apache.cassandra.stress.settings.Command;
 import org.apache.cassandra.stress.settings.StressSettings;
-import org.apache.cassandra.stress.util.Timer;
 
 public class CqlInserter extends CqlOperation<Integer>
 {
@@ -42,7 +42,11 @@ public class CqlInserter extends CqlOperation<Integer>
     @Override
     protected String buildQuery()
     {
-        StringBuilder query = new StringBuilder("UPDATE ").append(wrapInQuotes(type.table));
+        StringBuilder query = new StringBuilder("UPDATE ")
+        .append(settings.schema.keyspace)
+        .append('.')
+        .append(wrapInQuotes(type.table));
+
         if (settings.columns.timestamp != null)
             query.append(" USING TIMESTAMP ").append(settings.columns.timestamp);
 
@@ -71,9 +75,9 @@ public class CqlInserter extends CqlOperation<Integer>
     }
 
     @Override
-    protected CqlRunOp<Integer> buildRunOp(ClientWrapper client, String query, Object queryId, List<Object> params, ByteBuffer key)
+    protected CqlRunOp<Integer> buildRunOp(QueryExecutor<?> queryExecutor, List<Object> params, ByteBuffer key)
     {
-        return new CqlRunOpAlwaysSucceed(client, query, queryId, params, key, 1);
+        return new CqlRunOpAlwaysSucceed(queryExecutor, params, key, 1);
     }
 
     public boolean isWrite()

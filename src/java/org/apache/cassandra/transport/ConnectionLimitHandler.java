@@ -25,6 +25,8 @@ import io.netty.channel.ChannelInboundHandlerAdapter;
 import io.netty.util.Attribute;
 import io.netty.util.AttributeKey;
 import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.utils.NoSpamLogger;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -33,6 +35,7 @@ import java.net.InetSocketAddress;
 import java.net.SocketAddress;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 
 
@@ -44,7 +47,9 @@ import java.util.concurrent.atomic.AtomicLong;
 final class ConnectionLimitHandler extends ChannelInboundHandlerAdapter
 {
     private static final Logger logger = LoggerFactory.getLogger(ConnectionLimitHandler.class);
-    private static final AttributeKey<InetAddress> addressAttributeKey = AttributeKey.valueOf("address");
+    private static final NoSpamLogger noSpamLogger = NoSpamLogger.getLogger(logger, 1L, TimeUnit.MINUTES);
+    private static final AttributeKey<InetAddress> addressAttributeKey = AttributeKey.valueOf(ConnectionLimitHandler.class, "address");
+
     private final ConcurrentMap<InetAddress, AtomicLong> connectionsPerClient = new ConcurrentHashMap<>();
     private final AtomicLong counter = new AtomicLong(0);
 
@@ -62,7 +67,7 @@ final class ConnectionLimitHandler extends ChannelInboundHandlerAdapter
         }
         else
         {
-            logger.warn("Remote address of unknown type: {}, skipping per-IP connection limits",
+            noSpamLogger.warn("Remote address of unknown type: {}, skipping per-IP connection limits",
                               remoteAddress.getClass());
         }
         return addressAttribute.get();
@@ -88,7 +93,7 @@ final class ConnectionLimitHandler extends ChannelInboundHandlerAdapter
         if (count > limit)
         {
             // The decrement will be done in channelClosed(...)
-            logger.warn("Exceeded maximum native connection limit of {} by using {} connections", limit, count);
+            noSpamLogger.error("Exceeded maximum native connection limit of {} by using {} connections (see native_transport_max_concurrent_connections in cassandra.yaml)", limit, count);
             ctx.close();
         }
         else
@@ -116,7 +121,7 @@ final class ConnectionLimitHandler extends ChannelInboundHandlerAdapter
                 if (perIpCount.incrementAndGet() > perIpLimit)
                 {
                     // The decrement will be done in channelClosed(...)
-                    logger.warn("Exceeded maximum native connection limit per ip of {} by using {} connections", perIpLimit, perIpCount);
+                    noSpamLogger.error("Exceeded maximum native connection limit per ip of {} by using {} connections (see native_transport_max_concurrent_connections_per_ip)", perIpLimit, perIpCount);
                     ctx.close();
                     return;
                 }

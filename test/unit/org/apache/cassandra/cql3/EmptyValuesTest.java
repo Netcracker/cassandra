@@ -19,7 +19,6 @@
 package org.apache.cassandra.cql3;
 
 import java.io.ByteArrayOutputStream;
-import java.io.PrintStream;
 import java.nio.charset.StandardCharsets;
 import java.util.regex.Pattern;
 
@@ -30,6 +29,7 @@ import org.junit.Test;
 
 import com.datastax.driver.core.ResultSet;
 import com.datastax.driver.core.Row;
+import org.apache.cassandra.config.CassandraRelevantProperties;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.marshal.BytesType;
 import org.apache.cassandra.db.marshal.DecimalType;
@@ -46,7 +46,7 @@ import org.apache.cassandra.db.marshal.TimestampType;
 import org.apache.cassandra.db.marshal.UTF8Type;
 import org.apache.cassandra.db.marshal.UUIDType;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
-import org.apache.cassandra.transport.Server;
+import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.utils.ByteBufferUtil;
 
 import static org.junit.Assume.assumeTrue;
@@ -60,12 +60,12 @@ public class EmptyValuesTest extends CQLTester
         Assert.assertTrue(row.getColumns().stream().anyMatch(c -> c.name.toString().equals("v")));
         Assert.assertEquals(0, row.getBytes("v").remaining());
 
-        ResultSet resultNet = executeNet(Server.CURRENT_VERSION, "SELECT * FROM %s");
+        ResultSet resultNet = executeNet(ProtocolVersion.CURRENT, "SELECT * FROM %s");
         Row rowNet = resultNet.one();
         Assert.assertTrue(rowNet.getColumnDefinitions().contains("v"));
         Assert.assertEquals(0, rowNet.getBytesUnsafe("v").remaining());
 
-        ResultSet jsonNet = executeNet(Server.CURRENT_VERSION, "SELECT JSON * FROM %s");
+        ResultSet jsonNet = executeNet(ProtocolVersion.CURRENT, "SELECT JSON * FROM %s");
         Row jsonRowNet = jsonNet.one();
         Assert.assertTrue(jsonRowNet.getString("[json]"), jsonRowNet.getString("[json]").matches(".*\"v\"\\s*:\\s*\"" + Pattern.quote(emptyValue) + "\".*"));
 
@@ -73,17 +73,22 @@ public class EmptyValuesTest extends CQLTester
         ByteArrayOutputStream buf = new ByteArrayOutputStream();
         for (SSTableReader ssTable : cfs.getLiveSSTables())
         {
-            try (PrintStream out = new PrintStream(buf, true))
+            int exitValue = 0;
+            try
             {
                 ProcessBuilder pb = new ProcessBuilder("tools/bin/sstabledump", ssTable.getFilename());
+                pb.redirectErrorStream(true);
+                if (CassandraRelevantProperties.CASSANDRA_CONFIG.isPresent())
+                    pb.environment().put("JVM_OPTS", "-Dcassandra.config=" + CassandraRelevantProperties.CASSANDRA_CONFIG.getString());
                 Process process = pb.start();
-                process.waitFor();
+                exitValue = process.waitFor();
                 IOUtils.copy(process.getInputStream(), buf);
             }
             catch (Throwable t)
             {
                 Assert.fail(t.getClass().getName());
             }
+            Assert.assertEquals(buf.toString(), 0, exitValue);
         }
         
         String outString = new String(buf.toByteArray(), StandardCharsets.UTF_8);
@@ -95,7 +100,7 @@ public class EmptyValuesTest extends CQLTester
         execute("TRUNCATE %s");
 
         // In most cases we cannot insert empty value when we do not bind variables
-        // This is due to the current implementation of org.apache.cassandra.cql3.Constants.Literal.testAssignment
+        // This is due to the current implementation of org.apache.cassandra.cql3.terms.Constants.Literal.testAssignment
         // execute("INSERT INTO %s (id, v) VALUES (1, '" + emptyValue + "')");
         execute("INSERT INTO %s (id, v) VALUES (1, ?)", ByteBufferUtil.EMPTY_BYTE_BUFFER);
         flush();

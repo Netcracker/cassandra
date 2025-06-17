@@ -17,63 +17,60 @@
  */
 package org.apache.cassandra.cql3.restrictions;
 
-import java.util.Collection;
-import java.util.List;
-
-import org.apache.cassandra.config.ColumnDefinition;
-import org.apache.cassandra.cql3.QueryOptions;
-import org.apache.cassandra.cql3.functions.Function;
-import org.apache.cassandra.db.filter.RowFilter;
-import org.apache.cassandra.exceptions.InvalidRequestException;
-import org.apache.cassandra.index.SecondaryIndexManager;
+import org.apache.cassandra.schema.ColumnMetadata;
 
 /**
  * Sets of restrictions
  */
-interface Restrictions
+public interface Restrictions extends Restriction
 {
     /**
-     * Returns the column definitions in position order.
-     * @return the column definitions in position order.
+     * Checks if the specified column is restricted by an equals at the column level.
+     * @return {@code true} if the column is restricted by an equals at the column level, {@code false} otherwise.
      */
-    public Collection<ColumnDefinition> getColumnDefs();
+    boolean isRestrictedByEquals(ColumnMetadata column);
 
     /**
-     * Adds all functions (native and user-defined) used by any component of the restriction
-     * to the specified list.
-     * @param functions the list to add to
+     * Checks if the specified column is restricted by an equals or an IN at the column level.
+     * @return {@code true} if the column is restricted by an equals or an IN at the column level, {@code false} otherwise.
      */
-    public void addFunctionsTo(List<Function> functions);
+    boolean isRestrictedByEqualsOrIN(ColumnMetadata column);
 
     /**
-     * Check if the restriction is on indexed columns.
+     * Checks if this <code>Restrictions</code> is empty or not.
      *
-     * @param indexManager the index manager
-     * @return <code>true</code> if the restriction is on indexed columns, <code>false</code>
+     * @return <code>true</code> if this <code>Restrictions</code> is empty, <code>false</code> otherwise.
      */
-    public boolean hasSupportingIndex(SecondaryIndexManager indexManager);
-
-    /**
-     * Adds to the specified row filter the expressions corresponding to this <code>Restrictions</code>.
-     *
-     * @param filter the row filter to add expressions to
-     * @param indexManager the secondary index manager
-     * @param options the query options
-     * @throws InvalidRequestException if this <code>Restrictions</code> cannot be converted into a row filter
-     */
-    public void addRowFilterTo(RowFilter filter, SecondaryIndexManager indexManager, QueryOptions options) throws InvalidRequestException;
-
-    /**
-     * Checks if this <code>PrimaryKeyRestrictionSet</code> is empty or not.
-     *
-     * @return <code>true</code> if this <code>PrimaryKeyRestrictionSet</code> is empty, <code>false</code> otherwise.
-     */
-    boolean isEmpty();
+    default boolean isEmpty()
+    {
+        return size() == 0;
+    }
 
     /**
      * Returns the number of columns that have a restriction.
      *
      * @return the number of columns that have a restriction.
      */
-    public int size();
+    default int size()
+    {
+        return columns().size();
+    }
+
+    /**
+     * Checks if any of the underlying restriction use an {@code IN} operator.
+     * @return {@code true} if any of the underlying restriction is an IN, {@code false} otherwise
+     */
+    default boolean hasIN()
+    {
+        return false;
+    }
+
+    /**
+     * Checks if any of the underlying restrictions is a slice.
+     * @return {@code true} if any of the underlying restrictions is a slice, {@code false} otherwise
+     */
+    default boolean hasSlice()
+    {
+        return false;
+    }
 }

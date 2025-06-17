@@ -18,17 +18,17 @@
 
 package org.apache.cassandra.db.view;
 
-import java.net.InetAddress;
-import java.util.ArrayList;
-import java.util.List;
 import java.util.Optional;
+import java.util.function.Predicate;
 
-import org.apache.cassandra.config.DatabaseDescriptor;
-import org.apache.cassandra.db.Keyspace;
+import com.google.common.collect.Iterables;
 import org.apache.cassandra.dht.Token;
-import org.apache.cassandra.locator.AbstractReplicationStrategy;
+import org.apache.cassandra.locator.EndpointsForToken;
 import org.apache.cassandra.locator.NetworkTopologyStrategy;
-import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.locator.Replica;
+import org.apache.cassandra.schema.KeyspaceMetadata;
+import org.apache.cassandra.tcm.ClusterMetadata;
+import org.apache.cassandra.tcm.membership.Location;
 
 public final class ViewUtils
 {
@@ -45,7 +45,7 @@ public final class ViewUtils
      * nodes in the local datacenter when calculating cardinality.
      *
      * For example, if we have the following ring:
-     *   A, T1 -> B, T2 -> C, T3 -> A
+     *   {@code A, T1 -> B, T2 -> C, T3 -> A}
      *
      * For the token T1, at RF=1, A would be included, so A's cardinality for T1 is 1. For the token T1, at RF=2, B would
      * be included, so B's cardinality for token T1 is 2. For token T3, at RF = 2, A would be included, so A's cardinality
@@ -58,46 +58,53 @@ public final class ViewUtils
      *
      * @return Optional.empty() if this method is called using a base token which does not belong to this replica
      */
-    public static Optional<InetAddress> getViewNaturalEndpoint(String keyspaceName, Token baseToken, Token viewToken)
+    public static Optional<Replica> getViewNaturalEndpoint(ClusterMetadata metadata, String keyspace, Token baseToken, Token viewToken)
     {
-        AbstractReplicationStrategy replicationStrategy = Keyspace.open(keyspaceName).getReplicationStrategy();
+        Location local = metadata.locator.local();
+        KeyspaceMetadata keyspaceMetadata = metadata.schema.getKeyspaces().getNullable(keyspace);
 
-        String localDataCenter = DatabaseDescriptor.getEndpointSnitch().getDatacenter(FBUtilities.getBroadcastAddress());
-        List<InetAddress> baseEndpoints = new ArrayList<>();
-        List<InetAddress> viewEndpoints = new ArrayList<>();
-        for (InetAddress baseEndpoint : replicationStrategy.getNaturalEndpoints(baseToken))
-        {
-            // An endpoint is local if we're not using Net
-            if (!(replicationStrategy instanceof NetworkTopologyStrategy) ||
-                DatabaseDescriptor.getEndpointSnitch().getDatacenter(baseEndpoint).equals(localDataCenter))
-                baseEndpoints.add(baseEndpoint);
-        }
+        EndpointsForToken naturalBaseReplicas = metadata.placements.get(keyspaceMetadata.params.replication).reads.forToken(baseToken).get();
+        EndpointsForToken naturalViewReplicas = metadata.placements.get(keyspaceMetadata.params.replication).reads.forToken(viewToken).get();
 
-        for (InetAddress viewEndpoint : replicationStrategy.getNaturalEndpoints(viewToken))
-        {
-            // If we are a base endpoint which is also a view replica, we use ourselves as our view replica
-            if (viewEndpoint.equals(FBUtilities.getBroadcastAddress()))
-                return Optional.of(viewEndpoint);
+        Optional<Replica> localReplica = Iterables.tryFind(naturalViewReplicas, Replica::isSelf).toJavaUtil();
+        if (localReplica.isPresent())
+            return localReplica;
 
-            // We have to remove any endpoint which is shared between the base and the view, as it will select itself
-            // and throw off the counts otherwise.
-            if (baseEndpoints.contains(viewEndpoint))
-                baseEndpoints.remove(viewEndpoint);
-            else if (!(replicationStrategy instanceof NetworkTopologyStrategy) ||
-                     DatabaseDescriptor.getEndpointSnitch().getDatacenter(viewEndpoint).equals(localDataCenter))
-                viewEndpoints.add(viewEndpoint);
-        }
+        // We only select replicas from our own DC
+        // TODO: this is poor encapsulation, leaking implementation details of replication strategy
+        Predicate<Replica> isLocalDC = r -> !(keyspaceMetadata.replicationStrategy instanceof NetworkTopologyStrategy)
+                || metadata.locator.location(r.endpoint()).sameDatacenter(local);
+
+        // We have to remove any endpoint which is shared between the base and the view, as it will select itself
+        // and throw off the counts otherwise.
+        EndpointsForToken baseReplicas = naturalBaseReplicas.filter(
+                r -> !naturalViewReplicas.endpoints().contains(r.endpoint()) && isLocalDC.test(r)
+        );
+        EndpointsForToken viewReplicas = naturalViewReplicas.filter(
+                r -> !naturalBaseReplicas.endpoints().contains(r.endpoint()) && isLocalDC.test(r)
+        );
 
         // The replication strategy will be the same for the base and the view, as they must belong to the same keyspace.
         // Since the same replication strategy is used, the same placement should be used and we should get the same
         // number of replicas for all of the tokens in the ring.
-        assert baseEndpoints.size() == viewEndpoints.size() : "Replication strategy should have the same number of endpoints for the base and the view";
-        int baseIdx = baseEndpoints.indexOf(FBUtilities.getBroadcastAddress());
+        assert baseReplicas.size() == viewReplicas.size() :
+        String.format("Replication strategy should have the same number of endpoints for the base (%d) and the view (%d)",
+                      baseReplicas.size(), viewReplicas.size());
+
+        int baseIdx = -1;
+        for (int i=0; i<baseReplicas.size(); i++)
+        {
+            if (baseReplicas.get(i).isSelf())
+            {
+                baseIdx = i;
+                break;
+            }
+        }
 
         if (baseIdx < 0)
             //This node is not a base replica of this key, so we return empty
             return Optional.empty();
 
-        return Optional.of(viewEndpoints.get(baseIdx));
+        return Optional.of(viewReplicas.get(baseIdx));
     }
 }

@@ -28,10 +28,15 @@ import org.junit.Test;
 import org.apache.cassandra.Util;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.ClockAndCount;
-import org.apache.cassandra.db.LegacyLayout.LegacyCell;
+import org.apache.cassandra.db.commitlog.CommitLog;
 import org.apache.cassandra.db.context.CounterContext.Relationship;
+import org.apache.cassandra.db.marshal.ByteBufferAccessor;
+import org.apache.cassandra.distributed.test.log.ClusterMetadataTestHelper;
+import org.apache.cassandra.tcm.ClusterMetadataService;
+import org.apache.cassandra.tcm.StubClusterMetadataService;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.CounterId;
+import org.apache.cassandra.utils.FBUtilities;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
@@ -55,7 +60,11 @@ public class CounterContextTest
     @BeforeClass
     public static void setupDD()
     {
-        DatabaseDescriptor.setDaemonInitialized();
+        DatabaseDescriptor.daemonInitialization();
+        CommitLog.instance.start();
+        ClusterMetadataService.unsetInstance();
+        ClusterMetadataService.setInstance(StubClusterMetadataService.forTesting());
+        ClusterMetadataTestHelper.register(FBUtilities.getBroadcastAddressAndPort());
     }
 
     @Test
@@ -305,7 +314,7 @@ public class CounterContextTest
 
         merged = cc.merge(left.context, right.context);
         assertEquals(headerSizeLength + 5 * headerEltLength + 5 * stepLength, merged.remaining());
-        assertEquals(18L, cc.total(merged));
+        assertEquals(18L, cc.total(merged, ByteBufferAccessor.instance));
         assertEquals(5, merged.getShort(merged.position()));
 
         int headerLength = headerSizeLength + 5 * headerEltLength;
@@ -338,7 +347,7 @@ public class CounterContextTest
         merged = cc.merge(left.context, right.context);
         headerLength = headerSizeLength + headerEltLength;
         assertEquals(headerLength + stepLength, merged.remaining());
-        assertEquals(30L, cc.total(merged));
+        assertEquals(30L, cc.total(merged, ByteBufferAccessor.instance));
         assertEquals(1, merged.getShort(merged.position()));
         assertTrue(Util.equalsCounterId(CounterId.fromInt(1), merged, headerLength));
         assertEquals(10L, merged.getLong(merged.position() + headerLength + idLength));
@@ -360,7 +369,7 @@ public class CounterContextTest
         merged = cc.merge(left.context, right.context);
         headerLength = headerSizeLength + 2 * headerEltLength;
         assertEquals(headerLength + 2 * stepLength, merged.remaining());
-        assertEquals(2L, cc.total(merged));
+        assertEquals(2L, cc.total(merged, ByteBufferAccessor.instance));
         assertEquals(2, merged.getShort(merged.position()));
         assertTrue(Util.equalsCounterId(CounterId.fromInt(1), merged, headerLength));
         assertEquals(1L, merged.getLong(merged.position() + headerLength + idLength));
@@ -379,13 +388,13 @@ public class CounterContextTest
         mixed.writeRemote(CounterId.fromInt(4), 4L, 4L);
         mixed.writeRemote(CounterId.fromInt(5), 5L, 5L);
         mixed.writeLocal(CounterId.getLocalId(), 12L, 12L);
-        assertEquals(24L, cc.total(mixed.context));
+        assertEquals(24L, cc.total(mixed.context, ByteBufferAccessor.instance));
 
         ContextState global = ContextState.allocate(3, 0, 0);
         global.writeGlobal(CounterId.fromInt(1), 1L, 1L);
         global.writeGlobal(CounterId.fromInt(2), 2L, 2L);
         global.writeGlobal(CounterId.fromInt(3), 3L, 3L);
-        assertEquals(6L, cc.total(global.context));
+        assertEquals(6L, cc.total(global.context, ByteBufferAccessor.instance));
     }
 
     @Test
@@ -399,26 +408,26 @@ public class CounterContextTest
         state = ContextState.allocate(0, 0, 1);
         state.writeRemote(CounterId.fromInt(1), 1L, 1L);
 
-        assertFalse(cc.shouldClearLocal(state.context));
+        assertFalse(cc.shouldClearLocal(state.context, ByteBufferAccessor.instance));
         marked = cc.markLocalToBeCleared(state.context);
         assertEquals(0, marked.getShort(marked.position()));
         assertSame(state.context, marked); // should return the original context
 
-        cleared = cc.clearAllLocal(marked);
+        cleared = cc.clearAllLocal(marked, ByteBufferAccessor.instance);
         assertSame(cleared, marked); // shouldn't alter anything either
 
         // a single local shard
         state = ContextState.allocate(0, 1, 0);
         state.writeLocal(CounterId.fromInt(1), 1L, 1L);
 
-        assertFalse(cc.shouldClearLocal(state.context));
+        assertFalse(cc.shouldClearLocal(state.context, ByteBufferAccessor.instance));
         marked = cc.markLocalToBeCleared(state.context);
-        assertTrue(cc.shouldClearLocal(marked));
+        assertTrue(cc.shouldClearLocal(marked, ByteBufferAccessor.instance));
         assertEquals(-1, marked.getShort(marked.position()));
         assertNotSame(state.context, marked); // shouldn't alter in place, as it used to do
 
-        cleared = cc.clearAllLocal(marked);
-        assertFalse(cc.shouldClearLocal(cleared));
+        cleared = cc.clearAllLocal(marked, ByteBufferAccessor.instance);
+        assertFalse(cc.shouldClearLocal(cleared, ByteBufferAccessor.instance));
         assertEquals(0, cleared.getShort(cleared.position()));
 
         // 2 global + 1 local shard
@@ -427,9 +436,9 @@ public class CounterContextTest
         state.writeGlobal(CounterId.fromInt(2), 2L, 2L);
         state.writeGlobal(CounterId.fromInt(3), 3L, 3L);
 
-        assertFalse(cc.shouldClearLocal(state.context));
+        assertFalse(cc.shouldClearLocal(state.context, ByteBufferAccessor.instance));
         marked = cc.markLocalToBeCleared(state.context);
-        assertTrue(cc.shouldClearLocal(marked));
+        assertTrue(cc.shouldClearLocal(marked, ByteBufferAccessor.instance));
 
         assertEquals(-3, marked.getShort(marked.position()));
         assertEquals(0, marked.getShort(marked.position() + headerSizeLength));
@@ -449,8 +458,8 @@ public class CounterContextTest
         assertEquals(3L, marked.getLong(marked.position() + headerLength + 2 * stepLength + idLength));
         assertEquals(3L, marked.getLong(marked.position() + headerLength + 2 * stepLength + idLength + clockLength));
 
-        cleared = cc.clearAllLocal(marked);
-        assertFalse(cc.shouldClearLocal(cleared));
+        cleared = cc.clearAllLocal(marked, ByteBufferAccessor.instance);
+        assertFalse(cc.shouldClearLocal(cleared, ByteBufferAccessor.instance));
 
         assertEquals(2, cleared.getShort(cleared.position())); // 2 global shards
         assertEquals(Short.MIN_VALUE + 1, cleared.getShort(marked.position() + headerEltLength));
@@ -473,12 +482,12 @@ public class CounterContextTest
         state = ContextState.allocate(1, 0, 0);
         state.writeGlobal(CounterId.fromInt(1), 1L, 1L);
 
-        assertFalse(cc.shouldClearLocal(state.context));
+        assertFalse(cc.shouldClearLocal(state.context, ByteBufferAccessor.instance));
         marked = cc.markLocalToBeCleared(state.context);
         assertEquals(1, marked.getShort(marked.position()));
         assertSame(state.context, marked);
 
-        cleared = cc.clearAllLocal(marked);
+        cleared = cc.clearAllLocal(marked, ByteBufferAccessor.instance);
         assertSame(cleared, marked);
     }
 
@@ -556,8 +565,6 @@ public class CounterContextTest
 
         assertEquals(ClockAndCount.create(1L, 10L), cc.getClockAndCountOf(updateContext, CounterContext.UPDATE_CLOCK_ID));
         assertTrue(cc.isUpdate(updateContext));
-        LegacyCell updateCell = LegacyCell.counter(null, updateContext);
-        assertTrue(updateCell.isCounterUpdate());
 
 
         /*
@@ -571,7 +578,5 @@ public class CounterContextTest
         ByteBuffer notUpdateContext = notUpdateContextState.context;
 
         assertFalse(cc.isUpdate(notUpdateContext));
-        LegacyCell notUpdateCell = LegacyCell.counter(null, notUpdateContext);
-        assertFalse(notUpdateCell.isCounterUpdate());
     }
 }

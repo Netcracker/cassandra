@@ -21,36 +21,49 @@ package org.apache.cassandra.db.commitlog;
  *
  */
 
-import java.io.*;
+import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.Properties;
-import java.util.UUID;
-
-import junit.framework.Assert;
 
 import com.google.common.base.Predicate;
-
 import org.junit.After;
+import org.junit.Assert;
 import org.junit.Before;
 import org.junit.BeforeClass;
 import org.junit.Test;
 
 import org.apache.cassandra.SchemaLoader;
-import org.apache.cassandra.config.CFMetaData;
-import org.apache.cassandra.config.Schema;
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.Mutation;
-import org.apache.cassandra.db.rows.Cell;
-import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.db.marshal.AsciiType;
 import org.apache.cassandra.db.marshal.BytesType;
 import org.apache.cassandra.db.partitions.PartitionUpdate;
+import org.apache.cassandra.db.rows.Cell;
+import org.apache.cassandra.db.rows.Row;
+import org.apache.cassandra.io.util.File;
+import org.apache.cassandra.io.util.FileInputStreamPlus;
+import org.apache.cassandra.schema.KeyspaceMetadata;
 import org.apache.cassandra.schema.KeyspaceParams;
+import org.apache.cassandra.schema.Schema;
+import org.apache.cassandra.schema.SchemaTestUtil;
+import org.apache.cassandra.schema.TableId;
+import org.apache.cassandra.schema.TableMetadata;
+import org.apache.cassandra.schema.Tables;
+import org.apache.cassandra.security.EncryptionContextGenerator;
 import org.apache.cassandra.utils.JVMStabilityInspector;
 import org.apache.cassandra.utils.KillerForTests;
-import org.apache.cassandra.db.commitlog.CommitLogReplayer.CommitLogReplayException;
 
+/**
+ * Note: if you are looking to create new test cases for this test, check out
+ * {@link CommitLogUpgradeTestMaker}
+ */
 public class CommitLogUpgradeTest
 {
+    static
+    {
+        DatabaseDescriptor.daemonInitialization();
+    }
+
     static final String DATA_DIR = "test/data/legacy-commitlog/";
     static final String PROPERTIES_FILE = "hash.txt";
     static final String CFID_PROPERTY = "cfid";
@@ -64,6 +77,15 @@ public class CommitLogUpgradeTest
     private JVMStabilityInspector.Killer originalKiller;
     private KillerForTests killerForTests;
     private boolean shouldBeKilled = false;
+
+    static TableMetadata metadata =
+        TableMetadata.builder(KEYSPACE, TABLE)
+                     .addPartitionKeyColumn("key", AsciiType.instance)
+                     .addClusteringColumn("col", AsciiType.instance)
+                     .addRegularColumn("val", BytesType.instance)
+                     .addRegularColumn("val0", BytesType.instance)
+                     .compression(SchemaLoader.getCompressionParameters())
+                     .build();
 
     @Before
     public void prepareToBeKilled()
@@ -79,116 +101,63 @@ public class CommitLogUpgradeTest
         Assert.assertEquals("JVM killed", shouldBeKilled, killerForTests.wasKilled());
     }
 
+    // 30 matches version in MessagingService, 3.0.13 is the latest patch release after 3.0.0 but before 3.0.14
     @Test
-    public void test20() throws Exception
+    public void test30_encrypted() throws Exception
     {
-        testRestore(DATA_DIR + "2.0");
+        testRestore(DATA_DIR + "3.0.13-encrypted");
     }
 
+    // 3014 matches version in MessagingService, 3.0.29 is the latest patch release after 3.0.14
     @Test
-    public void test21() throws Exception
+    public void test3014_encrypted() throws Exception
     {
-        testRestore(DATA_DIR + "2.1");
+        testRestore(DATA_DIR + "3.0.29-encrypted");
     }
 
+    // 40 matches version in MessagingService, 4.0.11 is the latest patch release on 4.0
     @Test
-
-    public void test22() throws Exception
+    public void test40_encrypted() throws Exception
     {
-        testRestore(DATA_DIR + "2.2");
-    }
-
-    @Test
-    public void test22_LZ4() throws Exception
-    {
-        testRestore(DATA_DIR + "2.2-lz4");
+        testRestore(DATA_DIR + "4.0.11-encrypted");
     }
 
     @Test
-    public void test22_Snappy() throws Exception
+    public void test34_encrypted() throws Exception
     {
-        testRestore(DATA_DIR + "2.2-snappy");
-    }
-
-    public void test22_truncated() throws Exception
-    {
-        testRestore(DATA_DIR + "2.2-lz4-truncated");
-    }
-
-    @Test(expected = CommitLogReplayException.class)
-    public void test22_bitrot() throws Exception
-    {
-        shouldBeKilled = true;
-        testRestore(DATA_DIR + "2.2-lz4-bitrot");
-    }
-
-    @Test
-    public void test22_bitrot_ignored() throws Exception
-    {
-        try {
-            System.setProperty(CommitLogReplayer.IGNORE_REPLAY_ERRORS_PROPERTY, "true");
-            testRestore(DATA_DIR + "2.2-lz4-bitrot");
-        } finally {
-            System.clearProperty(CommitLogReplayer.IGNORE_REPLAY_ERRORS_PROPERTY);
-        }
-    }
-
-    @Test(expected = CommitLogReplayException.class)
-    public void test22_bitrot2() throws Exception
-    {
-        shouldBeKilled = true;
-        testRestore(DATA_DIR + "2.2-lz4-bitrot2");
-    }
-
-    @Test
-    public void test22_bitrot2_ignored() throws Exception
-    {
-        try {
-            System.setProperty(CommitLogReplayer.IGNORE_REPLAY_ERRORS_PROPERTY, "true");
-            testRestore(DATA_DIR + "2.2-lz4-bitrot2");
-        } finally {
-            System.clearProperty(CommitLogReplayer.IGNORE_REPLAY_ERRORS_PROPERTY);
-        }
+        testRestore(DATA_DIR + "3.4-encrypted");
     }
 
     @BeforeClass
-    static public void initialize() throws FileNotFoundException, IOException, InterruptedException
+    public static void initialize()
     {
-        CFMetaData metadata = CFMetaData.Builder.createDense(KEYSPACE, TABLE, false, false)
-                                                .addPartitionKey("key", AsciiType.instance)
-                                                .addClusteringColumn("col", AsciiType.instance)
-                                                .addRegularColumn("val", BytesType.instance)
-                                                .build()
-                                                .compression(SchemaLoader.getCompressionParameters());
         SchemaLoader.loadSchema();
-        SchemaLoader.createKeyspace(KEYSPACE,
-                                    KeyspaceParams.simple(1),
-                                    metadata);
+        SchemaLoader.createKeyspace(KEYSPACE, KeyspaceParams.simple(1), metadata);
+        DatabaseDescriptor.setEncryptionContext(EncryptionContextGenerator.createContext(true));
     }
 
     public void testRestore(String location) throws IOException, InterruptedException
     {
         Properties prop = new Properties();
-        prop.load(new FileInputStream(new File(location + File.separatorChar + PROPERTIES_FILE)));
+        prop.load(new FileInputStreamPlus(new File(location + File.pathSeparator() + PROPERTIES_FILE)));
         int hash = Integer.parseInt(prop.getProperty(HASH_PROPERTY));
         int cells = Integer.parseInt(prop.getProperty(CELLS_PROPERTY));
 
         String cfidString = prop.getProperty(CFID_PROPERTY);
         if (cfidString != null)
         {
-            UUID cfid = UUID.fromString(cfidString);
-            if (Schema.instance.getCF(cfid) == null)
-            {
-                CFMetaData cfm = Schema.instance.getCFMetaData(KEYSPACE, TABLE);
-                Schema.instance.unload(cfm);
-                Schema.instance.load(cfm.copy(cfid));
-            }
+            TableId tableId = TableId.fromString(cfidString);
+            if (Schema.instance.getTableMetadata(tableId) == null)
+                SchemaTestUtil.addOrUpdateKeyspace(KeyspaceMetadata.create(KEYSPACE,
+                                                                           KeyspaceParams.simple(1),
+                                                                           Tables.of(metadata.unbuild().id(tableId).build())),
+                                                   true);
         }
 
         Hasher hasher = new Hasher();
-        CommitLogTestReplayer replayer = new CommitLogTestReplayer(CommitLog.instance, hasher);
-        File[] files = new File(location).listFiles((file, name) -> name.endsWith(".log"));
-        replayer.recover(files);
+        CommitLogTestReplayer replayer = new CommitLogTestReplayer(hasher);
+        File[] files = new File(location).tryList((file, name) -> name.endsWith(".log"));
+        replayer.replayFiles(files);
 
         Assert.assertEquals(cells, hasher.cells);
         Assert.assertEquals(hash, hasher.hash);
@@ -217,11 +186,11 @@ public class CommitLogUpgradeTest
             {
                 for (Row row : update)
                     if (row.clustering().size() > 0 &&
-                        AsciiType.instance.compose(row.clustering().get(0)).startsWith(CELLNAME))
+                        AsciiType.instance.compose(row.clustering().bufferAt(0)).startsWith(CELLNAME))
                     {
-                        for (Cell cell : row.cells())
+                        for (Cell<?> cell : row.cells())
                         {
-                            hash = hash(hash, cell.value());
+                            hash = hash(hash, cell.buffer());
                             ++cells;
                         }
                     }

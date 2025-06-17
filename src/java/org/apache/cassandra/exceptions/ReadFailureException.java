@@ -17,15 +17,26 @@
  */
 package org.apache.cassandra.exceptions;
 
+import java.util.Map;
+
+import com.google.common.collect.ImmutableMap;
+
 import org.apache.cassandra.db.ConsistencyLevel;
+import org.apache.cassandra.locator.InetAddressAndPort;
 
 public class ReadFailureException extends RequestFailureException
 {
     public final boolean dataPresent;
 
-    public ReadFailureException(ConsistencyLevel consistency, int received, int failures, int blockFor, boolean dataPresent)
+    public ReadFailureException(ConsistencyLevel consistency, int received, int blockFor, boolean dataPresent, Map<InetAddressAndPort, RequestFailureReason> failureReasonByEndpoint)
     {
-        super(ExceptionCode.READ_FAILURE, consistency, received, failures, blockFor);
+        super(ExceptionCode.READ_FAILURE, consistency, received, blockFor, ImmutableMap.copyOf(failureReasonByEndpoint));
+        this.dataPresent = dataPresent;
+    }
+
+    protected ReadFailureException(String msg, ConsistencyLevel consistency, int received, int blockFor, boolean dataPresent, Map<InetAddressAndPort, RequestFailureReason> failureReasonByEndpoint)
+    {
+        super(ExceptionCode.READ_FAILURE, msg, consistency, received, blockFor, failureReasonByEndpoint);
         this.dataPresent = dataPresent;
     }
 }

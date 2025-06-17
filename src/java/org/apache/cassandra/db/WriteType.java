@@ -17,6 +17,10 @@
  */
 package org.apache.cassandra.db;
 
+/**
+ * Identifier for what type of operation timed out.  This type is driver facing as a String, but some drivers convert
+ * this to an enum, meaning any changes to this type require protocol changes and driver support.
+ */
 public enum WriteType
 {
     SIMPLE,
@@ -25,5 +29,7 @@ public enum WriteType
     COUNTER,
     BATCH_LOG,
     CAS,
-    VIEW;
+    VIEW,
+    CDC
+    //TODO update client protocol to support "TRANSACTION"
 }

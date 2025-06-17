@@ -31,7 +31,11 @@ import com.google.common.util.concurrent.Uninterruptibles;
 
 import org.apache.cassandra.stress.operations.OpDistributionFactory;
 import org.apache.cassandra.stress.util.JavaDriverClient;
-import org.apache.cassandra.thrift.ConsistencyLevel;
+import org.apache.cassandra.stress.util.ResultLogger;
+import org.apache.cassandra.db.ConsistencyLevel;
+
+import static org.apache.cassandra.utils.LocalizeString.toLowerCaseLocalized;
+import static org.apache.cassandra.utils.LocalizeString.toUpperCaseLocalized;
 
 // Generic command settings - common to read/write/etc
 public abstract class SettingsCommand implements Serializable
@@ -67,9 +71,9 @@ public abstract class SettingsCommand implements Serializable
     public SettingsCommand(Command type, Options options, Count count, Duration duration, Uncertainty uncertainty)
     {
         this.type = type;
-        this.consistencyLevel = ConsistencyLevel.valueOf(options.consistencyLevel.value().toUpperCase());
+        this.consistencyLevel = ConsistencyLevel.valueOf(toUpperCaseLocalized(options.consistencyLevel.value()));
         this.noWarmup = options.noWarmup.setByUser();
-        this.truncate = TruncateWhen.valueOf(options.truncate.value().toUpperCase());
+        this.truncate = TruncateWhen.valueOf(toUpperCaseLocalized(options.truncate.value()));
 
         if (count != null)
         {
@@ -84,7 +88,7 @@ public abstract class SettingsCommand implements Serializable
         {
             this.count = -1;
             this.duration = Long.parseLong(duration.duration.value().substring(0, duration.duration.value().length() - 1));
-            switch (duration.duration.value().toLowerCase().charAt(duration.duration.value().length() - 1))
+            switch (toLowerCaseLocalized(duration.duration.value()).charAt(duration.duration.value().length() - 1))
             {
                 case 's':
                     this.durationUnits = TimeUnit.SECONDS;
@@ -94,6 +98,9 @@ public abstract class SettingsCommand implements Serializable
                     break;
                 case 'h':
                     this.durationUnits = TimeUnit.HOURS;
+                    break;
+                case 'd':
+                    this.durationUnits = TimeUnit.DAYS;
                     break;
                 default:
                     throw new IllegalStateException();
@@ -119,7 +126,7 @@ public abstract class SettingsCommand implements Serializable
     {
         final OptionSimple noWarmup = new OptionSimple("no-warmup", "", null, "Do not warmup the process", false);
         final OptionSimple truncate = new OptionSimple("truncate=", "never|once|always", "never", "Truncate the table: never, before performing any work, or before each iteration", false);
-        final OptionSimple consistencyLevel = new OptionSimple("cl=", "ONE|QUORUM|LOCAL_QUORUM|EACH_QUORUM|ALL|ANY|TWO|THREE|LOCAL_ONE", "LOCAL_ONE", "Consistency level to use", false);
+        final OptionSimple consistencyLevel = new OptionSimple("cl=", "ONE|QUORUM|LOCAL_QUORUM|EACH_QUORUM|ALL|ANY|TWO|THREE|LOCAL_ONE|SERIAL|LOCAL_SERIAL", "LOCAL_ONE", "Consistency level to use", false);
     }
 
     static class Count extends Options
@@ -134,7 +141,7 @@ public abstract class SettingsCommand implements Serializable
 
     static class Duration extends Options
     {
-        final OptionSimple duration = new OptionSimple("duration=", "[0-9]+[smh]", null, "Time to run in (in seconds, minutes or hours)", true);
+        final OptionSimple duration = new OptionSimple("duration=", "[0-9]+[smhd]", null, "Time to run in (in seconds, minutes, hours or days)", true);
         @Override
         public List<? extends Option> options()
         {
@@ -172,6 +179,27 @@ public abstract class SettingsCommand implements Serializable
 
     // CLI Utility Methods
 
+    public void printSettings(ResultLogger out)
+    {
+        out.printf("  Type: %s%n", toLowerCaseLocalized(type.toString()));
+        out.printf("  Count: %,d%n", count);
+        if (durationUnits != null)
+        {
+            out.printf("  Duration: %,d %s%n", duration, durationUnits.toString());
+        }
+        out.printf("  No Warmup: %s%n", noWarmup);
+        out.printf("  Consistency Level: %s%n", consistencyLevel.toString());
+        if (targetUncertainty != -1)
+        {
+            out.printf("  Target Uncertainty: %.3f%n", targetUncertainty);
+            out.printf("  Minimum Uncertainty Measurements: %,d%n", minimumUncertaintyMeasurements);
+            out.printf("  Maximum Uncertainty Measurements: %,d%n", maximumUncertaintyMeasurements);
+        } else {
+            out.printf("  Target Uncertainty: not applicable%n");
+        }
+    }
+
+
     static SettingsCommand get(Map<String, String[]> clArgs)
     {
         for (Command cmd : Command.values())
@@ -201,23 +229,11 @@ public abstract class SettingsCommand implements Serializable
 
     static void printHelp(Command type)
     {
-        printHelp(type.toString().toLowerCase());
+        printHelp(toLowerCaseLocalized(type.toString()));
     }
 
     static void printHelp(String type)
     {
-        GroupedOptions.printOptions(System.out, type.toLowerCase(), new Uncertainty(), new Count(), new Duration());
-    }
-
-    static Runnable helpPrinter(final Command type)
-    {
-        return new Runnable()
-        {
-            @Override
-            public void run()
-            {
-                printHelp(type);
-            }
-        };
+        GroupedOptions.printOptions(System.out, toLowerCaseLocalized(type), new Uncertainty(), new Count(), new Duration());
     }
 }

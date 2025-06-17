@@ -19,42 +19,55 @@
 package org.apache.cassandra.repair;
 
 import java.io.IOException;
-import java.net.InetAddress;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ExecutionException;
 
 import com.google.common.collect.Sets;
+import org.junit.BeforeClass;
 import org.junit.Test;
 
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.dht.IPartitioner;
 import org.apache.cassandra.dht.Murmur3Partitioner;
 import org.apache.cassandra.dht.Range;
 import org.apache.cassandra.dht.Token;
 import org.apache.cassandra.gms.Gossiper;
-import org.apache.cassandra.service.ActiveRepairService;
+import org.apache.cassandra.locator.InetAddressAndPort;
+import org.apache.cassandra.streaming.PreviewKind;
 import org.apache.cassandra.utils.ByteBufferUtil;
-import org.apache.cassandra.utils.UUIDGen;
+import org.apache.cassandra.utils.TimeUUID;
 
+import static org.apache.cassandra.utils.TimeUUID.Generator.nextTimeUUID;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.fail;
 
 public class RepairSessionTest
 {
+    @BeforeClass
+    public static void initDD()
+    {
+        DatabaseDescriptor.daemonInitialization();
+    }
+
     @Test
     public void testConviction() throws Exception
     {
-        InetAddress remote = InetAddress.getByName("127.0.0.2");
+        InetAddressAndPort remote = InetAddressAndPort.getByName("127.0.0.2");
         Gossiper.instance.initializeNodeUnsafe(remote, UUID.randomUUID(), 1);
 
         // Set up RepairSession
-        UUID parentSessionId = UUIDGen.getTimeUUID();
-        UUID sessionId = UUID.randomUUID();
+        TimeUUID parentSessionId = nextTimeUUID();
         IPartitioner p = Murmur3Partitioner.instance;
         Range<Token> repairRange = new Range<>(p.getToken(ByteBufferUtil.bytes(0)), p.getToken(ByteBufferUtil.bytes(100)));
-        Set<InetAddress> endpoints = Sets.newHashSet(remote);
-        RepairSession session = new RepairSession(parentSessionId, sessionId, Arrays.asList(repairRange), "Keyspace1", RepairParallelism.SEQUENTIAL, endpoints, ActiveRepairService.UNREPAIRED_SSTABLE, "Standard1");
+        Set<InetAddressAndPort> endpoints = Sets.newHashSet(remote);
+        RepairSession session = new RepairSession(SharedContext.Global.instance, new Scheduler.NoopScheduler(), parentSessionId,
+                                                  new CommonRange(endpoints, Collections.emptySet(), Arrays.asList(repairRange)),
+                                                  false, "Keyspace1", RepairParallelism.SEQUENTIAL,
+                                                  false, false, PreviewKind.NONE, false,
+                                                  false, false, false, false, "Standard1");
 
         // perform convict
         session.convict(remote, Double.MAX_VALUE);

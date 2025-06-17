@@ -19,9 +19,11 @@ package org.apache.cassandra.transport;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.transport.messages.ErrorMessage;
 
 import org.junit.Assert;
+import org.junit.BeforeClass;
 import org.junit.Test;
 
 import java.util.ArrayList;
@@ -31,22 +33,29 @@ import static org.apache.cassandra.transport.Message.Direction.*;
 
 public class ProtocolErrorTest {
 
+    @BeforeClass
+    public static void setupDD()
+    {
+        DatabaseDescriptor.daemonInitialization();
+    }
+
     @Test
     public void testInvalidProtocolVersion() throws Exception
     {
-        // test using a protocol version higher than the current version
-        testInvalidProtocolVersion(Server.CURRENT_VERSION + 1);
-     // test using a protocol version lower than the lowest version
-        testInvalidProtocolVersion(Server.MIN_SUPPORTED_VERSION - 1);
+        // test using a protocol 2 version higher than the current version (1 version higher is current beta)
+        testInvalidProtocolVersion(ProtocolVersion.CURRENT.asInt() + 2); //
+        // test using a protocol version lower than the lowest version
+        for (ProtocolVersion version : ProtocolVersion.UNSUPPORTED)
+            testInvalidProtocolVersion(version.asInt());
 
     }
 
     public void testInvalidProtocolVersion(int version) throws Exception
     {
-        Frame.Decoder dec = new Frame.Decoder(null, ProtocolVersionLimit.SERVER_DEFAULT);
+        Envelope.Decoder dec = new Envelope.Decoder();
 
         List<Object> results = new ArrayList<>();
-        byte[] frame = new byte[] {
+        byte[] bytes = new byte[] {
                 (byte) REQUEST.addToVersion(version),  // direction & version
                 0x00,  // flags
                 0x00, 0x01,  // stream ID
@@ -58,7 +67,7 @@ public class ProtocolErrorTest {
                 0x65, 0x6d, 0x2e, 0x6c, 0x6f, 0x63, 0x61, 0x6c,
                 0x3b
         };
-        ByteBuf buf = Unpooled.wrappedBuffer(frame);
+        ByteBuf buf = Unpooled.wrappedBuffer(bytes);
         try {
             dec.decode(null, buf, results);
             Assert.fail("Expected protocol error");
@@ -68,20 +77,20 @@ public class ProtocolErrorTest {
     }
 
     @Test
-    public void testInvalidProtocolVersionShortFrame() throws Exception
+    public void testInvalidProtocolVersionShortBody() throws Exception
     {
         // test for CASSANDRA-11464
-        Frame.Decoder dec = new Frame.Decoder(null, ProtocolVersionLimit.SERVER_DEFAULT);
+        Envelope.Decoder dec = new Envelope.Decoder();
 
         List<Object> results = new ArrayList<>();
-        byte[] frame = new byte[] {
+        byte[] bytes = new byte[] {
                 (byte) REQUEST.addToVersion(1),  // direction & version
                 0x00,  // flags
                 0x01,  // stream ID
                 0x09,  // opcode
                 0x00, 0x00, 0x00, 0x21,  // body length
         };
-        ByteBuf buf = Unpooled.wrappedBuffer(frame);
+        ByteBuf buf = Unpooled.wrappedBuffer(bytes);
         try {
             dec.decode(null, buf, results);
             Assert.fail("Expected protocol error");
@@ -93,13 +102,13 @@ public class ProtocolErrorTest {
     @Test
     public void testInvalidDirection() throws Exception
     {
-        Frame.Decoder dec = new Frame.Decoder(null, ProtocolVersionLimit.SERVER_DEFAULT);
+        Envelope.Decoder dec = new Envelope.Decoder();
 
         List<Object> results = new ArrayList<>();
-        // should generate a protocol exception for using a response frame with
+        // should generate a protocol exception for using a response with
         // a prepare op, ensure that it comes back with stream ID 1
-        byte[] frame = new byte[] {
-                (byte) RESPONSE.addToVersion(Server.CURRENT_VERSION),  // direction & version
+        byte[] bytes = new byte[] {
+                (byte) RESPONSE.addToVersion(ProtocolVersion.CURRENT.asInt()),  // direction & version
                 0x00,  // flags
                 0x00, 0x01,  // stream ID
                 0x09,  // opcode
@@ -110,7 +119,7 @@ public class ProtocolErrorTest {
                 0x65, 0x6d, 0x2e, 0x6c, 0x6f, 0x63, 0x61, 0x6c,
                 0x3b
         };
-        ByteBuf buf = Unpooled.wrappedBuffer(frame);
+        ByteBuf buf = Unpooled.wrappedBuffer(bytes);
         try {
             dec.decode(null, buf, results);
             Assert.fail("Expected protocol error");
@@ -124,18 +133,18 @@ public class ProtocolErrorTest {
     @Test
     public void testBodyLengthOverLimit() throws Exception
     {
-        Frame.Decoder dec = new Frame.Decoder(null, ProtocolVersionLimit.SERVER_DEFAULT);
+        Envelope.Decoder dec = new Envelope.Decoder();
 
         List<Object> results = new ArrayList<>();
-        byte[] frame = new byte[] {
-                (byte) REQUEST.addToVersion(Server.CURRENT_VERSION),  // direction & version
+        byte[] bytes = new byte[] {
+                (byte) REQUEST.addToVersion(ProtocolVersion.CURRENT.asInt()),  // direction & version
                 0x00,  // flags
                 0x00, 0x01,  // stream ID
                 0x09,  // opcode
                 0x10, (byte) 0x00, (byte) 0x00, (byte) 0x00,  // body length
         };
         byte[] body = new byte[0x10000000];
-        ByteBuf buf = Unpooled.wrappedBuffer(frame, body);
+        ByteBuf buf = Unpooled.wrappedBuffer(bytes, body);
         try {
             dec.decode(null, buf, results);
             Assert.fail("Expected protocol error");
@@ -147,14 +156,14 @@ public class ProtocolErrorTest {
     }
 
     @Test
-    public void testErrorMessageWithNullString() throws Exception
+    public void testErrorMessageWithNullString()
     {
         // test for CASSANDRA-11167
         ErrorMessage msg = ErrorMessage.fromException(new ServerError((String) null));
         assert msg.toString().endsWith("null") : msg.toString();
-        int size = ErrorMessage.codec.encodedSize(msg, Server.CURRENT_VERSION);
+        int size = ErrorMessage.codec.encodedSize(msg, ProtocolVersion.CURRENT);
         ByteBuf buf = Unpooled.buffer(size);
-        ErrorMessage.codec.encode(msg, buf, Server.CURRENT_VERSION);
+        ErrorMessage.codec.encode(msg, buf, ProtocolVersion.CURRENT);
 
         ByteBuf expected = Unpooled.wrappedBuffer(new byte[]{
                 0x00, 0x00, 0x00, 0x00,  // int error code
@@ -162,5 +171,26 @@ public class ProtocolErrorTest {
         });
 
         Assert.assertEquals(expected, buf);
+    }
+
+    @Test
+    public void testUnsupportedMessage() throws Exception
+    {
+        byte[] bytes = new byte[] {
+            (byte) REQUEST.addToVersion(ProtocolVersion.CURRENT.asInt()),  // direction & version
+            0x00,  // flags
+            0x00, 0x01,  // stream ID
+            0x04,  // opcode for obsoleted CREDENTIALS message
+            0x00, (byte) 0x00, (byte) 0x00, (byte) 0x10,  // body length
+        };
+        byte[] body = new byte[0x10];
+        ByteBuf buf = Unpooled.wrappedBuffer(bytes, body);
+        Envelope decoded = new Envelope.Decoder().decode(buf);
+        try {
+            decoded.header.type.codec.decode(decoded.body, decoded.header.version);
+            Assert.fail("Expected protocol error");
+        } catch (ProtocolException e) {
+            Assert.assertTrue(e.getMessage().contains("Unsupported message"));
+        }
     }
 }

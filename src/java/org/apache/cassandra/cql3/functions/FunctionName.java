@@ -24,19 +24,23 @@ import java.util.Set;
 
 import com.google.common.base.Objects;
 
-import org.apache.cassandra.db.SystemKeyspace;
+import org.apache.cassandra.cql3.CqlBuilder;
+import org.apache.cassandra.schema.SchemaConstants;
 
 public final class FunctionName
 {
     private static final Set<Character> DISALLOWED_CHARACTERS = Collections.unmodifiableSet(
         new HashSet<>(Arrays.asList('/', '[', ']')));
 
+    // We special case the token function because that's the only function which name is a reserved keyword
+    private static final FunctionName TOKEN_FUNCTION_NAME = FunctionName.nativeFunction("token");
+
     public final String keyspace;
     public final String name;
 
     public static FunctionName nativeFunction(String name)
     {
-        return new FunctionName(SystemKeyspace.NAME, name);
+        return new FunctionName(SchemaConstants.SYSTEM_KEYSPACE_NAME, name);
     }
 
     /**
@@ -93,8 +97,8 @@ public final class FunctionName
 
     public final boolean equalsNativeFunction(FunctionName nativeFunction)
     {
-        assert nativeFunction.keyspace.equals(SystemKeyspace.NAME);
-        if (this.hasKeyspace() && !this.keyspace.equals(SystemKeyspace.NAME))
+        assert nativeFunction.keyspace.equals(SchemaConstants.SYSTEM_KEYSPACE_NAME);
+        if (this.hasKeyspace() && !this.keyspace.equals(SchemaConstants.SYSTEM_KEYSPACE_NAME))
             return false;
 
         return Objects.equal(this.name, nativeFunction.name);
@@ -104,5 +108,22 @@ public final class FunctionName
     public String toString()
     {
         return keyspace == null ? name : keyspace + "." + name;
+    }
+
+    public void appendCqlTo(CqlBuilder builder)
+    {
+        if (equalsNativeFunction(TOKEN_FUNCTION_NAME))
+        {
+            builder.append(name);
+        }
+        else
+        {
+            if (keyspace != null)
+            {
+                builder.appendQuotingIfNeeded(keyspace)
+                       .append('.');
+            }
+            builder.appendQuotingIfNeeded(name);
+        }
     }
 }

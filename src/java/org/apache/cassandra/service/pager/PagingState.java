@@ -22,25 +22,24 @@ import java.nio.ByteBuffer;
 import java.util.*;
 
 import com.google.common.annotations.VisibleForTesting;
-import com.google.common.primitives.Ints;
 
-import org.apache.cassandra.config.CFMetaData;
 import org.apache.cassandra.db.Clustering;
-import org.apache.cassandra.db.LegacyLayout;
 import org.apache.cassandra.db.marshal.AbstractType;
+import org.apache.cassandra.db.marshal.ByteBufferAccessor;
 import org.apache.cassandra.db.marshal.BytesType;
+import org.apache.cassandra.db.marshal.CompositeType;
 import org.apache.cassandra.db.rows.Cell;
 import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.io.util.DataInputBuffer;
 import org.apache.cassandra.io.util.DataOutputBuffer;
 import org.apache.cassandra.io.util.DataOutputBufferFixed;
 import org.apache.cassandra.net.MessagingService;
+import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.transport.ProtocolException;
+import org.apache.cassandra.transport.ProtocolVersion;
 
 import static org.apache.cassandra.db.TypeSizes.sizeof;
 import static org.apache.cassandra.db.TypeSizes.sizeofUnsignedVInt;
-import static org.apache.cassandra.transport.Server.VERSION_3;
-import static org.apache.cassandra.transport.Server.VERSION_4;
 import static org.apache.cassandra.utils.ByteBufferUtil.*;
 import static org.apache.cassandra.utils.vint.VIntCoding.computeUnsignedVIntSize;
 import static org.apache.cassandra.utils.vint.VIntCoding.getUnsignedVInt;
@@ -61,12 +60,12 @@ public class PagingState
         this.remainingInPartition = remainingInPartition;
     }
 
-    public ByteBuffer serialize(int protocolVersion)
+    public ByteBuffer serialize(ProtocolVersion protocolVersion)
     {
         assert rowMark == null || protocolVersion == rowMark.protocolVersion;
         try
         {
-            return protocolVersion > VERSION_3 ? modernSerialize() : legacySerialize(true);
+            return protocolVersion.isGreaterThan(ProtocolVersion.V3) ? modernSerialize() : legacySerialize(true);
         }
         catch (IOException e)
         {
@@ -74,11 +73,11 @@ public class PagingState
         }
     }
 
-    public int serializedSize(int protocolVersion)
+    public int serializedSize(ProtocolVersion protocolVersion)
     {
         assert rowMark == null || protocolVersion == rowMark.protocolVersion;
 
-        return protocolVersion > VERSION_3 ? modernSerializedSize() : legacySerializedSize(true);
+        return protocolVersion.isGreaterThan(ProtocolVersion.V3) ? modernSerializedSize() : legacySerializedSize(true);
     }
 
     /**
@@ -87,7 +86,7 @@ public class PagingState
      * a paging state that adheres to the protocol version provided, or, if not - see if it is in a different
      * version, in which case we try the other format.
      */
-    public static PagingState deserialize(ByteBuffer bytes, int protocolVersion)
+    public static PagingState deserialize(ByteBuffer bytes, ProtocolVersion protocolVersion)
     {
         if (bytes == null)
             return null;
@@ -100,16 +99,16 @@ public class PagingState
              * to a lesser extent, readWithShortLength()
              */
 
-            if (protocolVersion > VERSION_3)
+            if (protocolVersion.isGreaterThan(ProtocolVersion.V3))
             {
                 if (isModernSerialized(bytes)) return modernDeserialize(bytes, protocolVersion);
-                if (isLegacySerialized(bytes)) return legacyDeserialize(bytes, VERSION_3);
+                if (isLegacySerialized(bytes)) return legacyDeserialize(bytes, ProtocolVersion.V3);
             }
 
-            if (protocolVersion < VERSION_4)
+            if (protocolVersion.isSmallerThan(ProtocolVersion.V4))
             {
                 if (isLegacySerialized(bytes)) return legacyDeserialize(bytes, protocolVersion);
-                if (isModernSerialized(bytes)) return modernDeserialize(bytes, VERSION_4);
+                if (isModernSerialized(bytes)) return modernDeserialize(bytes, ProtocolVersion.V4);
             }
         }
         catch (IOException e)
@@ -124,62 +123,89 @@ public class PagingState
      * Modern serde (> VERSION_3)
      */
 
-    @SuppressWarnings({ "resource", "RedundantSuppression" })
     private ByteBuffer modernSerialize() throws IOException
     {
         DataOutputBuffer out = new DataOutputBufferFixed(modernSerializedSize());
         writeWithVIntLength(null == partitionKey ? EMPTY_BYTE_BUFFER : partitionKey, out);
         writeWithVIntLength(null == rowMark ? EMPTY_BYTE_BUFFER : rowMark.mark, out);
-        out.writeUnsignedVInt(remaining);
-        out.writeUnsignedVInt(remainingInPartition);
+        out.writeUnsignedVInt32(remaining);
+        out.writeUnsignedVInt32(remainingInPartition);
         return out.buffer(false);
     }
 
-    private static boolean isModernSerialized(ByteBuffer bytes)
+    @VisibleForTesting
+    static boolean isModernSerialized(ByteBuffer bytes)
     {
         int index = bytes.position();
         int limit = bytes.limit();
 
-        long partitionKeyLen = getUnsignedVInt(bytes, index, limit);
+        int partitionKeyLen = toIntExact(getUnsignedVInt(bytes, index, limit));
         if (partitionKeyLen < 0)
             return false;
-        index += computeUnsignedVIntSize(partitionKeyLen) + partitionKeyLen;
-        if (index >= limit)
+        index = addNonNegative(index, computeUnsignedVIntSize(partitionKeyLen), partitionKeyLen);
+        if (index >= limit || index < 0)
             return false;
 
-        long rowMarkerLen = getUnsignedVInt(bytes, index, limit);
+        int rowMarkerLen = toIntExact(getUnsignedVInt(bytes, index, limit));
         if (rowMarkerLen < 0)
             return false;
-        index += computeUnsignedVIntSize(rowMarkerLen) + rowMarkerLen;
-        if (index >= limit)
+        index = addNonNegative(index, computeUnsignedVIntSize(rowMarkerLen), rowMarkerLen);
+        if (index >= limit || index < 0)
             return false;
 
-        long remaining = getUnsignedVInt(bytes, index, limit);
+        int remaining = toIntExact(getUnsignedVInt(bytes, index, limit));
         if (remaining < 0)
             return false;
-        index += computeUnsignedVIntSize(remaining);
-        if (index >= limit)
+        index = addNonNegative(index, computeUnsignedVIntSize(remaining));
+        if (index >= limit || index < 0)
             return false;
 
         long remainingInPartition = getUnsignedVInt(bytes, index, limit);
         if (remainingInPartition < 0)
             return false;
-        index += computeUnsignedVIntSize(remainingInPartition);
+        index = addNonNegative(index, computeUnsignedVIntSize(remainingInPartition));
         return index == limit;
     }
 
-    @SuppressWarnings({ "resource", "RedundantSuppression" })
-    private static PagingState modernDeserialize(ByteBuffer bytes, int protocolVersion) throws IOException
+    // Following operations are similar to Math.{addExact/toIntExact}, but without using exceptions for control flow.
+    // Since we're operating non-negative numbers, we can use -1 return value as an error code.
+    private static int addNonNegative(int x, int y)
     {
-        if (protocolVersion < VERSION_4)
+        int sum = x + y;
+        if (sum < 0)
+            return -1;
+        return sum;
+    }
+
+    private static int addNonNegative(int x, int y, int z)
+    {
+        int sum = x + y;
+        if (sum < 0)
+            return -1;
+        sum += z;
+        if (sum < 0)
+            return -1;
+        return sum;
+    }
+
+    private static int toIntExact(long value)
+    {
+        if ((int)value != value)
+            return -1;
+        return (int)value;
+    }
+
+    private static PagingState modernDeserialize(ByteBuffer bytes, ProtocolVersion protocolVersion) throws IOException
+    {
+        if (protocolVersion.isSmallerThan(ProtocolVersion.V4))
             throw new IllegalArgumentException();
 
         DataInputBuffer in = new DataInputBuffer(bytes, false);
 
         ByteBuffer partitionKey = readWithVIntLength(in);
         ByteBuffer rawMark = readWithVIntLength(in);
-        int remaining = Ints.checkedCast(in.readUnsignedVInt());
-        int remainingInPartition = Ints.checkedCast(in.readUnsignedVInt());
+        int remaining = in.readUnsignedVInt32();
+        int remainingInPartition = in.readUnsignedVInt32();
 
         return new PagingState(partitionKey.hasRemaining() ? partitionKey : null,
                                rawMark.hasRemaining() ? new RowMark(rawMark, protocolVersion) : null,
@@ -203,7 +229,6 @@ public class PagingState
      */
 
     @VisibleForTesting
-    @SuppressWarnings({ "resource", "RedundantSuppression" })
     ByteBuffer legacySerialize(boolean withRemainingInPartition) throws IOException
     {
         DataOutputBuffer out = new DataOutputBufferFixed(legacySerializedSize(withRemainingInPartition));
@@ -215,7 +240,8 @@ public class PagingState
         return out.buffer(false);
     }
 
-    private static boolean isLegacySerialized(ByteBuffer bytes)
+    @VisibleForTesting
+    static boolean isLegacySerialized(ByteBuffer bytes)
     {
         int index = bytes.position();
         int limit = bytes.limit();
@@ -253,10 +279,9 @@ public class PagingState
         return false;
     }
 
-    @SuppressWarnings({ "resource", "RedundantSuppression" })
-    private static PagingState legacyDeserialize(ByteBuffer bytes, int protocolVersion) throws IOException
+    private static PagingState legacyDeserialize(ByteBuffer bytes, ProtocolVersion protocolVersion) throws IOException
     {
-        if (protocolVersion > VERSION_3)
+        if (protocolVersion.isGreaterThan(ProtocolVersion.V3))
             throw new IllegalArgumentException();
 
         DataInputBuffer in = new DataInputBuffer(bytes, false);
@@ -325,15 +350,15 @@ public class PagingState
     {
         // This can be null for convenience if no row is marked.
         private final ByteBuffer mark;
-        private final int protocolVersion;
+        private final ProtocolVersion protocolVersion;
 
-        private RowMark(ByteBuffer mark, int protocolVersion)
+        private RowMark(ByteBuffer mark, ProtocolVersion protocolVersion)
         {
             this.mark = mark;
             this.protocolVersion = protocolVersion;
         }
 
-        private static List<AbstractType<?>> makeClusteringTypes(CFMetaData metadata)
+        private static List<AbstractType<?>> makeClusteringTypes(TableMetadata metadata)
         {
             // This is the types that will be used when serializing the clustering in the paging state. We can't really use the actual clustering
             // types however because we can't guarantee that there won't be a schema change between when we send the paging state and get it back,
@@ -347,45 +372,100 @@ public class PagingState
             return l;
         }
 
-        public static RowMark create(CFMetaData metadata, Row row, int protocolVersion)
+        public static RowMark create(TableMetadata metadata, Row row, ProtocolVersion protocolVersion)
         {
             ByteBuffer mark;
-            if (protocolVersion <= VERSION_3)
+            if (protocolVersion.isSmallerOrEqualTo(ProtocolVersion.V3))
             {
                 // We need to be backward compatible with 2.1/2.2 nodes paging states. Which means we have to send
                 // the full cellname of the "last" cell in the row we get (since that's how 2.1/2.2 nodes will start after
                 // that last row if they get that paging state).
-                Iterator<Cell> cells = row.cellsInLegacyOrder(metadata, true).iterator();
+                Iterator<Cell<?>> cells = row.cellsInLegacyOrder(metadata, true).iterator();
                 if (!cells.hasNext())
                 {
                     // If the last returned row has no cell, this means in 2.1/2.2 terms that we stopped on the row
-                    // marker. Note that this shouldn't happen if the table is COMPACT.
+                    // marker.  Note that this shouldn't happen if the table is COMPACT STORAGE tables.
                     assert !metadata.isCompactTable();
-                    mark = LegacyLayout.encodeCellName(metadata, row.clustering(), EMPTY_BYTE_BUFFER, null);
+                    mark = encodeCellName(metadata, row.clustering(), EMPTY_BYTE_BUFFER, null);
                 }
                 else
                 {
-                    Cell cell = cells.next();
-                    mark = LegacyLayout.encodeCellName(metadata, row.clustering(), cell.column().name.bytes, cell.column().isComplex() ? cell.path().get(0) : null);
+                    Cell<?> cell = cells.next();
+                    mark = encodeCellName(metadata, row.clustering(), cell.column().name.bytes, cell.column().isComplex() ? cell.path().get(0) : null);
                 }
             }
             else
             {
-                // We froze the serialization version to 3.0 as we need to make this this doesn't change (that is, it has to be
-                // fix for a given version of the protocol).
-                mark = Clustering.serializer.serialize(row.clustering(), MessagingService.VERSION_30, makeClusteringTypes(metadata));
+                // We froze the serialization version to 3.0 as we need to make sure this this doesn't change
+                //  It got bumped to 4.0 when 3.0 got dropped, knowing it didn't change
+                mark = Clustering.serializer.serialize(row.clustering(), MessagingService.VERSION_40, makeClusteringTypes(metadata));
             }
             return new RowMark(mark, protocolVersion);
         }
 
-        public Clustering clustering(CFMetaData metadata)
+        public Clustering<?> clustering(TableMetadata metadata)
         {
             if (mark == null)
                 return null;
 
-            return protocolVersion <= VERSION_3
-                 ? LegacyLayout.decodeClustering(metadata, mark)
-                 : Clustering.serializer.deserialize(mark, MessagingService.VERSION_30, makeClusteringTypes(metadata));
+            return protocolVersion.isSmallerOrEqualTo(ProtocolVersion.V3)
+                 ? decodeClustering(metadata, mark)
+                 : Clustering.serializer.deserialize(mark, MessagingService.VERSION_40, makeClusteringTypes(metadata));
+        }
+
+        // Old (pre-3.0) encoding of cells. We need that for the protocol v3 as that is how things where encoded
+        private static ByteBuffer encodeCellName(TableMetadata metadata, Clustering<?> clustering, ByteBuffer columnName, ByteBuffer collectionElement)
+        {
+            // v30 and v3X don't use composites for single-element clusterings in compact tables
+            if (metadata.isCompactTable() && metadata.comparator.size() == 1)
+                return clustering.bufferAt(0);
+
+            boolean isStatic = clustering == Clustering.STATIC_CLUSTERING;
+
+            // We use comparator.size() rather than clustering.size() because of static clusterings
+            int clusteringSize = metadata.comparator.size();
+            int size = clusteringSize + 1 + (collectionElement == null ? 0 : 1);
+            ByteBuffer[] values = new ByteBuffer[size];
+            for (int i = 0; i < clusteringSize; i++)
+            {
+                if (isStatic)
+                {
+                    values[i] = EMPTY_BYTE_BUFFER;
+                    continue;
+                }
+
+                ByteBuffer v = clustering.bufferAt(i);
+                // we can have null (only for dense compound tables for backward compatibility reasons) but that
+                // means we're done and should stop there as far as building the composite is concerned.
+                if (v == null)
+                    return CompositeType.build(ByteBufferAccessor.instance, Arrays.copyOfRange(values, 0, i));
+
+                values[i] = v;
+            }
+
+            values[clusteringSize] = columnName;
+            if (collectionElement != null)
+                values[clusteringSize + 1] = collectionElement;
+
+            return CompositeType.build(ByteBufferAccessor.instance, isStatic, values);
+        }
+
+        private static Clustering<?> decodeClustering(TableMetadata metadata, ByteBuffer value)
+        {
+            int csize = metadata.comparator.size();
+            if (csize == 0)
+                return Clustering.EMPTY;
+
+            // v30 and v3X don't use composites for single-element clusterings in compact tables
+            if (metadata.isCompactTable() && metadata.comparator.size() == 1)
+                return Clustering.make(value);
+
+            if (CompositeType.isStaticName(value, ByteBufferAccessor.instance))
+                return Clustering.STATIC_CLUSTERING;
+
+            List<ByteBuffer> components = CompositeType.splitName(value, ByteBufferAccessor.instance);
+
+            return Clustering.make(components.subList(0, Math.min(csize, components.size())).toArray(new ByteBuffer[csize]));
         }
 
         @Override

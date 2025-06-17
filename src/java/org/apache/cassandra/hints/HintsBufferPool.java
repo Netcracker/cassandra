@@ -18,14 +18,16 @@
 package org.apache.cassandra.hints;
 
 import java.io.Closeable;
-import java.io.IOException;
 import java.util.UUID;
 import java.util.concurrent.BlockingQueue;
-import java.util.concurrent.LinkedBlockingQueue;
 
-import org.apache.cassandra.config.Config;
+import com.google.common.annotations.VisibleForTesting;
+
 import org.apache.cassandra.net.MessagingService;
-import sun.nio.ch.DirectBuffer;
+import org.apache.cassandra.utils.concurrent.UncheckedInterruptedException;
+
+import static org.apache.cassandra.config.CassandraRelevantProperties.MAX_HINT_BUFFERS;
+import static org.apache.cassandra.utils.concurrent.BlockingQueues.newBlockingQueue;
 
 /**
  * A primitive pool of {@link HintsBuffer} buffers. Under normal conditions should only hold two buffers - the currently
@@ -38,7 +40,7 @@ final class HintsBufferPool implements Closeable
         void flush(HintsBuffer buffer, HintsBufferPool pool);
     }
 
-    static final int MAX_ALLOCATED_BUFFERS = Integer.getInteger(Config.PROPERTY_PREFIX + "MAX_HINT_BUFFERS", 3);
+    static final int MAX_ALLOCATED_BUFFERS = MAX_HINT_BUFFERS.getInt();
     private volatile HintsBuffer currentBuffer;
     private final BlockingQueue<HintsBuffer> reserveBuffers;
     private final int bufferSize;
@@ -47,7 +49,7 @@ final class HintsBufferPool implements Closeable
 
     HintsBufferPool(int bufferSize, FlushCallback flushCallback)
     {
-        reserveBuffers = new LinkedBlockingQueue<>();
+        reserveBuffers = newBlockingQueue();
         this.bufferSize = bufferSize;
         this.flushCallback = flushCallback;
     }
@@ -119,7 +121,7 @@ final class HintsBufferPool implements Closeable
             }
             catch (InterruptedException e)
             {
-                throw new RuntimeException(e);
+                throw new UncheckedInterruptedException(e);
             }
         }
         currentBuffer = buffer == null ? createBuffer() : buffer;
@@ -131,6 +133,13 @@ final class HintsBufferPool implements Closeable
     {
         allocatedBuffers++;
         return HintsBuffer.create(bufferSize);
+    }
+
+    @VisibleForTesting
+    public void clearUnsafe()
+    {
+        if (currentBuffer != null)
+            currentBuffer = currentBuffer.recycle();
     }
 
     public void close()

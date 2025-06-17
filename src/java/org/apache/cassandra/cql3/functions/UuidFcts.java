@@ -25,14 +25,15 @@ import org.apache.cassandra.serializers.UUIDSerializer;
 
 public abstract class UuidFcts
 {
-    public static Collection<Function> all()
+    public static void addFunctionsTo(NativeFunctions functions)
     {
-        return Collections.singleton(uuidFct);
+        functions.add(uuidFct);
     }
 
-    public static final Function uuidFct = new NativeScalarFunction("uuid", UUIDType.instance)
+    public static final NativeFunction uuidFct = new NativeScalarFunction("uuid", UUIDType.instance)
     {
-        public ByteBuffer execute(int protocolVersion, List<ByteBuffer> parameters)
+        @Override
+        public ByteBuffer execute(Arguments arguments)
         {
             return UUIDSerializer.instance.serialize(UUID.randomUUID());
         }

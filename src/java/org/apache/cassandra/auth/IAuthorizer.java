@@ -22,12 +22,22 @@ import java.util.Set;
 import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.exceptions.RequestExecutionException;
 import org.apache.cassandra.exceptions.RequestValidationException;
+import org.apache.cassandra.utils.Pair;
 
 /**
  * Primary Cassandra authorization interface.
  */
-public interface IAuthorizer
+public interface IAuthorizer extends AuthCache.BulkLoader<Pair<AuthenticatedUser, IResource>, Set<Permission>>
 {
+    /**
+     * Whether or not the authorizer will attempt authorization.
+     * If false the authorizer will not be called for authorization of resources.
+     */
+    default boolean requireAuthorization()
+    {
+        return true;
+    }
+
     /**
      * Returns a set of permissions of a user on a resource.
      * Since Roles were introduced in version 2.2, Cassandra does not distinguish in any
@@ -52,12 +62,14 @@ public interface IAuthorizer
      * @param permissions Set of permissions to grant.
      * @param resource Resource on which to grant the permissions.
      * @param grantee Role to which the permissions are to be granted.
+     * @return the permissions that have been successfully granted, comprised by the requested permissions excluding
+     * those permissions that were already granted.
      *
      * @throws RequestValidationException
      * @throws RequestExecutionException
      * @throws java.lang.UnsupportedOperationException
      */
-    void grant(AuthenticatedUser performer, Set<Permission> permissions, IResource resource, RoleResource grantee)
+    Set<Permission> grant(AuthenticatedUser performer, Set<Permission> permissions, IResource resource, RoleResource grantee)
     throws RequestValidationException, RequestExecutionException;
 
     /**
@@ -70,12 +82,14 @@ public interface IAuthorizer
      * @param permissions Set of permissions to revoke.
      * @param revokee Role from which to the permissions are to be revoked.
      * @param resource Resource on which to revoke the permissions.
+     * @return the permissions that have been successfully revoked, comprised by the requested permissions excluding
+     * those permissions that were already not granted.
      *
      * @throws RequestValidationException
      * @throws RequestExecutionException
      * @throws java.lang.UnsupportedOperationException
      */
-    void revoke(AuthenticatedUser performer, Set<Permission> permissions, IResource resource, RoleResource revokee)
+    Set<Permission> revoke(AuthenticatedUser performer, Set<Permission> permissions, IResource resource, RoleResource revokee)
     throws RequestValidationException, RequestExecutionException;
 
     /**

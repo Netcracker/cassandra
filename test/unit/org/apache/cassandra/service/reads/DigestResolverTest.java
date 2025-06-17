@@ -18,91 +18,80 @@
 
 package org.apache.cassandra.service.reads;
 
-import java.net.UnknownHostException;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 
-import com.google.common.collect.ImmutableList;
-import org.junit.BeforeClass;
+import org.apache.cassandra.locator.ReplicaPlan;
+import org.junit.Assert;
 import org.junit.Test;
 
-import org.apache.cassandra.SchemaLoader;
-import org.apache.cassandra.Util;
-import org.apache.cassandra.config.CFMetaData;
-import org.apache.cassandra.config.DatabaseDescriptor;
-import org.apache.cassandra.db.*;
-import org.apache.cassandra.db.marshal.AsciiType;
-import org.apache.cassandra.db.marshal.BytesType;
-import org.apache.cassandra.db.partitions.PartitionIterator;
+import org.apache.cassandra.db.ConsistencyLevel;
+import org.apache.cassandra.db.SimpleBuilders;
+import org.apache.cassandra.db.SinglePartitionReadCommand;
 import org.apache.cassandra.db.partitions.PartitionUpdate;
-import org.apache.cassandra.db.partitions.SingletonUnfilteredPartitionIterator;
-import org.apache.cassandra.db.partitions.UnfilteredPartitionIterator;
-import org.apache.cassandra.db.rows.*;
-import org.apache.cassandra.dht.Murmur3Partitioner;
-import org.apache.cassandra.locator.InetAddressAndPort;
-import org.apache.cassandra.schema.KeyspaceParams;
-import org.apache.cassandra.service.DigestMismatchException;
-import org.apache.cassandra.service.DigestResolver;
-import org.apache.cassandra.service.ReadCallback;
-import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.db.rows.Row;
+import org.apache.cassandra.locator.EndpointsForToken;
+import org.apache.cassandra.tcm.Epoch;
+import org.apache.cassandra.schema.TableMetadata;
+import org.apache.cassandra.transport.Dispatcher;
 
-import static org.apache.cassandra.utils.ByteBufferUtil.bytes;
-import static org.junit.Assert.assertTrue;
+import static org.apache.cassandra.locator.ReplicaUtils.full;
+import static org.apache.cassandra.locator.ReplicaUtils.trans;
 
-public class DigestResolverTest
+public class DigestResolverTest extends AbstractReadResponseTest
 {
-    public static final String KEYSPACE1 = "DigestResolverTest";
-    public static final String CF_STANDARD = "Standard1";
-
-    private static Keyspace ks;
-    private static CFMetaData cfm;
-
-    private static final InetAddressAndPort EP1;
-    private static final InetAddressAndPort EP2;
-
-    static
+    private static PartitionUpdate.Builder update(TableMetadata metadata, String key, Row... rows)
     {
-        try
+        PartitionUpdate.Builder builder = new PartitionUpdate.Builder(metadata, dk(key), metadata.regularAndStaticColumns(), rows.length, false);
+        for (Row row: rows)
         {
-            EP1 = InetAddressAndPort.getByName("127.0.0.1");
-            EP2 = InetAddressAndPort.getByName("127.0.0.2");
+            builder.add(row);
         }
-        catch (UnknownHostException e)
-        {
-            throw new RuntimeException(e);
-        }
+        return builder;
     }
 
-    @BeforeClass
-    public static void setupClass() throws Throwable
+    private static PartitionUpdate.Builder update(Row... rows)
     {
-        DatabaseDescriptor.setPartitionerUnsafe(Murmur3Partitioner.instance);
-
-        CFMetaData.Builder builder1 = CFMetaData.Builder.create(KEYSPACE1, CF_STANDARD)
-                                                        .addPartitionKey("key", BytesType.instance)
-                                                        .addClusteringColumn("col1", AsciiType.instance)
-                                                        .addRegularColumn("c1", AsciiType.instance);
-
-        SchemaLoader.prepareServer();
-        SchemaLoader.createKeyspace(KEYSPACE1, KeyspaceParams.simple(2), builder1.build());
-
-        ks = Keyspace.open(KEYSPACE1);
-        ColumnFamilyStore cfs = ks.getColumnFamilyStore(CF_STANDARD);
-        cfm = cfs.metadata;
+        return update(cfm, "key1", rows);
     }
-    
+
+    private static Row row(long timestamp, int clustering, int value)
+    {
+        SimpleBuilders.RowBuilder builder = new SimpleBuilders.RowBuilder(cfm, Integer.toString(clustering));
+        builder.timestamp(timestamp).add("c1", Integer.toString(value));
+        return builder.build();
+    }
+
+    @Test
+    public void noRepairNeeded()
+    {
+        SinglePartitionReadCommand command = SinglePartitionReadCommand.fullPartitionRead(cfm, nowInSec, dk);
+        EndpointsForToken targetReplicas = EndpointsForToken.of(dk.getToken(), full(EP1), full(EP2));
+        DigestResolver resolver = new DigestResolver(ReadCoordinator.DEFAULT, command, plan(ConsistencyLevel.QUORUM, targetReplicas), new Dispatcher.RequestTime(0L, 0L));
+
+        PartitionUpdate response = update(row(1000, 4, 4), row(1000, 5, 5)).build();
+
+        Assert.assertFalse(resolver.isDataPresent());
+        resolver.preprocess(response(command, EP2, iter(response), true));
+        resolver.preprocess(response(command, EP1, iter(response), false));
+        Assert.assertTrue(resolver.isDataPresent());
+        Assert.assertTrue(resolver.responsesMatch());
+
+        assertPartitionsEqual(filter(iter(response)), resolver.getData());
+    }
+
     /**
-     * This test makes a time-boxed effort to reproduce the issue found in CASSANDRA-16883.
+     * This test makes a time-boxed effort to reproduce the issue found in CASSANDRA-16807.
      */
     @Test
-    public void multiThreadedNoRepairNeededReadCallback() throws DigestMismatchException
+    public void multiThreadedNoRepairNeededReadCallback()
     {
-        DecoratedKey dk = Util.dk("key1");
-        SinglePartitionReadCommand command = SinglePartitionReadCommand.fullPartitionRead(cfm, FBUtilities.nowInSeconds(), dk);
-        BufferCell cell = BufferCell.live(cfm, cfm.partitionColumns().regulars.getSimple(0), 1000, bytes("1"));
-        PartitionUpdate response = PartitionUpdate.singleRowUpdate(cfm, dk, BTreeRow.singleCellRow(cfm.comparator.make("1"), cell));
+        SinglePartitionReadCommand command = SinglePartitionReadCommand.fullPartitionRead(cfm, nowInSec, dk);
+        EndpointsForToken targetReplicas = EndpointsForToken.of(dk.getToken(), full(EP1), full(EP2));
+        PartitionUpdate response = update(row(1000, 4, 4), row(1000, 5, 5)).build();
+        ReplicaPlan.SharedForTokenRead plan = plan(ConsistencyLevel.ONE, targetReplicas);
 
         ExecutorService pool = Executors.newFixedThreadPool(2);
         long endTime = System.nanoTime() + TimeUnit.MINUTES.toNanos(2);
@@ -111,8 +100,10 @@ public class DigestResolverTest
         {
             while (System.nanoTime() < endTime)
             {
-                final DigestResolver resolver = new DigestResolver(ks, command, ConsistencyLevel.ONE, 2);
-                final ReadCallback callback = new ReadCallback(resolver, ConsistencyLevel.ONE, command, ImmutableList.of(EP1.address, EP2.address));
+                final long startNanos = System.nanoTime();
+                final Dispatcher.RequestTime requestTime = new Dispatcher.RequestTime(startNanos, startNanos);
+                final DigestResolver<EndpointsForToken, ReplicaPlan.ForTokenRead> resolver = new DigestResolver<>(ReadCoordinator.DEFAULT, command, plan, requestTime);
+                final ReadCallback<EndpointsForToken, ReplicaPlan.ForTokenRead> callback = new ReadCallback<>(resolver, command, plan, requestTime);
                 
                 final CountDownLatch startlatch = new CountDownLatch(2);
 
@@ -120,23 +111,19 @@ public class DigestResolverTest
                              {
                                  startlatch.countDown();
                                  waitForLatch(startlatch);
-                                 callback.response(ReadResponse.createDataResponse(iter(response), command));
+                                 callback.onResponse(response(command, EP1, iter(response), true));
                              });
 
                 pool.execute(() ->
                              {
                                  startlatch.countDown();
                                  waitForLatch(startlatch);
-                                 callback.response(ReadResponse.createDataResponse(iter(response), command));
+                                 callback.onResponse(response(command, EP2, iter(response), true));
                              });
 
                 callback.awaitResults();
-                assertTrue(resolver.isDataPresent());
-                
-                try (PartitionIterator result = resolver.resolve())
-                {
-                    assertTrue(result.hasNext());
-                }
+                Assert.assertTrue(resolver.isDataPresent());
+                Assert.assertTrue(resolver.responsesMatch());
             }
         }
         finally
@@ -145,9 +132,90 @@ public class DigestResolverTest
         }
     }
 
-    public UnfilteredPartitionIterator iter(PartitionUpdate update)
+    @Test
+    public void digestMismatch()
     {
-        return new SingletonUnfilteredPartitionIterator(update.unfilteredIterator(), false);
+        SinglePartitionReadCommand command = SinglePartitionReadCommand.fullPartitionRead(cfm, nowInSec, dk);
+        EndpointsForToken targetReplicas = EndpointsForToken.of(dk.getToken(), full(EP1), full(EP2));
+        DigestResolver resolver = new DigestResolver(ReadCoordinator.DEFAULT, command, plan(ConsistencyLevel.QUORUM, targetReplicas), new Dispatcher.RequestTime(0L, 0L));
+
+        PartitionUpdate response1 = update(row(1000, 4, 4), row(1000, 5, 5)).build();
+        PartitionUpdate response2 = update(row(2000, 4, 5)).build();
+
+        Assert.assertFalse(resolver.isDataPresent());
+        resolver.preprocess(response(command, EP2, iter(response1), true));
+        resolver.preprocess(response(command, EP1, iter(response2), false));
+        Assert.assertTrue(resolver.isDataPresent());
+        Assert.assertFalse(resolver.responsesMatch());
+        Assert.assertFalse(resolver.hasTransientResponse());
+    }
+
+    /**
+     * A full response and a transient response, with the transient response being a subset of the full one
+     */
+    @Test
+    public void agreeingTransient()
+    {
+        SinglePartitionReadCommand command = SinglePartitionReadCommand.fullPartitionRead(cfm, nowInSec, dk);
+        EndpointsForToken targetReplicas = EndpointsForToken.of(dk.getToken(), full(EP1), trans(EP2));
+        DigestResolver<?, ?> resolver = new DigestResolver<>(ReadCoordinator.DEFAULT, command, plan(ConsistencyLevel.QUORUM, targetReplicas), new Dispatcher.RequestTime(0L, 0L));
+
+        PartitionUpdate response1 = update(row(1000, 4, 4), row(1000, 5, 5)).build();
+        PartitionUpdate response2 = update(row(1000, 5, 5)).build();
+
+        Assert.assertFalse(resolver.isDataPresent());
+        resolver.preprocess(response(command, EP1, iter(response1), false));
+        resolver.preprocess(response(command, EP2, iter(response2), false));
+        Assert.assertTrue(resolver.isDataPresent());
+        Assert.assertTrue(resolver.responsesMatch());
+        Assert.assertTrue(resolver.hasTransientResponse());
+    }
+
+    /**
+     * Transient responses shouldn't be classified as the single dataResponse
+     */
+    @Test
+    public void transientResponse()
+    {
+        SinglePartitionReadCommand command = SinglePartitionReadCommand.fullPartitionRead(cfm, nowInSec, dk);
+        EndpointsForToken targetReplicas = EndpointsForToken.of(dk.getToken(), full(EP1), trans(EP2));
+        DigestResolver<?, ?> resolver = new DigestResolver<>(ReadCoordinator.DEFAULT, command, plan(ConsistencyLevel.QUORUM, targetReplicas), new Dispatcher.RequestTime(0L, 0L));
+
+        PartitionUpdate response2 = update(row(1000, 5, 5)).build();
+        Assert.assertFalse(resolver.isDataPresent());
+        Assert.assertFalse(resolver.hasTransientResponse());
+        resolver.preprocess(response(command, EP2, iter(response2), false));
+        Assert.assertFalse(resolver.isDataPresent());
+        Assert.assertTrue(resolver.hasTransientResponse());
+    }
+
+    @Test
+    public void transientResponseData()
+    {
+        SinglePartitionReadCommand command = SinglePartitionReadCommand.fullPartitionRead(cfm, nowInSec, dk);
+        EndpointsForToken targetReplicas = EndpointsForToken.of(dk.getToken(), full(EP1), full(EP2), trans(EP3));
+        DigestResolver<?, ?> resolver = new DigestResolver<>(ReadCoordinator.DEFAULT, command, plan(ConsistencyLevel.QUORUM, targetReplicas), new Dispatcher.RequestTime(0L, 0L));
+
+        PartitionUpdate fullResponse = update(row(1000, 1, 1)).build();
+        PartitionUpdate digestResponse = update(row(1000, 1, 1)).build();
+        PartitionUpdate transientResponse = update(row(1000, 2, 2)).build();
+        Assert.assertFalse(resolver.isDataPresent());
+        Assert.assertFalse(resolver.hasTransientResponse());
+        resolver.preprocess(response(command, EP1, iter(fullResponse), false));
+        Assert.assertTrue(resolver.isDataPresent());
+        resolver.preprocess(response(command, EP2, iter(digestResponse), true));
+        resolver.preprocess(response(command, EP3, iter(transientResponse), false));
+        Assert.assertTrue(resolver.hasTransientResponse());
+
+        assertPartitionsEqual(filter(iter(dk,
+                                          row(1000, 1, 1),
+                                          row(1000, 2, 2))),
+                              resolver.getData());
+    }
+
+    private ReplicaPlan.SharedForTokenRead plan(ConsistencyLevel consistencyLevel, EndpointsForToken replicas)
+    {
+        return ReplicaPlan.shared(new ReplicaPlan.ForTokenRead(ks, ks.getReplicationStrategy(), consistencyLevel, replicas, replicas, replicas, null, (self) -> null, Epoch.EMPTY));
     }
 
     private void waitForLatch(CountDownLatch startlatch)

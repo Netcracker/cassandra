@@ -28,18 +28,24 @@ import org.junit.BeforeClass;
 import org.junit.Test;
 
 import org.apache.cassandra.SchemaLoader;
-import org.apache.cassandra.config.CFMetaData;
-import org.apache.cassandra.config.Schema;
+import org.apache.cassandra.concurrent.NamedThreadFactory;
 import org.apache.cassandra.db.Mutation;
 import org.apache.cassandra.db.RowUpdateBuilder;
+import org.apache.cassandra.db.marshal.ValueAccessors;
 import org.apache.cassandra.db.rows.Cell;
 import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.io.util.DataInputBuffer;
 import org.apache.cassandra.io.util.DataInputPlus;
 import org.apache.cassandra.net.MessagingService;
 import org.apache.cassandra.schema.KeyspaceParams;
+import org.apache.cassandra.schema.Schema;
+import org.apache.cassandra.schema.TableMetadata;
 
-import static junit.framework.Assert.*;
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
 
 import static org.apache.cassandra.utils.ByteBufferUtil.bytes;
 import static org.apache.cassandra.utils.FBUtilities.updateChecksum;
@@ -61,7 +67,6 @@ public class HintsBufferTest
     }
 
     @Test
-    @SuppressWarnings("resource")
     public void testOverlyLargeAllocation()
     {
         // create a small, 128 bytes buffer
@@ -114,7 +119,7 @@ public class HintsBufferTest
         // create HINT_THREADS_COUNT, start them, and wait for them to finish
         List<Thread> threads = new ArrayList<>(HINT_THREADS_COUNT);
         for (int i = 0; i < HINT_THREADS_COUNT; i ++)
-            threads.add(new Thread(new Writer(buffer, load, hintSize, i, baseTimestamp)));
+            threads.add(NamedThreadFactory.createAnonymousThread(new Writer(buffer, load, hintSize, i, baseTimestamp)));
         threads.forEach(java.lang.Thread::start);
         for (Thread thread : threads)
             thread.join();
@@ -180,10 +185,10 @@ public class HintsBufferTest
         Row row = hint.mutation.getPartitionUpdates().iterator().next().iterator().next();
         assertEquals(1, Iterables.size(row.cells()));
 
-        assertEquals(bytes(idx), row.clustering().get(0));
-        Cell cell = row.cells().iterator().next();
+        ValueAccessors.assertDataEquals(bytes(idx), row.clustering().get(0));
+        Cell<?> cell = row.cells().iterator().next();
         assertEquals(TimeUnit.MILLISECONDS.toMicros(baseTimestamp + idx), cell.timestamp());
-        assertEquals(bytes(idx), cell.value());
+        ValueAccessors.assertDataEquals(bytes(idx), cell.buffer());
 
         return idx;
     }
@@ -196,7 +201,7 @@ public class HintsBufferTest
 
     private static Mutation createMutation(int index, long timestamp)
     {
-        CFMetaData table = Schema.instance.getCFMetaData(KEYSPACE, TABLE);
+        TableMetadata table = Schema.instance.getTableMetadata(KEYSPACE, TABLE);
         return new RowUpdateBuilder(table, timestamp, bytes(index))
                    .clustering(bytes(index))
                    .add("val", bytes(index))

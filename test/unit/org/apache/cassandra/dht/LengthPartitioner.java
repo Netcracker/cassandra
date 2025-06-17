@@ -19,22 +19,31 @@ package org.apache.cassandra.dht;
 
 import java.math.BigInteger;
 import java.nio.ByteBuffer;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Random;
+import java.util.concurrent.ThreadLocalRandom;
+import java.util.function.Function;
 
-import org.apache.cassandra.config.CFMetaData;
-import org.apache.cassandra.config.Schema;
+import accord.primitives.Ranges;
 import org.apache.cassandra.db.BufferDecoratedKey;
 import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.db.marshal.IntegerType;
 import org.apache.cassandra.db.marshal.PartitionerDefinedOrder;
 import org.apache.cassandra.dht.KeyCollisionTest.BigIntegerToken;
+import org.apache.cassandra.schema.Schema;
+import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.Pair;
+import org.apache.cassandra.utils.bytecomparable.ByteComparable;
+import org.apache.cassandra.utils.bytecomparable.ByteSource;
 
-public class LengthPartitioner implements IPartitioner
+public class LengthPartitioner extends AccordSplitter implements IPartitioner
 {
     public static final BigInteger ZERO = new BigInteger("0");
     public static final BigIntegerToken MINIMUM = new BigIntegerToken("-1");
@@ -56,14 +65,30 @@ public class LengthPartitioner implements IPartitioner
         return new BigIntegerToken(midpair.left);
     }
 
+    public Token split(Token left, Token right, double ratioToLeft)
+    {
+        throw new UnsupportedOperationException();
+    }
+
     public BigIntegerToken getMinimumToken()
     {
         return MINIMUM;
     }
 
+    @Override
+    public Token getMaximumTokenForSplitting()
+    {
+        return null;
+    }
+
     public BigIntegerToken getRandomToken()
     {
-        return new BigIntegerToken(BigInteger.valueOf(new Random().nextInt(15)));
+        return getRandomToken(ThreadLocalRandom.current());
+    }
+
+    public BigIntegerToken getRandomToken(Random random)
+    {
+        return new BigIntegerToken(BigInteger.valueOf(random.nextInt(15)));
     }
 
     private final Token.TokenFactory tokenFactory = new Token.TokenFactory() {
@@ -76,6 +101,11 @@ public class LengthPartitioner implements IPartitioner
         public Token fromByteArray(ByteBuffer bytes)
         {
             return new BigIntegerToken(new BigInteger(ByteBufferUtil.getArray(bytes)));
+        }
+
+        public Token fromComparableBytes(ByteSource.Peekable comparableBytes, ByteComparable.Version version)
+        {
+            return fromByteArray(IntegerType.instance.fromComparableBytes(comparableBytes, version));
         }
 
         public String toString(Token token)
@@ -91,6 +121,8 @@ public class LengthPartitioner implements IPartitioner
 
         public void validate(String token) {}
     };
+
+    private LengthPartitioner() {}
 
     public Token.TokenFactory getTokenFactory()
     {
@@ -112,32 +144,32 @@ public class LengthPartitioner implements IPartitioner
     public Map<Token, Float> describeOwnership(List<Token> sortedTokens)
     {
         // allTokens will contain the count and be returned, sorted_ranges is shorthand for token<->token math.
-        Map<Token, Float> allTokens = new HashMap<Token, Float>();
-        List<Range<Token>> sortedRanges = new ArrayList<Range<Token>>();
+        Map<Token, Float> allTokens = new HashMap<>();
+        List<Range<Token>> sortedRanges = new ArrayList<>();
 
         // this initializes the counts to 0 and calcs the ranges in order.
         Token lastToken = sortedTokens.get(sortedTokens.size() - 1);
         for (Token node : sortedTokens)
         {
-            allTokens.put(node, new Float(0.0));
-            sortedRanges.add(new Range<Token>(lastToken, node));
+            allTokens.put(node, 0.0F);
+            sortedRanges.add(new Range<>(lastToken, node));
             lastToken = node;
         }
 
         for (String ks : Schema.instance.getKeyspaces())
         {
-            for (CFMetaData cfmd : Schema.instance.getTablesAndViews(ks))
+            for (TableMetadata cfmd : Schema.instance.getTablesAndViews(ks))
             {
                 for (Range<Token> r : sortedRanges)
                 {
                     // Looping over every KS:CF:Range, get the splits size and add it to the count
-                    allTokens.put(r.right, allTokens.get(r.right) + StorageService.instance.getSplits(ks, cfmd.cfName, r, 1).size());
+                    allTokens.put(r.right, allTokens.get(r.right) + StorageService.instance.getSplits(ks, cfmd.name, r, 1).size());
                 }
             }
         }
 
         // Sum every count up and divide count/total for the fractional ownership.
-        Float total = new Float(0.0);
+        Float total = 0.0F;
         for (Float f : allTokens.values())
             total += f;
         for (Map.Entry<Token, Float> row : allTokens.entrySet())
@@ -154,5 +186,40 @@ public class LengthPartitioner implements IPartitioner
     public AbstractType<?> partitionOrdering()
     {
         return new PartitionerDefinedOrder(this);
+    }
+
+    public AbstractType<?> partitionOrdering(AbstractType<?> partitionKeyType)
+    {
+        return new PartitionerDefinedOrder(this, partitionKeyType);
+    }
+
+    @Override
+    public Function<Ranges, AccordSplitter> accordSplitter()
+    {
+        return ignore -> this;
+    }
+
+    @Override
+    BigInteger valueForToken(Token token)
+    {
+        return ((BigIntegerToken)token).token;
+    }
+
+    @Override
+    Token tokenForValue(BigInteger value)
+    {
+        return new BigIntegerToken(value);
+    }
+
+    @Override
+    BigInteger minimumValue()
+    {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    BigInteger maximumValue()
+    {
+        throw new UnsupportedOperationException();
     }
 }

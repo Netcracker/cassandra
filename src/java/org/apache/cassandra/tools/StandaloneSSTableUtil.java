@@ -18,19 +18,18 @@
  */
 package org.apache.cassandra.tools;
 
-import org.apache.cassandra.config.CFMetaData;
-import org.apache.cassandra.config.Schema;
-import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.schema.Schema;
+import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.db.Directories;
 import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
+import org.apache.cassandra.tcm.ClusterMetadataService;
 import org.apache.cassandra.utils.OutputHandler;
 import org.apache.commons.cli.*;
 
-import java.io.File;
 import java.io.IOException;
-import java.util.function.BiFunction;
+import java.util.function.BiPredicate;
 
-import static org.apache.cassandra.tools.BulkLoader.CmdLineOptions;
+import org.apache.cassandra.io.util.File;
 
 public class StandaloneSSTableUtil
 {
@@ -44,13 +43,14 @@ public class StandaloneSSTableUtil
 
     public static void main(String args[])
     {
+
         Options options = Options.parseArgs(args);
         try
         {
             // load keyspace descriptions.
-            Schema.instance.loadFromDisk(false);
-
-            CFMetaData metadata = Schema.instance.getCFMetaData(options.keyspaceName, options.cfName);
+            Util.initDatabaseDescriptor();
+            ClusterMetadataService.initializeForTools(false);
+            TableMetadata metadata = Schema.instance.getTableMetadata(options.keyspaceName, options.cfName);
             if (metadata == null)
                 throw new IllegalArgumentException(String.format("Unknown keyspace/table %s.%s",
                                                                  options.keyspaceName,
@@ -60,7 +60,7 @@ public class StandaloneSSTableUtil
 
             if (options.cleanup)
             {
-                handler.output("Cleanuping up...");
+                handler.output("Cleaning up...");
                 LifecycleTransaction.removeUnfinishedLeftovers(metadata);
             }
             else
@@ -80,18 +80,18 @@ public class StandaloneSSTableUtil
         }
     }
 
-    private static void listFiles(Options options, CFMetaData metadata, OutputHandler handler) throws IOException
+    private static void listFiles(Options options, TableMetadata metadata, OutputHandler handler) throws IOException
     {
-        Directories directories = new Directories(metadata, ColumnFamilyStore.getInitialDirectories());
+        Directories directories = new Directories(metadata);
 
         for (File dir : directories.getCFDirectories())
         {
             for (File file : LifecycleTransaction.getFiles(dir.toPath(), getFilter(options), Directories.OnTxnErr.THROW))
-                handler.output(file.getCanonicalPath());
+                handler.output(file.canonicalPath());
         }
     }
 
-    private static BiFunction<File, Directories.FileType, Boolean> getFilter(Options options)
+    private static BiPredicate<File, Directories.FileType> getFilter(Options options)
     {
         return (file, type) ->
         {

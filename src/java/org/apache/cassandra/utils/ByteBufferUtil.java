@@ -23,20 +23,41 @@ package org.apache.cassandra.utils;
  * afterward, and ensure the tests still pass.
  */
 
-import java.io.*;
+import java.io.DataInput;
+import java.io.EOFException;
+import java.io.IOException;
+import java.io.InputStream;
+import java.math.BigDecimal;
+import java.math.BigInteger;
 import java.net.InetAddress;
 import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
 import java.nio.charset.CharacterCodingException;
 import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
+import java.util.Date;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
+import java.util.stream.Collectors;
 
+import net.nicoulaj.compilecommand.annotations.DontInline;
 import net.nicoulaj.compilecommand.annotations.Inline;
 import org.apache.cassandra.db.TypeSizes;
+import org.apache.cassandra.db.marshal.BooleanType;
+import org.apache.cassandra.db.marshal.BytesType;
+import org.apache.cassandra.db.marshal.ListType;
+import org.apache.cassandra.db.marshal.MapType;
+import org.apache.cassandra.db.marshal.SetType;
+import org.apache.cassandra.db.marshal.TimestampType;
+import org.apache.cassandra.io.UnversionedSerializer;
+import org.apache.cassandra.io.compress.BufferType;
 import org.apache.cassandra.io.util.DataInputPlus;
 import org.apache.cassandra.io.util.DataOutputPlus;
-import org.apache.cassandra.io.util.FileDataInput;
 import org.apache.cassandra.io.util.FileUtils;
 
 /**
@@ -83,6 +104,10 @@ public class ByteBufferUtil
     /** Represents an unset value in bound variables */
     public static final ByteBuffer UNSET_BYTE_BUFFER = ByteBuffer.wrap(new byte[]{});
 
+    public static final long EMPTY_SIZE_ON_HEAP = ObjectSizes.measureDeep(ByteBufferUtil.EMPTY_BYTE_BUFFER);
+
+    public static final ByteBuffer[] EMPTY_ARRAY = new ByteBuffer[0];
+
     @Inline
     public static int compareUnsigned(ByteBuffer o1, ByteBuffer o2)
     {
@@ -99,6 +124,16 @@ public class ByteBufferUtil
     public static int compare(ByteBuffer o1, byte[] o2)
     {
         return FastByteOperations.compareUnsigned(o1, o2, 0, o2.length);
+    }
+
+    public static int compare(ByteBuffer o1, int s1, int l1, byte[] o2)
+    {
+        return FastByteOperations.compareUnsigned(o1, s1, l1, o2, 0, o2.length);
+    }
+
+    public static int compare(byte[] o1, ByteBuffer o2, int s2, int l2)
+    {
+        return FastByteOperations.compareUnsigned(o1, 0, o1.length, o2, s2, l2);
     }
 
     /**
@@ -161,18 +196,45 @@ public class ByteBufferUtil
      */
     public static byte[] getArray(ByteBuffer buffer)
     {
-        int length = buffer.remaining();
+        return getArray(buffer, buffer.position(), buffer.remaining());
+    }
 
+    /**
+     * You should almost never use this.  Instead, use the write* methods to avoid copies.
+     */
+    public static byte[] getArray(ByteBuffer buffer, int position, int length)
+    {
         if (buffer.hasArray())
         {
-            int boff = buffer.arrayOffset() + buffer.position();
+            int boff = buffer.arrayOffset() + position;
             return Arrays.copyOfRange(buffer.array(), boff, boff + length);
         }
+
         // else, DirectByteBuffer.get() is the fastest route
         byte[] bytes = new byte[length];
-        buffer.duplicate().get(bytes);
-
+        ByteBuffer dup = buffer.duplicate();
+        dup.position(position).limit(position + length);
+        dup.get(bytes);
         return bytes;
+    }
+
+    /**
+     * You should almost never use this.  Instead, use the write* methods to avoid copies.
+     */
+    public static byte[] getArrayUnsafe(ByteBuffer buffer)
+    {
+        return getArrayUnsafe(buffer, buffer.position(), buffer.remaining());
+    }
+
+    /**
+     * You should almost never use this.  Instead, use the write* methods to avoid copies.
+     */
+    public static byte[] getArrayUnsafe(ByteBuffer buffer, int position, int length)
+    {
+        if (buffer.hasArray() && position == 0 && buffer.arrayOffset() == 0 && length == buffer.capacity())
+            return buffer.array();
+
+        return getArray(buffer, position, length);
     }
 
     /**
@@ -256,14 +318,23 @@ public class ByteBufferUtil
         return clone;
     }
 
-    public static void arrayCopy(ByteBuffer src, int srcPos, byte[] dst, int dstPos, int length)
+    /**
+     * Transfer bytes from a ByteBuffer to byte array.
+     *
+     * @param src the source ByteBuffer
+     * @param srcPos starting position in the source ByteBuffer
+     * @param dst the destination byte array
+     * @param dstPos starting position in the destination byte array
+     * @param length the number of bytes to copy
+     */
+    public static void copyBytes(ByteBuffer src, int srcPos, byte[] dst, int dstPos, int length)
     {
         FastByteOperations.copy(src, srcPos, dst, dstPos, length);
     }
 
     /**
      * Transfer bytes from one ByteBuffer to another.
-     * This function acts as System.arrayCopy() but for ByteBuffers.
+     * This function acts as System.arrayCopy() but for ByteBuffers, and operates safely on direct memory.
      *
      * @param src the source ByteBuffer
      * @param srcPos starting position in the source ByteBuffer
@@ -271,7 +342,7 @@ public class ByteBufferUtil
      * @param dstPos starting position in the destination ByteBuffer
      * @param length the number of bytes to copy
      */
-    public static void arrayCopy(ByteBuffer src, int srcPos, ByteBuffer dst, int dstPos, int length)
+    public static void copyBytes(ByteBuffer src, int srcPos, ByteBuffer dst, int dstPos, int length)
     {
         FastByteOperations.copy(src, srcPos, dst, dstPos, length);
     }
@@ -279,10 +350,35 @@ public class ByteBufferUtil
     public static int put(ByteBuffer src, ByteBuffer trg)
     {
         int length = Math.min(src.remaining(), trg.remaining());
-        arrayCopy(src, src.position(), trg, trg.position(), length);
+        copyBytes(src, src.position(), trg, trg.position(), length);
         trg.position(trg.position() + length);
         src.position(src.position() + length);
         return length;
+    }
+
+    public static void writeZeroes(ByteBuffer dest, int count)
+    {
+        if (count >= 8)
+        {
+            // align
+            while ((dest.position() & 0x7) != 0)
+            {
+                dest.put((byte) 0);
+                --count;
+            }
+        }
+        // write aligned longs
+        while (count >= 8)
+        {
+            dest.putLong(0L);
+            count -= 8;
+        }
+        // finish up
+        while (count > 0)
+        {
+            dest.put((byte) 0);
+            --count;
+        }
     }
 
     public static void writeWithLength(ByteBuffer bytes, DataOutputPlus out) throws IOException
@@ -293,28 +389,24 @@ public class ByteBufferUtil
 
     public static void writeWithVIntLength(ByteBuffer bytes, DataOutputPlus out) throws IOException
     {
-        out.writeUnsignedVInt(bytes.remaining());
+        out.writeUnsignedVInt32(bytes.remaining());
         out.write(bytes);
     }
-
-    public static void writeWithLength(byte[] bytes, DataOutput out) throws IOException
+    public static void writeWithVIntLengthAndNull(ByteBuffer bytes, DataOutputPlus out) throws IOException
     {
-        out.writeInt(bytes.length);
+        if (bytes == null)
+        {
+            out.writeVInt32(-1);
+            return;
+        }
+        
+        out.writeVInt32(bytes.remaining());
         out.write(bytes);
     }
 
     public static void writeWithShortLength(ByteBuffer buffer, DataOutputPlus out) throws IOException
     {
         int length = buffer.remaining();
-        assert 0 <= length && length <= FBUtilities.MAX_UNSIGNED_SHORT
-            : String.format("Attempted serializing to buffer exceeded maximum of %s bytes: %s", FBUtilities.MAX_UNSIGNED_SHORT, length);
-        out.writeShort(length);
-        out.write(buffer);
-    }
-
-    public static void writeWithShortLength(byte[] buffer, DataOutput out) throws IOException
-    {
-        int length = buffer.length;
         assert 0 <= length && length <= FBUtilities.MAX_UNSIGNED_SHORT
             : String.format("Attempted serializing to buffer exceeded maximum of %s bytes: %s", FBUtilities.MAX_UNSIGNED_SHORT, length);
         out.writeShort(length);
@@ -334,17 +426,11 @@ public class ByteBufferUtil
 
     public static ByteBuffer readWithVIntLength(DataInputPlus in) throws IOException
     {
-        int length = (int)in.readUnsignedVInt();
+        int length = in.readUnsignedVInt32();
         if (length < 0)
             throw new IOException("Corrupt (negative) value length encountered");
 
         return ByteBufferUtil.read(in, length);
-    }
-
-    public static int serializedSizeWithLength(ByteBuffer buffer)
-    {
-        int size = buffer.remaining();
-        return TypeSizes.sizeof(size) + size;
     }
 
     public static int serializedSizeWithVIntLength(ByteBuffer buffer)
@@ -353,9 +439,14 @@ public class ByteBufferUtil
         return TypeSizes.sizeofUnsignedVInt(size) + size;
     }
 
+    public static long estimatedSizeOnHeap(ByteBuffer buffer)
+    {
+        return EMPTY_SIZE_ON_HEAP + buffer.remaining();
+    }
+
     public static void skipWithVIntLength(DataInputPlus in) throws IOException
     {
-        int length = (int)in.readUnsignedVInt();
+        int length = in.readUnsignedVInt32();
         if (length < 0)
             throw new IOException("Corrupt (negative) value length encountered");
 
@@ -386,7 +477,6 @@ public class ByteBufferUtil
 
     /**
      * @param in data input
-     * @return null
      * @throws IOException if an I/O error occurs.
      */
     public static void skipShortLength(DataInputPlus in) throws IOException
@@ -413,6 +503,15 @@ public class ByteBufferUtil
         return bytes;
     }
 
+    public static byte[] readBytesWithLength(DataInput in) throws IOException
+    {
+        int length = in.readInt();
+        if (length < 0)
+            throw new IOException("Corrupt (negative) value length encountered");
+
+        return readBytes(in, length);
+    }
+
     /**
      * Convert a byte buffer to an integer.
      * Does not change the byte buffer position.
@@ -437,6 +536,18 @@ public class ByteBufferUtil
         return bytes.getShort(bytes.position());
     }
 
+    /**
+     * Convert a byte buffer to a short.
+     * Does not change the byte buffer position.
+     *
+     * @param bytes byte buffer to convert to byte
+     * @return byte representation of the byte buffer
+     */
+    public static byte toByte(ByteBuffer bytes)
+    {
+        return bytes.get(bytes.position());
+    }
+
     public static long toLong(ByteBuffer bytes)
     {
         return bytes.getLong(bytes.position());
@@ -445,6 +556,11 @@ public class ByteBufferUtil
     public static float toFloat(ByteBuffer bytes)
     {
         return bytes.getFloat(bytes.position());
+    }
+
+    public static float getFloat(ByteBuffer bytes, int offset)
+    {
+        return bytes.getFloat(offset);
     }
 
     public static double toDouble(ByteBuffer bytes)
@@ -466,14 +582,69 @@ public class ByteBufferUtil
             return ByteBufferUtil.bytes((float) obj);
         else if (obj instanceof Double)
             return ByteBufferUtil.bytes((double) obj);
+        else if (obj instanceof Boolean)
+            return BooleanType.instance.decompose((Boolean) obj);
         else if (obj instanceof UUID)
             return ByteBufferUtil.bytes((UUID) obj);
         else if (obj instanceof InetAddress)
             return ByteBufferUtil.bytes((InetAddress) obj);
         else if (obj instanceof String)
             return ByteBufferUtil.bytes((String) obj);
+        else if (obj instanceof byte[])
+            return ByteBuffer.wrap((byte[]) obj);
         else if (obj instanceof ByteBuffer)
             return (ByteBuffer) obj;
+        else if (obj instanceof BigInteger)
+            return ByteBuffer.wrap(((BigInteger)obj).toByteArray());
+        else if (obj instanceof BigDecimal)
+        {
+            BigDecimal cast = (BigDecimal) obj;
+            BigInteger bi = cast.unscaledValue();
+            int scale = cast.scale();
+            byte[] bibytes = bi.toByteArray();
+
+            ByteBuffer bytes = ByteBuffer.allocate(4 + bibytes.length);
+            bytes.putInt(scale);
+            bytes.put(bibytes);
+            bytes.rewind();
+            return bytes;
+        }
+        else if (obj instanceof List)
+        {
+            List<?> list = (List<?>) obj;
+            // convert subtypes to BB
+            List<ByteBuffer> bbs = list.stream().map(ByteBufferUtil::objectToBytes).collect(Collectors.toList());
+            // decompose/serializer doesn't use the isMultiCell, so safe to do this
+            return ListType.getInstance(BytesType.instance, false).decompose(bbs);
+        }
+        else if (obj instanceof Map)
+        {
+            Map<?, ?> map = (Map<?, ?>) obj;
+            // convert subtypes to BB
+            Map<ByteBuffer, ByteBuffer> bbs = new LinkedHashMap<>();
+            for (Map.Entry<?, ?> e : map.entrySet())
+            {
+                Object key = e.getKey();
+                ByteBuffer previousValue = bbs.put(objectToBytes(key), objectToBytes(e.getValue()));
+                if (previousValue != null)
+                    throw new IllegalStateException("Key " + key + " already maps to value " + previousValue);
+            }
+            // decompose/serializer doesn't use the isMultiCell, so safe to do this
+            return MapType.getInstance(BytesType.instance, BytesType.instance, false).decompose(bbs);
+        }
+        else if (obj instanceof Set)
+        {
+            Set<?> set = (Set<?>) obj;
+            // convert subtypes to BB
+            Set<ByteBuffer> bbs = new LinkedHashSet<>();
+            for (Object o : set)
+                if (!bbs.add(objectToBytes(o)))
+                    throw new IllegalStateException("Object " + o + " maps to a buffer that already exists in the set");
+            // decompose/serializer doesn't use the isMultiCell, so safe to do this
+            return SetType.getInstance(BytesType.instance, false).decompose(bbs);
+        }
+        else if (obj instanceof Date)
+            return TimestampType.instance.decompose((Date) obj);
         else
             throw new IllegalArgumentException(String.format("Cannot convert value %s of type %s",
                                                              obj,
@@ -543,8 +714,17 @@ public class ByteBufferUtil
         };
     }
 
+    /*
+     * Does not modify position or limit of buffer even temporarily
+     * so this is safe even without duplication.
+     */
     public static String bytesToHex(ByteBuffer bytes)
     {
+        if (bytes.hasArray())
+        {
+            return Hex.bytesToHex(bytes.array(), bytes.arrayOffset() + bytes.position(), bytes.remaining());
+        }
+
         final int offset = bytes.position();
         final int size = bytes.remaining();
         final char[] c = new char[size * 2];
@@ -580,6 +760,7 @@ public class ByteBufferUtil
 
         assert bytes1.limit() >= offset1 + length : "The first byte array isn't long enough for the specified offset and length.";
         assert bytes2.limit() >= offset2 + length : "The second byte array isn't long enough for the specified offset and length.";
+
         for (int i = 0; i < length; i++)
         {
             byte byte1 = bytes1.get(offset1 + i);
@@ -602,6 +783,11 @@ public class ByteBufferUtil
         return ByteBuffer.wrap(UUIDGen.decompose(uuid));
     }
 
+    public static ByteBuffer bytes(TimeUUID uuid)
+    {
+        return ByteBuffer.wrap(UUIDGen.decompose(uuid.msb(), uuid.lsb()));
+    }
+
     // Returns whether {@code prefix} is a prefix of {@code value}.
     public static boolean isPrefix(ByteBuffer prefix, ByteBuffer value)
     {
@@ -614,13 +800,14 @@ public class ByteBufferUtil
 
     public static boolean canMinimize(ByteBuffer buf)
     {
-        return buf != null && (buf.capacity() > buf.remaining() || !buf.hasArray());
+        return buf != null && (!buf.hasArray() || buf.array().length > buf.remaining());
+        // Note: buf.array().length is different from buf.capacity() for sliced buffers.
     }
 
     /** trims size of bytebuffer to exactly number of bytes in it, to do not hold too much memory */
     public static ByteBuffer minimalBufferFor(ByteBuffer buf)
     {
-        return buf.capacity() > buf.remaining() || !buf.hasArray() ? ByteBuffer.wrap(getArray(buf)) : buf;
+        return !buf.hasArray() || buf.array().length > buf.remaining() ? ByteBuffer.wrap(getArray(buf)) : buf;
     }
 
     public static ByteBuffer[] minimizeBuffers(ByteBuffer[] src)
@@ -641,11 +828,15 @@ public class ByteBufferUtil
         return false;
     }
 
+    public static int getUnsignedShort(ByteBuffer bb, int position)
+    {
+        return ((bb.get(position) & 0xFF) << 8) | (bb.get(position + 1) & 0xFF);
+    }
+
     // Doesn't change bb position
     public static int getShortLength(ByteBuffer bb, int position)
     {
-        int length = (bb.get(position) & 0xFF) << 8;
-        return length | (bb.get(position + 1) & 0xFF);
+        return getUnsignedShort(bb, position);
     }
 
     // changes bb position
@@ -658,6 +849,8 @@ public class ByteBufferUtil
     // changes bb position
     public static void writeShortLength(ByteBuffer bb, int length)
     {
+        if (length > FBUtilities.MAX_UNSIGNED_SHORT)
+            throw new IllegalArgumentException(String.format("Length %d > max length %d", length, FBUtilities.MAX_UNSIGNED_SHORT));
         bb.put((byte) ((length >> 8) & 0xFF));
         bb.put((byte) (length & 0xFF));
     }
@@ -678,4 +871,272 @@ public class ByteBufferUtil
         return readBytes(bb, length);
     }
 
+    /**
+     * Ensure {@code buf} is large enough for {@code outputLength}. If not, it is cleaned up and a new buffer is allocated;
+     * else; buffer has it's position/limit set appropriately.
+     *
+     * @param buf buffer to test the size of; may be null, in which case, a new buffer is allocated.
+     * @param outputLength the minimum target size of the buffer
+     * @param allowBufferResize true if resizing (reallocating) the buffer is allowed
+     * @return {@code buf} if it was large enough, else a newly allocated buffer.
+     */
+    public static ByteBuffer ensureCapacity(ByteBuffer buf, int outputLength, boolean allowBufferResize)
+    {
+        BufferType bufferType = buf != null ? BufferType.typeOf(buf) : BufferType.ON_HEAP;
+        return ensureCapacity(buf, outputLength, allowBufferResize, bufferType);
+    }
+
+    /**
+     * Ensure {@code buf} is large enough for {@code outputLength}. If not, it is cleaned up and a new buffer is allocated;
+     * else; buffer has it's position/limit set appropriately.
+     *
+     * @param buf buffer to test the size of; may be null, in which case, a new buffer is allocated.
+     * @param outputLength the minimum target size of the buffer
+     * @param allowBufferResize true if resizing (reallocating) the buffer is allowed
+     * @param bufferType on- or off- heap byte buffer
+     * @return {@code buf} if it was large enough, else a newly allocated buffer.
+     */
+    public static ByteBuffer ensureCapacity(ByteBuffer buf, int outputLength, boolean allowBufferResize, BufferType bufferType)
+    {
+        if (0 > outputLength)
+            throw new IllegalArgumentException("invalid size for output buffer: " + outputLength);
+        if (buf == null || buf.capacity() < outputLength)
+        {
+            if (!allowBufferResize)
+                throw new IllegalStateException(String.format("output buffer is not large enough for data: current capacity %d, required %d", buf.capacity(), outputLength));
+            FileUtils.clean(buf);
+            buf = bufferType.allocate(outputLength);
+        }
+        else
+        {
+            buf.position(0).limit(outputLength);
+        }
+        return buf;
+    }
+
+    /**
+     * Check is the given buffer contains a given sub-buffer.
+     *
+     * @param buffer The buffer to search for sequence of bytes in.
+     * @param subBuffer The buffer to match.
+     *
+     * @return true if buffer contains sub-buffer, false otherwise.
+     */
+    public static boolean contains(ByteBuffer buffer, ByteBuffer subBuffer)
+    {
+        int len = subBuffer.remaining();
+        if (buffer.remaining() - len < 0)
+            return false;
+
+        // adapted form the JDK's String.indexOf()
+        byte first = subBuffer.get(subBuffer.position());
+        int max = buffer.position() + (buffer.remaining() - len);
+
+        for (int i = buffer.position(); i <= max; i++)
+        {
+            /* Look for first character. */
+            if (buffer.get(i) != first)
+            {
+                while (++i <= max && buffer.get(i) != first)
+                {}
+            }
+
+            /* (maybe) Found first character, now look at the rest of v2 */
+            if (i <= max)
+            {
+                int j = i + 1;
+                int end = j + len - 1;
+                for (int k = 1 + subBuffer.position(); j < end && buffer.get(j) == subBuffer.get(k); j++, k++)
+                {}
+
+                if (j == end)
+                    return true;
+            }
+        }
+        return false;
+    }
+
+    public static boolean startsWith(ByteBuffer src, ByteBuffer prefix)
+    {
+        return startsWith(src, prefix, 0);
+    }
+
+    public static boolean endsWith(ByteBuffer src, ByteBuffer suffix)
+    {
+        return startsWith(src, suffix, src.remaining() - suffix.remaining());
+    }
+
+    private static boolean startsWith(ByteBuffer src, ByteBuffer prefix, int offset)
+    {
+        if (offset < 0)
+            return false;
+
+        int sPos = src.position() + offset;
+        int pPos = prefix.position();
+
+        if (src.remaining() - offset < prefix.remaining())
+            return false;
+
+        int len = Math.min(src.remaining() - offset, prefix.remaining());
+
+        while (len-- > 0)
+        {
+            if (src.get(sPos++) != prefix.get(pPos++))
+                return false;
+        }
+
+        return true;
+    }
+
+    /**
+     * Returns true if the buffer at the current position in the input matches given buffer.
+     * If true, the input is positioned at the end of the consumed buffer.
+     * If false, the position of the input is undefined.
+     * <p>
+     * The matched buffer is unchanged
+     */
+    public static boolean equalsWithShortLength(DataInput in, ByteBuffer toMatch) throws IOException
+    {
+        int length = readShortLength(in);
+        if (length != toMatch.remaining())
+            return false;
+        int limit = toMatch.limit();
+        for (int i = toMatch.position(); i < limit; ++i)
+            if (toMatch.get(i) != in.readByte())
+                return false;
+
+        return true;
+    }
+
+    public static void readFully(FileChannel channel, ByteBuffer dst, long position) throws IOException
+    {
+        while (dst.hasRemaining())
+        {
+            int read = channel.read(dst, position);
+            if (read == -1)
+                throw new EOFException();
+            position += read;
+        }
+    }
+
+    public static void writeLeastSignificantBytes(long register, int bytes, ByteBuffer out)
+    {
+        writeMostSignificantBytes(register << ((8 - bytes)*8), bytes, out);
+    }
+
+    public static void writeMostSignificantBytes(long register, int bytes, ByteBuffer out)
+    {
+        int position = out.position();
+        int limit = out.limit();
+        if (limit - position < Long.BYTES)
+        {
+            writeMostSignificantBytesSlow(register, bytes, out);
+        }
+        else
+        {
+            out.putLong(position, register);
+            out.position(position + bytes);
+        }
+    }
+
+    @DontInline
+    private static void writeMostSignificantBytesSlow(long register, int bytes, ByteBuffer out)
+    {
+        switch (bytes)
+        {
+            case 0:
+                break;
+            case 1:
+                out.put((byte)(register >>> 56));
+                break;
+            case 2:
+                out.putShort((short)(register >> 48));
+                break;
+            case 3:
+                out.putShort((short)(register >> 48));
+                out.put((byte)(register >> 40));
+                break;
+            case 4:
+                out.putInt((int)(register >> 32));
+                break;
+            case 5:
+                out.putInt((int)(register >> 32));
+                out.put((byte)(register >> 24));
+                break;
+            case 6:
+                out.putInt((int)(register >> 32));
+                out.putShort((short)(register >> 16));
+                break;
+            case 7:
+                out.putInt((int)(register >> 32));
+                out.putShort((short)(register >> 16));
+                out.put((byte)(register >> 8));
+                break;
+            case 8:
+                out.putLong(register);
+                break;
+            default:
+                throw new IllegalArgumentException();
+        }
+    }
+
+    public static long readLeastSignificantBytes(int bytes, ByteBuffer in)
+    {
+        if (bytes == 0)
+            return 0L;
+
+        int position = in.position();
+        int limit = in.limit();
+        if (limit - position < Long.BYTES)
+        {
+            return readLeastSignificantBytesSlow(bytes, in);
+        }
+        else
+        {
+            long result = in.getLong(position);
+            in.position(position + bytes);
+            return result >>> (64 - 8*bytes);
+        }
+    }
+
+    @DontInline
+    private static long readLeastSignificantBytesSlow(int bytes, ByteBuffer out)
+    {
+        switch (bytes)
+        {
+            case 0: return 0;
+            case 1: return out.get() & 0xffL;
+            case 2: return out.getShort() & 0xffffL;
+            case 3: return ((out.getShort() & 0xffffL) << 8) | (out.get() & 0xffL);
+            case 4: return out.getInt() & 0xffffffffL;
+            case 5: return ((out.getInt() & 0xffffffffL) << 8) | (out.get() & 0xffL);
+            case 6: return ((out.getInt() & 0xffffffffL) << 16) | (out.getShort() & 0xffffL);
+            case 7: return ((out.getInt() & 0xffffffffL) << 24) | ((out.getShort() & 0xffffL) << 8) | (out.get() & 0xffL);
+            case 8: return out.getLong();
+            default: throw new IllegalArgumentException();
+        }
+    }
+
+    public static final UnversionedSerializer<ByteBuffer> byteBufferSerializer = new UnversionedSerializer<ByteBuffer>()
+    {
+        @Override
+        public void serialize(ByteBuffer bytes, DataOutputPlus out) throws IOException
+        {
+            writeWithVIntLength(bytes, out);
+        }
+
+        @Override
+        public ByteBuffer deserialize(DataInputPlus in) throws IOException
+        {
+            return readWithVIntLength(in);
+        }
+
+        @Override
+        public long serializedSize(ByteBuffer bytes)
+        {
+            return serializedSizeWithVIntLength(bytes);
+        }
+    };
+
+    public static final UnversionedSerializer<ByteBuffer> nullableByteBufferSerializer = NullableSerializer.wrap(byteBufferSerializer);
 }

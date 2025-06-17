@@ -29,13 +29,14 @@ import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.junit.runners.Parameterized;
 
+import org.apache.cassandra.Util;
 import org.apache.cassandra.config.Config.DiskFailurePolicy;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.Keyspace;
-import org.apache.cassandra.db.RowIndexEntry;
+import org.apache.cassandra.db.Slices;
 import org.apache.cassandra.db.filter.ColumnFilter;
-import org.apache.cassandra.db.rows.SliceableUnfilteredRowIterator;
+import org.apache.cassandra.db.rows.UnfilteredRowIterator;
 import org.apache.cassandra.distributed.Cluster;
 import org.apache.cassandra.distributed.api.ConsistencyLevel;
 import org.apache.cassandra.distributed.api.IInvokableInstance;
@@ -46,12 +47,12 @@ import org.apache.cassandra.gms.Gossiper;
 import org.apache.cassandra.io.FSError;
 import org.apache.cassandra.io.FSReadError;
 import org.apache.cassandra.io.sstable.CorruptSSTableException;
+import org.apache.cassandra.io.sstable.SSTableReadsListener;
 import org.apache.cassandra.io.sstable.format.ForwardingSSTableReader;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
-import org.apache.cassandra.io.sstable.format.SSTableReadsListener;
-import org.apache.cassandra.io.util.FileDataInput;
 import org.apache.cassandra.service.CassandraDaemon;
 import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.utils.Throwables;
 
 import static org.apache.cassandra.distributed.api.Feature.GOSSIP;
 import static org.apache.cassandra.distributed.api.Feature.NATIVE_PROTOCOL;
@@ -101,6 +102,8 @@ public class JVMStabilityInspectorThrowableTest extends TestBaseImpl
         String table = policy.name();
         try (final Cluster cluster = init(getCluster(policy).start()))
         {
+            cluster.setUncaughtExceptionsFilter(t -> Throwables.anyCauseMatches(
+            t, t2 -> Arrays.asList(CorruptSSTableException.class.getCanonicalName(), FSReadError.class.getCanonicalName()).contains(t2.getClass().getCanonicalName())));
             IInvokableInstance node = cluster.get(1);
             boolean[] setup = node.callOnInstance(() -> {
                 CassandraDaemon instanceForTesting = CassandraDaemon.getInstanceForTesting();
@@ -189,7 +192,7 @@ public class JVMStabilityInspectorThrowableTest extends TestBaseImpl
     {
         node.runOnInstance(() -> {
             ColumnFamilyStore cf = Keyspace.open(keyspace).getColumnFamilyStore(table);
-            cf.forceBlockingFlush();
+            Util.flush(cf);
 
             Set<SSTableReader> remove = cf.getLiveSSTables();
             Set<SSTableReader> replace = new HashSet<>();
@@ -219,15 +222,7 @@ public class JVMStabilityInspectorThrowableTest extends TestBaseImpl
         }
 
         @Override
-        public SliceableUnfilteredRowIterator iterator(DecoratedKey key, ColumnFilter selectedColumns, boolean reversed, boolean isForThrift, SSTableReadsListener listener)
-        {
-            if (shouldThrowCorrupted)
-                throw throwCorrupted();
-            throw throwFSError();
-        }
-
-        @Override
-        public SliceableUnfilteredRowIterator iterator(FileDataInput file, DecoratedKey key, RowIndexEntry indexEntry, ColumnFilter selectedColumns, boolean reversed, boolean isForThrift)
+        public UnfilteredRowIterator rowIterator(DecoratedKey key, Slices slices, ColumnFilter selectedColumns, boolean reversed, SSTableReadsListener listener)
         {
             if (shouldThrowCorrupted)
                 throw throwCorrupted();
@@ -236,12 +231,12 @@ public class JVMStabilityInspectorThrowableTest extends TestBaseImpl
 
         private CorruptSSTableException throwCorrupted()
         {
-            throw new CorruptSSTableException(new IOException("failed to get position"), descriptor.baseFilename());
+            throw new CorruptSSTableException(new IOException("failed to get position"), descriptor.baseFile());
         }
 
         private FSError throwFSError()
         {
-            throw new FSReadError(new IOException("failed to get position"), descriptor.baseFilename());
+            throw new FSReadError(new IOException("failed to get position"), descriptor.baseFile());
         }
     }
 }

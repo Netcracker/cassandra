@@ -20,52 +20,41 @@ package org.apache.cassandra.db.compaction.writers;
 import java.util.Set;
 
 import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.Directories;
-import org.apache.cassandra.db.RowIndexEntry;
-import org.apache.cassandra.db.SerializationHeader;
 import org.apache.cassandra.db.compaction.OperationType;
-import org.apache.cassandra.db.rows.UnfilteredRowIterator;
-import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
-import org.apache.cassandra.io.sstable.Descriptor;
+import org.apache.cassandra.db.lifecycle.ILifecycleTransaction;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
-import org.apache.cassandra.io.sstable.format.SSTableWriter;
-import org.apache.cassandra.io.sstable.metadata.MetadataCollector;
 
 public class MaxSSTableSizeWriter extends CompactionAwareWriter
 {
-    private final long expectedWriteSize;
     private final long maxSSTableSize;
     private final int level;
     private final long estimatedSSTables;
-    private final Set<SSTableReader> allSSTables;
 
     public MaxSSTableSizeWriter(ColumnFamilyStore cfs,
                                 Directories directories,
-                                LifecycleTransaction txn,
+                                ILifecycleTransaction txn,
                                 Set<SSTableReader> nonExpiredSSTables,
                                 long maxSSTableSize,
                                 int level)
     {
-        this(cfs, directories, txn, nonExpiredSSTables, maxSSTableSize, level, false, false);
+        this(cfs, directories, txn, nonExpiredSSTables, maxSSTableSize, level, false);
     }
 
-    @SuppressWarnings("resource")
     public MaxSSTableSizeWriter(ColumnFamilyStore cfs,
                                 Directories directories,
-                                LifecycleTransaction txn,
+                                ILifecycleTransaction txn,
                                 Set<SSTableReader> nonExpiredSSTables,
                                 long maxSSTableSize,
                                 int level,
-                                boolean offline,
                                 boolean keepOriginals)
     {
-        super(cfs, directories, txn, nonExpiredSSTables, offline, keepOriginals);
-        this.allSSTables = txn.originals();
+        super(cfs, directories, txn, nonExpiredSSTables, keepOriginals);
         this.level = level;
         this.maxSSTableSize = maxSSTableSize;
 
         long totalSize = getTotalWriteSize(nonExpiredSSTables, estimatedTotalKeys, cfs, txn.opType());
-        expectedWriteSize = Math.min(maxSSTableSize, totalSize);
         estimatedSSTables = Math.max(1, totalSize / maxSSTableSize);
     }
 
@@ -79,36 +68,29 @@ public class MaxSSTableSizeWriter extends CompactionAwareWriter
             estimatedKeysBeforeCompaction += sstable.estimatedKeys();
         estimatedKeysBeforeCompaction = Math.max(1, estimatedKeysBeforeCompaction);
         double estimatedCompactionRatio = (double) estimatedTotalKeys / estimatedKeysBeforeCompaction;
+
         return Math.round(estimatedCompactionRatio * cfs.getExpectedCompactedFileSize(nonExpiredSSTables, compactionType));
     }
 
     @Override
-    public boolean realAppend(UnfilteredRowIterator partition)
+    protected boolean shouldSwitchWriterInCurrentLocation(DecoratedKey key)
     {
-        RowIndexEntry rie = sstableWriter.append(partition);
-        if (sstableWriter.currentWriter().getOnDiskFilePointer() > maxSSTableSize)
-            switchCompactionLocation(getWriteDirectory(getExpectedWriteSize()));
-        return rie != null;
+        return sstableWriter.currentWriter().getEstimatedOnDiskBytesWritten() > maxSSTableSize;
     }
 
-    public void switchCompactionLocation(Directories.DataDirectory location)
+    protected int sstableLevel()
     {
-        @SuppressWarnings("resource")
-        SSTableWriter writer = SSTableWriter.create(Descriptor.fromFilename(cfs.getSSTablePath(getDirectories().getLocationForDisk(location))),
-                                                    estimatedTotalKeys / estimatedSSTables,
-                                                    minRepairedAt,
-                                                    cfs.metadata,
-                                                    new MetadataCollector(allSSTables, cfs.metadata.comparator, level),
-                                                    SerializationHeader.make(cfs.metadata, nonExpiredSSTables),
-                                                    txn);
+        return level;
+    }
 
-        sstableWriter.switchWriter(writer);
-
+    protected long sstableKeyCount()
+    {
+        return estimatedTotalKeys / estimatedSSTables;
     }
 
     @Override
     protected long getExpectedWriteSize()
     {
-        return expectedWriteSize;
+        return Math.min(maxSSTableSize, super.getExpectedWriteSize());
     }
 }

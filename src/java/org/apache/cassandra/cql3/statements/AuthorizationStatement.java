@@ -17,7 +17,6 @@
  */
 package org.apache.cassandra.cql3.statements;
 
-
 import org.apache.cassandra.auth.DataResource;
 import org.apache.cassandra.auth.IResource;
 import org.apache.cassandra.cql3.CQLStatement;
@@ -27,22 +26,20 @@ import org.apache.cassandra.exceptions.RequestExecutionException;
 import org.apache.cassandra.exceptions.RequestValidationException;
 import org.apache.cassandra.service.ClientState;
 import org.apache.cassandra.service.QueryState;
+import org.apache.cassandra.transport.Dispatcher;
 import org.apache.cassandra.transport.messages.ResultMessage;
+import org.apache.commons.lang3.builder.ToStringBuilder;
+import org.apache.commons.lang3.builder.ToStringStyle;
 
-public abstract class AuthorizationStatement extends ParsedStatement implements CQLStatement
+public abstract class AuthorizationStatement extends CQLStatement.Raw implements CQLStatement
 {
+    public AuthorizationStatement prepare(ClientState state)
+    {
+        return this;
+    }
+
     @Override
-    public Prepared prepare(ClientState clientState)
-    {
-        return new Prepared(this);
-    }
-
-    public int getBoundTerms()
-    {
-        return 0;
-    }
-
-    public ResultMessage execute(QueryState state, QueryOptions options)
+    public ResultMessage execute(QueryState state, QueryOptions options, Dispatcher.RequestTime requestTime)
     throws RequestValidationException, RequestExecutionException
     {
         return execute(state.getClientState());
@@ -50,9 +47,9 @@ public abstract class AuthorizationStatement extends ParsedStatement implements 
 
     public abstract ResultMessage execute(ClientState state) throws RequestValidationException, RequestExecutionException;
 
-    public ResultMessage executeInternal(QueryState state, QueryOptions options)
+    public ResultMessage executeLocally(QueryState state, QueryOptions options)
     {
-        // executeInternal is for local query only, thus altering permission doesn't make sense and is not supported
+        // executeLocally is for local query only, thus altering permission doesn't make sense and is not supported
         throw new UnsupportedOperationException();
     }
 
@@ -65,5 +62,11 @@ public abstract class AuthorizationStatement extends ParsedStatement implements 
                 return DataResource.table(state.getKeyspace(), dataResource.getTable());
         }
         return resource;
+    }
+    
+    @Override
+    public String toString()
+    {
+        return ToStringBuilder.reflectionToString(this, ToStringStyle.SHORT_PREFIX_STYLE);
     }
 }

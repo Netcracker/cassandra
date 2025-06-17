@@ -20,64 +20,72 @@ package org.apache.cassandra.cql3;
 import java.nio.ByteBuffer;
 import java.util.Map;
 
+import org.apache.cassandra.config.CassandraRelevantProperties;
 import org.apache.cassandra.cql3.statements.BatchStatement;
-import org.apache.cassandra.cql3.statements.ParsedStatement;
+import org.apache.cassandra.service.ClientState;
 import org.apache.cassandra.service.QueryState;
+import org.apache.cassandra.transport.Dispatcher;
 import org.apache.cassandra.transport.messages.ResultMessage;
 import org.apache.cassandra.utils.MD5Digest;
 
 /**
  * Custom QueryHandler that sends custom request payloads back with the result.
  * Used to facilitate testing.
- * Enabled with system property cassandra.custom_query_handler_class.
+ * Enabled with system property {@link CassandraRelevantProperties#CUSTOM_QUERY_HANDLER_CLASS}.
  */
 public class CustomPayloadMirroringQueryHandler implements QueryHandler
 {
     static QueryProcessor queryProcessor = QueryProcessor.instance;
 
-    public ResultMessage process(String query,
+    public CQLStatement parse(String query, QueryState state, QueryOptions options)
+    {
+        return queryProcessor.parse(query, state, options);
+    }
+
+    @Override
+    public ResultMessage process(CQLStatement statement,
                                  QueryState state,
                                  QueryOptions options,
-                                 Map<String, ByteBuffer> customPayload)
+                                 Map<String, ByteBuffer> customPayload,
+                                 Dispatcher.RequestTime requestTime)
     {
-        ResultMessage result = queryProcessor.process(query, state, options, customPayload);
+        ResultMessage result = queryProcessor.process(statement, state, options, customPayload, requestTime);
         result.setCustomPayload(customPayload);
         return result;
     }
 
-    public ResultMessage.Prepared prepare(String query, QueryState state, Map<String, ByteBuffer> customPayload)
+    public ResultMessage.Prepared prepare(String query, ClientState clientState, Map<String, ByteBuffer> customPayload)
     {
-        ResultMessage.Prepared prepared = queryProcessor.prepare(query, state, customPayload);
+        ResultMessage.Prepared prepared = queryProcessor.prepare(query, clientState, customPayload);
         prepared.setCustomPayload(customPayload);
         return prepared;
     }
 
-    public ParsedStatement.Prepared getPrepared(MD5Digest id)
+    public QueryProcessor.Prepared getPrepared(MD5Digest id)
     {
         return queryProcessor.getPrepared(id);
     }
 
-    public ParsedStatement.Prepared getPreparedForThrift(Integer id)
-    {
-        return queryProcessor.getPreparedForThrift(id);
-    }
-
+    @Override
     public ResultMessage processPrepared(CQLStatement statement,
                                          QueryState state,
                                          QueryOptions options,
-                                         Map<String, ByteBuffer> customPayload)
+                                         Map<String, ByteBuffer> customPayload,
+                                         Dispatcher.RequestTime requestTime)
     {
-        ResultMessage result = queryProcessor.processPrepared(statement, state, options, customPayload);
+        ResultMessage result = queryProcessor.processPrepared(statement, state, options, customPayload, requestTime);
         result.setCustomPayload(customPayload);
         return result;
     }
 
+    @Override
     public ResultMessage processBatch(BatchStatement statement,
                                       QueryState state,
                                       BatchQueryOptions options,
-                                      Map<String, ByteBuffer> customPayload)
+                                      Map<String, ByteBuffer> customPayload,
+                                      Dispatcher.RequestTime requestTime)
     {
-        ResultMessage result = queryProcessor.processBatch(statement, state, options, customPayload);
+        ResultMessage result = queryProcessor.processBatch(statement, state, options, customPayload, requestTime);
         result.setCustomPayload(customPayload);
         return result;
     }

@@ -18,26 +18,31 @@
 package org.apache.cassandra.db.partitions;
 
 import java.nio.ByteBuffer;
-import java.util.ArrayList;
-import java.util.List;
+import java.util.Iterator;
 import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
 import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
 
-import org.apache.cassandra.config.CFMetaData;
-import org.apache.cassandra.config.DatabaseDescriptor;
-import org.apache.cassandra.db.*;
-import org.apache.cassandra.db.rows.EncodingStats;
-import org.apache.cassandra.db.rows.Row;
-import org.apache.cassandra.db.rows.Rows;
+import com.google.common.annotations.VisibleForTesting;
+
 import org.apache.cassandra.index.transactions.UpdateTransaction;
-import org.apache.cassandra.utils.FBUtilities;
+
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.db.Clustering;
+import org.apache.cassandra.db.DecoratedKey;
+import org.apache.cassandra.db.DeletionInfo;
+import org.apache.cassandra.db.Slices;
+import org.apache.cassandra.db.filter.ColumnFilter;
+import org.apache.cassandra.db.rows.Row;
+import org.apache.cassandra.db.rows.UnfilteredRowIterator;
+import org.apache.cassandra.schema.TableMetadata;
+import org.apache.cassandra.schema.TableMetadataRef;
 import org.apache.cassandra.utils.ObjectSizes;
-import org.apache.cassandra.utils.btree.BTree;
-import org.apache.cassandra.utils.btree.UpdateFunction;
-import org.apache.cassandra.utils.concurrent.Locks;
 import org.apache.cassandra.utils.concurrent.OpOrder;
-import org.apache.cassandra.utils.memory.HeapAllocator;
+import org.apache.cassandra.utils.memory.Cloner;
 import org.apache.cassandra.utils.memory.MemtableAllocator;
+import org.github.jamm.Unmetered;
+
+import static org.apache.cassandra.utils.Clock.Global.nanoTime;
 
 /**
  * A thread-safe and atomic Partition implementation.
@@ -47,9 +52,9 @@ import org.apache.cassandra.utils.memory.MemtableAllocator;
  * other thread can see the state where only parts but not all rows have
  * been added.
  */
-public class AtomicBTreePartition extends AbstractBTreePartition
+public final class AtomicBTreePartition extends AbstractBTreePartition
 {
-    public static final long EMPTY_SIZE = ObjectSizes.measure(new AtomicBTreePartition(CFMetaData.createFake("keyspace", "table"),
+    public static final long EMPTY_SIZE = ObjectSizes.measure(new AtomicBTreePartition(null,
                                                                                        DatabaseDescriptor.getPartitioner().decorateKey(ByteBuffer.allocate(1)),
                                                                                        null));
 
@@ -67,11 +72,11 @@ public class AtomicBTreePartition extends AbstractBTreePartition
     // CLOCK_GRANULARITY = 1^9ns >> CLOCK_SHIFT == 132us == (1/7.63)ms
 
     private static final AtomicIntegerFieldUpdater<AtomicBTreePartition> wasteTrackerUpdater = AtomicIntegerFieldUpdater.newUpdater(AtomicBTreePartition.class, "wasteTracker");
-    private static final AtomicReferenceFieldUpdater<AtomicBTreePartition, Holder> refUpdater = AtomicReferenceFieldUpdater.newUpdater(AtomicBTreePartition.class, Holder.class, "ref");
+    private static final AtomicReferenceFieldUpdater<AtomicBTreePartition, BTreePartitionData> refUpdater = AtomicReferenceFieldUpdater.newUpdater(AtomicBTreePartition.class, BTreePartitionData.class, "ref");
 
     /**
      * (clock + allocation) granularity are combined to give us an acceptable (waste) allocation rate that is defined by
-     * the passage of real time of ALLOCATION_GRANULARITY_BYTES/CLOCK_GRANULARITY, or in this case 7.63Kb/ms, or 7.45Mb/s
+     * the passage of real time of ALLOCATION_GRANULARITY_BYTES/CLOCK_GRANULARITY, or in this case 7.63KiB/ms, or 7.45Mb/s
      *
      * in wasteTracker we maintain within EXCESS_WASTE_OFFSET before the current time; whenever we waste bytes
      * we increment the current value if it is within this window, and set it to the min of the window plus our waste
@@ -79,20 +84,31 @@ public class AtomicBTreePartition extends AbstractBTreePartition
      */
     private volatile int wasteTracker = TRACKER_NEVER_WASTED;
 
+    @Unmetered
     private final MemtableAllocator allocator;
-    private volatile Holder ref;
 
-    public AtomicBTreePartition(CFMetaData metadata, DecoratedKey partitionKey, MemtableAllocator allocator)
+    private volatile BTreePartitionData ref;
+
+    @Unmetered
+    private final TableMetadataRef metadata;
+
+    public AtomicBTreePartition(TableMetadataRef metadata, DecoratedKey partitionKey, MemtableAllocator allocator)
     {
         // involved in potential bug? partition columns may be a subset if we alter columns while it's in memtable
-        super(metadata, partitionKey);
+        super(partitionKey);
+        this.metadata = metadata;
         this.allocator = allocator;
-        this.ref = EMPTY;
+        this.ref = BTreePartitionData.EMPTY;
     }
 
-    protected Holder holder()
+    protected BTreePartitionData holder()
     {
         return ref;
+    }
+
+    public TableMetadata metadata()
+    {
+        return metadata.get();
     }
 
     protected boolean canHaveShadowedData()
@@ -104,72 +120,120 @@ public class AtomicBTreePartition extends AbstractBTreePartition
      * Adds a given update to this in-memtable partition.
      *
      * @return an array containing first the difference in size seen after merging the updates, and second the minimum
-     * time detla between updates.
+     * time delta between updates.
      */
-    public long[] addAllWithSizeDelta(final PartitionUpdate update, OpOrder.Group writeOp, UpdateTransaction indexer)
+    public BTreePartitionUpdater addAll(final PartitionUpdate update, Cloner cloner, OpOrder.Group writeOp, UpdateTransaction indexer)
     {
-        RowUpdater updater = new RowUpdater(this, allocator, writeOp, indexer);
-        DeletionInfo inputDeletionInfoCopy = null;
-        boolean monitorOwned = false;
-        try
+        return new Updater(allocator, cloner, writeOp, indexer).addAll(update);
+    }
+
+    @VisibleForTesting
+    public void unsafeSetHolder(BTreePartitionData holder)
+    {
+        ref = holder;
+    }
+
+    @VisibleForTesting
+    public BTreePartitionData unsafeGetHolder()
+    {
+        return ref;
+    }
+
+    class Updater extends BTreePartitionUpdater
+    {
+        BTreePartitionData current;
+
+        public Updater(MemtableAllocator allocator, Cloner cloner, OpOrder.Group writeOp, UpdateTransaction indexer)
         {
-            monitorOwned = maybeLock(writeOp);
-            indexer.start();
+            super(allocator, cloner, writeOp, indexer);
+        }
 
-            while (true)
+        Updater addAll(final PartitionUpdate update)
+        {
+            try
             {
-                Holder current = ref;
-                updater.ref = current;
-                updater.reset();
+                boolean shouldLock = shouldLock(writeOp);
+                indexer.start();
 
-                if (!update.deletionInfo().getPartitionDeletion().isLive())
-                    indexer.onPartitionDeletion(update.deletionInfo().getPartitionDeletion());
-
-                if (update.deletionInfo().hasRanges())
-                    update.deletionInfo().rangeIterator(false).forEachRemaining(indexer::onRangeTombstone);
-
-                DeletionInfo deletionInfo;
-                if (update.deletionInfo().mayModify(current.deletionInfo))
+                while (true)
                 {
-                    if (inputDeletionInfoCopy == null)
-                        inputDeletionInfoCopy = update.deletionInfo().copy(HeapAllocator.instance);
+                    if (shouldLock)
+                    {
+                        synchronized (this)
+                        {
+                            if (tryUpdateData(update))
+                                return this;
+                        }
+                    }
+                    else
+                    {
+                        if (tryUpdateData(update))
+                            return this;
 
-                    deletionInfo = current.deletionInfo.mutableCopy().add(inputDeletionInfoCopy);
-                    updater.allocated(deletionInfo.unsharedHeapSize() - current.deletionInfo.unsharedHeapSize());
-                }
-                else
-                {
-                    deletionInfo = current.deletionInfo;
-                }
-
-                PartitionColumns columns = update.columns().mergeTo(current.columns);
-                Row newStatic = update.staticRow();
-                Row staticRow = newStatic.isEmpty()
-                              ? current.staticRow
-                              : (current.staticRow.isEmpty() ? updater.apply(newStatic) : updater.apply(current.staticRow, newStatic));
-                Object[] tree = BTree.update(current.tree, update.metadata().comparator, update, update.rowCount(), updater);
-                EncodingStats newStats = current.stats.mergeWith(update.stats());
-
-                if (tree != null && refUpdater.compareAndSet(this, current, new Holder(columns, tree, deletionInfo, staticRow, newStats)))
-                {
-                    updater.finish();
-                    return new long[]{ updater.dataSize, updater.colUpdateTimeDelta };
-                }
-                else if (!monitorOwned)
-                {
-                    monitorOwned = maybeLock(updater.heapSize, writeOp);
+                        shouldLock = shouldLock(heapSize, writeOp);
+                    }
                 }
             }
+            finally
+            {
+                indexer.commit();
+                reportAllocatedMemory();
+            }
         }
-        finally
+
+        private boolean tryUpdateData(PartitionUpdate update)
         {
-            indexer.commit();
-            if (monitorOwned)
-                Locks.monitorExitUnsafe(this);
+            current = ref;
+            this.dataSize = 0;
+            this.heapSize = 0;
+            BTreePartitionData result = makeMergedPartition(current, update);
+            return refUpdater.compareAndSet(AtomicBTreePartition.this, current, result);
         }
     }
 
-    private boolean maybeLock(OpOrder.Group writeOp)
+    @Override
+    public DeletionInfo deletionInfo()
+    {
+        return allocator.ensureOnHeap().applyToDeletionInfo(super.deletionInfo());
+    }
+
+    @Override
+    public Row staticRow()
+    {
+        return allocator.ensureOnHeap().applyToStatic(super.staticRow());
+    }
+
+    @Override
+    public DecoratedKey partitionKey()
+    {
+        return allocator.ensureOnHeap().applyToPartitionKey(super.partitionKey());
+    }
+
+    @Override
+    public Row getRow(Clustering<?> clustering)
+    {
+        return allocator.ensureOnHeap().applyToRow(super.getRow(clustering));
+    }
+
+    @Override
+    public Row lastRow()
+    {
+        return allocator.ensureOnHeap().applyToRow(super.lastRow());
+    }
+
+    @Override
+    public UnfilteredRowIterator unfilteredIterator(BTreePartitionData current, ColumnFilter selection, Slices slices, boolean reversed)
+    {
+        return allocator.ensureOnHeap().applyToPartition(super.unfilteredIterator(current, selection, slices, reversed));
+    }
+
+    @Override
+    public Iterator<Row> iterator(boolean reverse)
+    {
+        return allocator.ensureOnHeap().applyToPartition(super.iterator(reverse));
+    }
+
+    private boolean shouldLock(OpOrder.Group writeOp)
     {
         if (!useLock())
             return false;
@@ -177,7 +241,7 @@ public class AtomicBTreePartition extends AbstractBTreePartition
         return lockIfOldest(writeOp);
     }
 
-    private boolean maybeLock(long addWaste, OpOrder.Group writeOp)
+    private boolean shouldLock(long addWaste, OpOrder.Group writeOp)
     {
         if (!updateWastedAllocationTracker(addWaste))
             return false;
@@ -190,11 +254,9 @@ public class AtomicBTreePartition extends AbstractBTreePartition
         if (!writeOp.isOldestLiveGroup())
         {
             Thread.yield();
-            if (!writeOp.isOldestLiveGroup())
-                return false;
+            return writeOp.isOldestLiveGroup();
         }
 
-        Locks.monitorEnterUnsafe(this);
         return true;
     }
 
@@ -221,7 +283,7 @@ public class AtomicBTreePartition extends AbstractBTreePartition
             while (TRACKER_PESSIMISTIC_LOCKING != (oldTrackerValue = wasteTracker))
             {
                 // Note this time value has an arbitrary offset, but is a constant rate 32 bit counter (that may wrap)
-                int time = (int) (System.nanoTime() >>> CLOCK_SHIFT);
+                int time = (int) (nanoTime() >>> CLOCK_SHIFT);
                 int delta = oldTrackerValue - time;
                 if (oldTrackerValue == TRACKER_NEVER_WASTED || delta >= 0 || delta < -EXCESS_WASTE_OFFSET)
                     delta = -EXCESS_WASTE_OFFSET;
@@ -243,96 +305,5 @@ public class AtomicBTreePartition extends AbstractBTreePartition
         if (wasteTracker == TRACKER_NEVER_WASTED || wasteTracker == TRACKER_PESSIMISTIC_LOCKING)
             return wasteTracker + 1;
         return wasteTracker;
-    }
-
-    // the function we provide to the btree utilities to perform any column replacements
-    private static final class RowUpdater implements UpdateFunction<Row, Row>
-    {
-        final AtomicBTreePartition updating;
-        final MemtableAllocator allocator;
-        final OpOrder.Group writeOp;
-        final UpdateTransaction indexer;
-        final int nowInSec;
-        Holder ref;
-        Row.Builder regularBuilder;
-        long dataSize;
-        long heapSize;
-        long colUpdateTimeDelta = Long.MAX_VALUE;
-        List<Row> inserted; // TODO: replace with walk of aborted BTree
-
-        private RowUpdater(AtomicBTreePartition updating, MemtableAllocator allocator, OpOrder.Group writeOp, UpdateTransaction indexer)
-        {
-            this.updating = updating;
-            this.allocator = allocator;
-            this.writeOp = writeOp;
-            this.indexer = indexer;
-            this.nowInSec = FBUtilities.nowInSeconds();
-        }
-
-        private Row.Builder builder(Clustering clustering)
-        {
-            boolean isStatic = clustering == Clustering.STATIC_CLUSTERING;
-            // We know we only insert/update one static per PartitionUpdate, so no point in saving the builder
-            if (isStatic)
-                return allocator.rowBuilder(writeOp);
-
-            if (regularBuilder == null)
-                regularBuilder = allocator.rowBuilder(writeOp);
-            return regularBuilder;
-        }
-
-        public Row apply(Row insert)
-        {
-            Row data = Rows.copy(insert, builder(insert.clustering())).build();
-            indexer.onInserted(insert);
-
-            this.dataSize += data.dataSize();
-            this.heapSize += data.unsharedHeapSizeExcludingData();
-            if (inserted == null)
-                inserted = new ArrayList<>();
-            inserted.add(data);
-            return data;
-        }
-
-        public Row apply(Row existing, Row update)
-        {
-            Row.Builder builder = builder(existing.clustering());
-            colUpdateTimeDelta = Math.min(colUpdateTimeDelta, Rows.merge(existing, update, builder, nowInSec));
-
-            Row reconciled = builder.build();
-
-            indexer.onUpdated(existing, reconciled);
-
-            dataSize += reconciled.dataSize() - existing.dataSize();
-            heapSize += reconciled.unsharedHeapSizeExcludingData() - existing.unsharedHeapSizeExcludingData();
-            if (inserted == null)
-                inserted = new ArrayList<>();
-            inserted.add(reconciled);
-
-            return reconciled;
-        }
-
-        protected void reset()
-        {
-            this.dataSize = 0;
-            this.heapSize = 0;
-            if (inserted != null)
-                inserted.clear();
-        }
-
-        public boolean abortEarly()
-        {
-            return updating.ref != ref;
-        }
-
-        public void allocated(long heapSize)
-        {
-            this.heapSize += heapSize;
-        }
-
-        protected void finish()
-        {
-            allocator.onHeap().adjust(heapSize, writeOp);
-        }
     }
 }

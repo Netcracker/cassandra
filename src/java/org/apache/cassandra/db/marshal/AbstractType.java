@@ -28,22 +28,28 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import javax.annotation.Nullable;
 
+import org.apache.cassandra.cql3.AssignmentTestable;
 import org.apache.cassandra.cql3.CQL3Type;
-import org.apache.cassandra.cql3.Term;
-import org.apache.cassandra.db.TypeSizes;
+import org.apache.cassandra.cql3.ColumnSpecification;
+import org.apache.cassandra.cql3.constraints.ColumnConstraint;
+import org.apache.cassandra.cql3.constraints.ColumnConstraints;
+import org.apache.cassandra.cql3.constraints.ConstraintViolationException;
+import org.apache.cassandra.cql3.terms.Term;
+import org.apache.cassandra.cql3.functions.ArgumentDeserializer;
 import org.apache.cassandra.db.rows.Cell;
 import org.apache.cassandra.exceptions.SyntaxException;
-import org.apache.cassandra.serializers.TypeSerializer;
-import org.apache.cassandra.serializers.MarshalException;
-
-import org.apache.cassandra.utils.FastByteOperations;
-import org.github.jamm.Unmetered;
-import org.apache.cassandra.io.util.DataOutputPlus;
 import org.apache.cassandra.io.util.DataInputPlus;
+import org.apache.cassandra.io.util.DataOutputPlus;
+import org.apache.cassandra.serializers.MarshalException;
+import org.apache.cassandra.serializers.TypeSerializer;
+import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.utils.bytecomparable.ByteComparable;
+import org.apache.cassandra.utils.bytecomparable.ByteSource;
+import org.apache.cassandra.utils.bytecomparable.ByteSourceInverse;
+import org.github.jamm.Unmetered;
 
 import static org.apache.cassandra.db.marshal.AbstractType.ComparisonType.CUSTOM;
 
@@ -56,9 +62,9 @@ import static org.apache.cassandra.db.marshal.AbstractType.ComparisonType.CUSTOM
  * represent a valid ByteBuffer for the type being compared.
  */
 @Unmetered
-public abstract class AbstractType<T> implements Comparator<ByteBuffer>
+public abstract class AbstractType<T> implements Comparator<ByteBuffer>, AssignmentTestable
 {
-    private static final Logger logger = LoggerFactory.getLogger(AbstractType.class);
+    private final static int VARIABLE_LENGTH = -1;
 
     public final Comparator<ByteBuffer> reverseComparator;
 
@@ -82,6 +88,7 @@ public abstract class AbstractType<T> implements Comparator<ByteBuffer>
 
     public final ComparisonType comparisonType;
     public final boolean isByteOrderComparable;
+    public final ValueComparators comparatorSet;
 
     protected AbstractType(ComparisonType comparisonType)
     {
@@ -90,7 +97,7 @@ public abstract class AbstractType<T> implements Comparator<ByteBuffer>
         reverseComparator = (o1, o2) -> AbstractType.this.compare(o2, o1);
         try
         {
-            Method custom = getClass().getMethod("compareCustom", ByteBuffer.class, ByteBuffer.class);
+            Method custom = getClass().getMethod("compareCustom", Object.class, ValueAccessor.class, Object.class, ValueAccessor.class);
             if ((custom.getDeclaringClass() == AbstractType.class) == (comparisonType == CUSTOM))
                 throw new IllegalStateException((comparisonType == CUSTOM ? "compareCustom must be overridden if ComparisonType is CUSTOM"
                                                                          : "compareCustom should not be overridden if ComparisonType is not CUSTOM")
@@ -100,6 +107,17 @@ public abstract class AbstractType<T> implements Comparator<ByteBuffer>
         {
             throw new IllegalStateException();
         }
+
+        comparatorSet = new ValueComparators((l, r) -> compare(l, ByteArrayAccessor.instance, r, ByteArrayAccessor.instance),
+                                             (l, r) -> compare(l, ByteBufferAccessor.instance, r, ByteBufferAccessor.instance));
+    }
+
+    static <VL, VR, T extends Comparable<T>> int compareComposed(VL left, ValueAccessor<VL> accessorL, VR right, ValueAccessor<VR> accessorR, AbstractType<T> type)
+    {
+        if (accessorL.isEmpty(left) || accessorR.isEmpty(right))
+            return Boolean.compare(accessorR.isEmpty(right), accessorL.isEmpty(left));
+
+        return type.compose(left, accessorL).compareTo(type.compose(right, accessorR));
     }
 
     public static List<String> asCQLTypeStringList(List<AbstractType<?>> abstractTypes)
@@ -110,9 +128,19 @@ public abstract class AbstractType<T> implements Comparator<ByteBuffer>
         return r;
     }
 
-    public T compose(ByteBuffer bytes)
+    public final T compose(ByteBuffer bytes)
     {
         return getSerializer().deserialize(bytes);
+    }
+
+    public <V> T compose(V value, ValueAccessor<V> accessor)
+    {
+        return getSerializer().deserialize(value, accessor);
+    }
+
+    public ByteBuffer decomposeUntyped(Object value)
+    {
+        return decompose((T) value);
     }
 
     public ByteBuffer decompose(T value)
@@ -121,15 +149,25 @@ public abstract class AbstractType<T> implements Comparator<ByteBuffer>
     }
 
     /** get a string representation of the bytes used for various identifier (NOT just for log messages) */
-    public String getString(ByteBuffer bytes)
+    public <V> String getString(V value, ValueAccessor<V> accessor)
     {
-        if (bytes == null)
+        if (value == null)
             return "null";
 
         TypeSerializer<T> serializer = getSerializer();
-        serializer.validate(bytes);
+        serializer.validate(value, accessor);
 
-        return serializer.toString(serializer.deserialize(bytes));
+        return serializer.toString(serializer.deserialize(value, accessor));
+    }
+
+    public final String getString(ByteBuffer bytes)
+    {
+        return getString(bytes, ByteBufferAccessor.instance);
+    }
+
+    public String toCQLString(ByteBuffer bytes)
+    {
+        return asCQL3Type().toCQLLiteral(bytes);
     }
 
     /** get a byte representation of the given string. */
@@ -150,34 +188,62 @@ public abstract class AbstractType<T> implements Comparator<ByteBuffer>
      * @param protocolVersion the protocol version to use for the conversion
      * @return a JSON string representing the specified value
      */
-    public String toJSONString(ByteBuffer buffer, int protocolVersion)
+    public String toJSONString(ByteBuffer buffer, ProtocolVersion protocolVersion)
     {
         return '"' + Objects.toString(getSerializer().deserialize(buffer), "") + '"';
+    }
+
+    public <V> String toJSONString(V value, ValueAccessor<V> accessor, ProtocolVersion protocolVersion)
+    {
+        return toJSONString(accessor.toBuffer(value), protocolVersion); // FIXME
     }
 
     /* validate that the byte array is a valid sequence for the type we are supposed to be comparing */
     public void validate(ByteBuffer bytes) throws MarshalException
     {
-        getSerializer().validate(bytes);
+        validate(bytes, ByteBufferAccessor.instance);
+    }
+
+    public <V> void validate(V value, ValueAccessor<V> accessor) throws MarshalException
+    {
+        getSerializer().validate(value, accessor);
+    }
+
+    public void checkConstraints(ByteBuffer bytes, ColumnConstraints constraints) throws ConstraintViolationException
+    {
+        checkConstraints(bytes, constraints.getConstraints());
+    }
+
+    public void checkConstraints(ByteBuffer bytes, List<ColumnConstraint<?>> constraints) throws ConstraintViolationException
+    {
+        for (ColumnConstraint<?> constraint : constraints)
+            constraint.evaluate(this, bytes);
     }
 
     public final int compare(ByteBuffer left, ByteBuffer right)
     {
-        return isByteOrderComparable
-               ? FastByteOperations.compareUnsigned(left, right)
-               : compareCustom(left, right);
+        return compare(left, ByteBufferAccessor.instance, right, ByteBufferAccessor.instance);
+    }
+
+    public final <VL, VR> int compare(VL left, ValueAccessor<VL> accessorL, VR right, ValueAccessor<VR> accessorR)
+    {
+        return isByteOrderComparable ? ValueAccessor.compare(left, accessorL, right, accessorR) : compareCustom(left, accessorL, right, accessorR);
     }
 
     /**
      * Implement IFF ComparisonType is CUSTOM
      *
-     * Compares the ByteBuffer representation of two instances of this class,
+     * Compares the byte representation of two instances of this class,
      * for types where this cannot be done by simple in-order comparison of the
      * unsigned bytes
      *
      * Standard Java compare semantics
+     * @param left
+     * @param accessorL
+     * @param right
+     * @param accessorR
      */
-    public int compareCustom(ByteBuffer left, ByteBuffer right)
+    public <VL, VR> int compareCustom(VL left, ValueAccessor<VL> accessorL, VR right, ValueAccessor<VR> accessorR)
     {
         throw new UnsupportedOperationException();
     }
@@ -190,15 +256,20 @@ public abstract class AbstractType<T> implements Comparator<ByteBuffer>
      * @param cellValue ByteBuffer representing cell value
      * @throws MarshalException
      */
-    public void validateCellValue(ByteBuffer cellValue) throws MarshalException
+    public <V> void validateCellValue(V cellValue, ValueAccessor<V> accessor) throws MarshalException
     {
-        validate(cellValue);
+        validate(cellValue, accessor);
     }
 
     /* Most of our internal type should override that. */
     public CQL3Type asCQL3Type()
     {
         return new CQL3Type.Custom(this);
+    }
+
+    public AbstractType<?> udfType()
+    {
+        return this;
     }
 
     /**
@@ -213,6 +284,14 @@ public abstract class AbstractType<T> implements Comparator<ByteBuffer>
     }
 
     public abstract TypeSerializer<T> getSerializer();
+
+    /**
+     * @return the deserializer used to deserialize the function arguments of this type.
+     */
+    public ArgumentDeserializer getArgumentDeserializer()
+    {
+        return new DefaultArgumentDeserializer(this);
+    }
 
     /* convenience method */
     public String getString(Collection<ByteBuffer> names)
@@ -238,6 +317,11 @@ public abstract class AbstractType<T> implements Comparator<ByteBuffer>
     public boolean isReversed()
     {
         return false;
+    }
+
+    public AbstractType<T> unwrap()
+    {
+        return this;
     }
 
     public static AbstractType<?> parseDefaultParameters(AbstractType<?> baseType, TypeParser parser) throws SyntaxException
@@ -316,32 +400,17 @@ public abstract class AbstractType<T> implements Comparator<ByteBuffer>
      *
      * Unless you're doing something very similar to CollectionsType, you shouldn't override this.
      */
-    public int compareCollectionMembers(ByteBuffer v1, ByteBuffer v2, ByteBuffer collectionName)
+    public <VL, VR> int compareCollectionMembers(VL left, ValueAccessor<VL> accessorL, VR right, ValueAccessor<VR> accessorR, VL collectionName)
     {
-        return compare(v1, v2);
+        return compare(left, accessorL, right, accessorR);
     }
 
-    /**
-     * An alternative validation function used by CollectionsType in conjunction with CompositeType.
-     *
-     * This is similar to the compare function above.
-     */
-    public void validateCollectionMember(ByteBuffer bytes, ByteBuffer collectionName) throws MarshalException
+    public <V> void validateCollectionMember(V value, V collectionName, ValueAccessor<V> accessor) throws MarshalException
     {
-        validate(bytes);
+        getSerializer().validate(value, accessor);
     }
 
     public boolean isCollection()
-    {
-        return false;
-    }
-
-    public boolean isMultiCell()
-    {
-        return false;
-    }
-
-    public boolean isTuple()
     {
         return false;
     }
@@ -351,17 +420,52 @@ public abstract class AbstractType<T> implements Comparator<ByteBuffer>
         return false;
     }
 
-    public AbstractType<?> freeze()
+    public boolean isTuple()
+    {
+        return false;
+    }
+
+    public boolean isVector()
+    {
+        return false;
+    }
+
+    public boolean isMultiCell()
+    {
+        return false;
+    }
+
+    public boolean isFreezable()
+    {
+        return false;
+    }
+
+    public AbstractType<T> freeze()
     {
         return this;
     }
 
-    /**
-     * Returns {@code true} for types where empty should be handled like {@code null} like {@link Int32Type}.
-     */
-    public boolean isEmptyValueMeaningless()
+    public AbstractType<?> unfreeze()
     {
-        return false;
+        return this;
+    }
+
+    public List<AbstractType<?>> subTypes()
+    {
+        return Collections.emptyList();
+    }
+
+    /**
+     * Returns an AbstractType instance that is equivalent to this one, but with all nested UDTs and collections
+     * explicitly frozen.
+     *
+     * This is only necessary for {@code 2.x -> 3.x} schema migrations, and can be removed in Cassandra 4.0.
+     *
+     * See CASSANDRA-11609 and CASSANDRA-11613.
+     */
+    public AbstractType<?> freezeNestedMulticellTypes()
+    {
+        return this;
     }
 
     /**
@@ -370,15 +474,6 @@ public abstract class AbstractType<T> implements Comparator<ByteBuffer>
     public String toString(boolean ignoreFreezing)
     {
         return this.toString();
-    }
-
-    /**
-     * The number of subcomponents this type has.
-     * This is always 1, i.e. the type has only itself as "subcomponents", except for CompositeType.
-     */
-    public int componentsCount()
-    {
-        return 1;
     }
 
     /**
@@ -391,70 +486,151 @@ public abstract class AbstractType<T> implements Comparator<ByteBuffer>
     }
 
     /**
-     * The length of values for this type if all values are of fixed length, -1 otherwise.
+     * The length of values for this type if all values are of fixed length, -1 otherwise. This has an impact on
+     * serialization.
+     * <lu>
+     *  <li> see {@link #writeValue} </li>
+     *  <li> see {@link #read} </li>
+     *  <li> see {@link #writtenLength} </li>
+     *  <li> see {@link #skipValue} </li>
+     * </lu>
      */
-    protected int valueLengthIfFixed()
+    public int valueLengthIfFixed()
     {
-        return -1;
+        return VARIABLE_LENGTH;
     }
 
-    public void validateIfFixedSize(ByteBuffer value)
+    /**
+     * Checks if all values are of fixed length.
+     *
+     * @return {@code true} if all values are of fixed length, {@code false} otherwise.
+     */
+    public final boolean isValueLengthFixed()
     {
-        if (valueLengthIfFixed() < 0)
-            return;
+        return valueLengthIfFixed() != VARIABLE_LENGTH;
+    }
 
-        validate(value);
+    /**
+     * Defines if the type allows an empty set of bytes ({@code new byte[0]}) as valid input.  The {@link #validate(Object, ValueAccessor)}
+     * and {@link #compose(Object, ValueAccessor)} methods must allow empty bytes when this returns true, and must reject empty bytes
+     * when this is false.
+     * <p/>
+     * As of this writing, the main user of this API is for testing to know what types allow empty values and what types don't,
+     * so that the data that gets generated understands when {@link ByteBufferUtil#EMPTY_BYTE_BUFFER} is allowed as valid data.
+     */
+    public boolean allowsEmpty()
+    {
+        return false;
+    }
+
+    /**
+     * Returns {@code true} for types where empty should be handled like {@code null} like {@link Int32Type}.
+     */
+    public boolean isEmptyValueMeaningless()
+    {
+        return false;
+    }
+
+    @Nullable
+    public ByteBuffer sanitize(@Nullable ByteBuffer bb)
+    {
+        if (bb == null) return null;
+        // not checking allowsEmpty as this method assumes that the bb has already passed validation for the type
+        return bb.remaining() == 0 && isEmptyValueMeaningless() ? null : bb;
+    }
+
+    public boolean isNull(ByteBuffer bb)
+    {
+        return isNull(bb, ByteBufferAccessor.instance);
+    }
+
+    public <V> boolean isNull(V buffer, ValueAccessor<V> accessor)
+    {
+        return getSerializer().isNull(buffer, accessor);
+    }
+
+    public boolean isNumber()
+    {
+        return unwrap() instanceof org.apache.cassandra.db.marshal.NumberType;
+    }
+
+    public boolean isString()
+    {
+        return unwrap() instanceof org.apache.cassandra.db.marshal.StringType;
     }
 
     // This assumes that no empty values are passed
     public void writeValue(ByteBuffer value, DataOutputPlus out) throws IOException
     {
-        assert value.hasRemaining();
-        int valueLengthIfFixed = valueLengthIfFixed();
-        assert valueLengthIfFixed < 0 || value.remaining() == valueLengthIfFixed : String.format("Expected exactly %d bytes, but was %d",
-                                                                                                 valueLengthIfFixed, value.remaining());
+        writeValue(value, ByteBufferAccessor.instance, out);
+    }
 
-        if (valueLengthIfFixed >= 0)
-            out.write(value);
+    // This assumes that no empty values are passed
+    public  <V> void writeValue(V value, ValueAccessor<V> accessor, DataOutputPlus out) throws IOException
+    {
+        assert !isNull(value, accessor) : "bytes should not be null for type " + this;
+        int expectedValueLength = valueLengthIfFixed();
+        if (expectedValueLength >= 0)
+        {
+            int actualValueLength = accessor.size(value);
+            if (actualValueLength == expectedValueLength)
+                accessor.write(value, out);
+            else
+                throw new IOException(String.format("Expected exactly %d bytes, but was %d",
+                                                    expectedValueLength, actualValueLength));
+        }
         else
-            ByteBufferUtil.writeWithVIntLength(value, out);
+        {
+            accessor.writeWithVIntLength(value, out);
+        }
     }
 
     public long writtenLength(ByteBuffer value)
     {
-        assert value.hasRemaining();
-        int valueLengthIfFixed = valueLengthIfFixed();
-        assert valueLengthIfFixed < 0 || value.remaining() == valueLengthIfFixed : String.format("Expected exactly %d bytes, but was %d",
-                                                                                                 valueLengthIfFixed, value.remaining());
-
-        return valueLengthIfFixed >= 0
-             ? value.remaining()
-             : TypeSizes.sizeofWithVIntLength(value);
+        return writtenLength(value, ByteBufferAccessor.instance);
     }
 
-    public ByteBuffer readValue(DataInputPlus in) throws IOException
+    public <V> long writtenLength(V value, ValueAccessor<V> accessor)
     {
-        return readValue(in, Integer.MAX_VALUE);
+        assert !accessor.isEmpty(value) : "bytes should not be empty for type " + this;
+        return valueLengthIfFixed() >= 0
+               ? accessor.size(value) // if the size is wrong, this will be detected in writeValue
+               : accessor.sizeWithVIntLength(value);
     }
 
-    public ByteBuffer readValue(DataInputPlus in, int maxValueSize) throws IOException
+    public ByteBuffer readBuffer(DataInputPlus in) throws IOException
+    {
+        return readBuffer(in, Integer.MAX_VALUE);
+    }
+
+    public ByteBuffer readBuffer(DataInputPlus in, int maxValueSize) throws IOException
+    {
+        return read(ByteBufferAccessor.instance, in, maxValueSize);
+    }
+
+    public byte[] readArray(DataInputPlus in, int maxValueSize) throws IOException
+    {
+        return read(ByteArrayAccessor.instance, in, maxValueSize);
+    }
+
+    public <V> V read(ValueAccessor<V> accessor, DataInputPlus in, int maxValueSize) throws IOException
     {
         int length = valueLengthIfFixed();
 
         if (length >= 0)
-            return ByteBufferUtil.read(in, length);
+            return accessor.read(in, length);
         else
         {
-            int l = (int)in.readUnsignedVInt();
+            int l = in.readUnsignedVInt32();
             if (l < 0)
                 throw new IOException("Corrupt (negative) value length encountered");
 
             if (l > maxValueSize)
                 throw new IOException(String.format("Corrupt value length %d encountered, as it exceeds the maximum of %d, " +
-                                                    "which is set via max_value_size_in_mb in cassandra.yaml",
+                                                    "which is set via max_value_size in cassandra.yaml",
                                                     l, maxValueSize));
 
-            return ByteBufferUtil.read(in, l);
+            return accessor.read(in, l);
         }
     }
 
@@ -467,9 +643,132 @@ public abstract class AbstractType<T> implements Comparator<ByteBuffer>
             ByteBufferUtil.skipWithVIntLength(in);
     }
 
-    public boolean referencesUserType(String userTypeName)
+    public final boolean referencesUserType(ByteBuffer name)
+    {
+        return referencesUserType(name, ByteBufferAccessor.instance);
+    }
+
+    public <V> boolean referencesUserType(V name, ValueAccessor<V> accessor)
     {
         return false;
+    }
+
+    /**
+     * Returns an instance of this type with all references to the provided user type recursively replaced with its new
+     * definition.
+     */
+    public AbstractType<?> withUpdatedUserType(UserType udt)
+    {
+        return this;
+    }
+
+    /**
+     * Replace any instances of UserType with equivalent TupleType-s.
+     *
+     * We need it for dropped_columns, to allow safely dropping unused user types later without retaining any references
+     * to them in system_schema.dropped_columns.
+     */
+    public AbstractType<?> expandUserTypes()
+    {
+        return this;
+    }
+
+    public boolean referencesDuration()
+    {
+        for (AbstractType<?> type : subTypes())
+        {
+            if (type.referencesDuration())
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Tests whether a CQL value having this type can be assigned to the provided receiver.
+     */
+    public AssignmentTestable.TestResult testAssignment(AbstractType<?> receiverType)
+    {
+        // testAssignement is for CQL literals and native protocol values, none of which make a meaningful
+        // difference between frozen or not and reversed or not.
+
+        if (isFreezable() && !isMultiCell())
+            receiverType = receiverType.freeze();
+
+        if (isReversed() && !receiverType.isReversed())
+            receiverType = ReversedType.getInstance(receiverType);
+
+        if (equals(receiverType))
+            return AssignmentTestable.TestResult.EXACT_MATCH;
+
+        if (receiverType.isValueCompatibleWith(this))
+            return AssignmentTestable.TestResult.WEAKLY_ASSIGNABLE;
+
+        return AssignmentTestable.TestResult.NOT_ASSIGNABLE;
+    }
+
+    /**
+     * Produce a byte-comparable representation of the given value, i.e. a sequence of bytes that compares the same way
+     * using lexicographical unsigned byte comparison as the original value using the type's comparator.
+     *
+     * We use a slightly stronger requirement to be able to use the types in tuples. Precisely, for any pair x, y of
+     * non-equal valid values of this type and any bytes b1, b2 between 0x10 and 0xEF,
+     * (+ stands for concatenation)
+     *   compare(x, y) == compareLexicographicallyUnsigned(asByteComparable(x)+b1, asByteComparable(y)+b2)
+     * (i.e. the values compare like the original type, and an added 0x10-0xEF byte at the end does not change that) and:
+     *   asByteComparable(x)+b1 is not a prefix of asByteComparable(y)      (weakly prefix free)
+     * (i.e. a valid representation of a value may be a prefix of another valid representation of a value only if the
+     * following byte in the latter is smaller than 0x10 or larger than 0xEF). These properties are trivially true if
+     * the encoding compares correctly and is prefix free, but also permits a little more freedom that enables somewhat
+     * more efficient encoding of arbitrary-length byte-comparable blobs.
+     *
+     * Depending on the type, this method can be called for null or empty input, in which case the output is allowed to
+     * be null (the clustering/tuple encoding will accept and handle it).
+     */
+    public <V> ByteSource asComparableBytes(ValueAccessor<V> accessor, V value, ByteComparable.Version version)
+    {
+        if (isByteOrderComparable)
+        {
+            // When a type is byte-ordered on its own, we only need to escape it, so that we can include it in
+            // multi-component types and make the encoding weakly-prefix-free.
+            return ByteSource.of(accessor, value, version);
+        }
+        else
+            // default is only good for byte-comparables
+            throw new UnsupportedOperationException(getClass().getSimpleName() + " does not implement asComparableBytes");
+    }
+
+    public final ByteSource asComparableBytes(ByteBuffer byteBuffer, ByteComparable.Version version)
+    {
+        return asComparableBytes(ByteBufferAccessor.instance, byteBuffer, version);
+    }
+
+    /**
+     * Translates the given byte-ordered representation to the common, non-byte-ordered binary representation of a
+     * payload for this abstract type (the latter, common binary representation is what we mostly work with in the
+     * storage engine internals). If the given bytes don't correspond to the encoding of some payload value for this
+     * abstract type, an {@link IllegalArgumentException} may be thrown.
+     *
+     * @param accessor value accessor used to construct the value.
+     * @param comparableBytes A byte-ordered representation (presumably of a payload for this abstract type).
+     * @param version The byte-comparable version used to construct the representation.
+     * @return A of a payload for this abstract type, corresponding to the given byte-ordered representation,
+     *         constructed using the supplied value accessor.
+     *
+     * @see #asComparableBytes
+     */
+    public <V> V fromComparableBytes(ValueAccessor<V> accessor, ByteSource.Peekable comparableBytes, ByteComparable.Version version)
+    {
+        if (isByteOrderComparable)
+            return accessor.valueOf(ByteSourceInverse.getUnescapedBytes(comparableBytes));
+        else
+            throw new UnsupportedOperationException(getClass().getSimpleName() + " does not implement fromComparableBytes");
+    }
+
+    public final ByteBuffer fromComparableBytes(ByteSource.Peekable comparableBytes, ByteComparable.Version version)
+    {
+        return fromComparableBytes(ByteBufferAccessor.instance, comparableBytes, version);
     }
 
     /**
@@ -492,5 +791,51 @@ public abstract class AbstractType<T> implements Comparator<ByteBuffer>
             case NOT_COMPARABLE:
                 throw new IllegalArgumentException(this + " cannot be used in comparisons, so cannot be used as a clustering column");
         }
+    }
+
+    public final AssignmentTestable.TestResult testAssignment(String keyspace, ColumnSpecification receiver)
+    {
+        return testAssignment(receiver.type);
+    }
+
+    @Override
+    public AbstractType<?> getCompatibleTypeIfKnown(String keyspace)
+    {
+        return this;
+    }
+
+    /**
+     * @return A fixed, serialized value to be used when the column is masked, to be returned instead of the real value.
+     */
+    public ByteBuffer getMaskedValue()
+    {
+        throw new UnsupportedOperationException("There isn't a defined masked value for type " + asCQL3Type());
+    }
+
+    /**
+     * {@link ArgumentDeserializer} that uses the type deserialization.
+     */
+    protected static class DefaultArgumentDeserializer implements ArgumentDeserializer
+    {
+        private final AbstractType<?> type;
+
+        public DefaultArgumentDeserializer(AbstractType<?> type)
+        {
+            this.type = type;
+        }
+
+        @Override
+        public Object deserialize(ProtocolVersion protocolVersion, ByteBuffer buffer)
+        {
+            if (buffer == null || (!buffer.hasRemaining() && type.isEmptyValueMeaningless()))
+                return null;
+
+            return type.compose(buffer);
+        }
+    }
+
+    public boolean isConstrainable()
+    {
+        return true;
     }
 }

@@ -17,14 +17,13 @@
  */
 package org.apache.cassandra.db.rows;
 
-import java.security.MessageDigest;
-
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import org.apache.cassandra.config.CFMetaData;
+import org.apache.cassandra.db.Digest;
+import org.apache.cassandra.db.filter.ColumnFilter;
 import org.apache.cassandra.db.transform.Transformation;
-import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.schema.TableMetadata;
 
 /**
  * Static methods to work with row iterators.
@@ -35,20 +34,36 @@ public abstract class RowIterators
 
     private RowIterators() {}
 
-    public static void digest(RowIterator iterator, MessageDigest digest)
+    public static void digest(RowIterator iterator, Digest digest)
     {
         // TODO: we're not computing digest the same way that old nodes. This is
         // currently ok as this is only used for schema digest and the is no exchange
         // of schema digest between different versions. If this changes however,
         // we'll need to agree on a version.
-        digest.update(iterator.partitionKey().getKey().duplicate());
+        digest.update(iterator.partitionKey().getKey());
         iterator.columns().regulars.digest(digest);
         iterator.columns().statics.digest(digest);
-        FBUtilities.updateWithBoolean(digest, iterator.isReverseOrder());
+        digest.updateWithBoolean(iterator.isReverseOrder());
         iterator.staticRow().digest(digest);
 
         while (iterator.hasNext())
             iterator.next().digest(digest);
+    }
+
+    /**
+     * Filter the provided iterator to only include cells that are selected by the user.
+     *
+     * @param iterator the iterator to filter.
+     * @param filter the {@code ColumnFilter} to use when deciding which cells are queried by the user. This should be the filter
+     * that was used when querying {@code iterator}.
+     * @return the filtered iterator..
+     */
+    public static RowIterator withOnlyQueriedData(RowIterator iterator, ColumnFilter filter)
+    {
+        if (filter.allFetchedColumnsAreQueried())
+            return iterator;
+
+        return Transformation.apply(iterator, new WithOnlyQueriedData(filter));
     }
 
     /**
@@ -59,12 +74,12 @@ public abstract class RowIterators
      */
     public static RowIterator loggingIterator(RowIterator iterator, final String id)
     {
-        CFMetaData metadata = iterator.metadata();
+        TableMetadata metadata = iterator.metadata();
         logger.info("[{}] Logging iterator on {}.{}, partition key={}, reversed={}",
                     id,
-                    metadata.ksName,
-                    metadata.cfName,
-                    metadata.getKeyValidator().getString(iterator.partitionKey().getKey()),
+                    metadata.keyspace,
+                    metadata.name,
+                    metadata.partitionKeyType.getString(iterator.partitionKey().getKey()),
                     iterator.isReverseOrder());
 
         class Log extends Transformation

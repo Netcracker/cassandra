@@ -18,27 +18,38 @@
 
 package org.apache.cassandra.metrics;
 
+import java.util.concurrent.TimeUnit;
+
 import org.junit.Test;
 
-import static junit.framework.Assert.assertFalse;
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 
 public class LatencyMetricsTest
 {
+    private final MetricNameFactory factory = new TestMetricsNameFactory();
+
+    private static class TestMetricsNameFactory implements MetricNameFactory
+    {
+
+        @Override
+        public CassandraMetricsRegistry.MetricName createMetricName(String metricName)
+        {
+            return new CassandraMetricsRegistry.MetricName(DefaultNameFactory.GROUP_NAME, ClientRequestMetrics.TYPE_NAME, metricName);
+        }
+    }
+
     /**
      * Test bitsets in a "real-world" environment, i.e., bloom filters
      */
     @Test
     public void testGetRecentLatency()
     {
-        final LatencyMetrics l = new LatencyMetrics("test", "test");
-        Runnable r = new Runnable()
-        {
-            public void run()
+        final LatencyMetrics l = new LatencyMetrics(ClientRequestMetrics.TYPE_NAME, "test");
+        Runnable r = () -> {
+            for (int i = 0; i < 10000; i++)
             {
-                for (int i = 0; i < 10000; i++)
-                {
-                    l.addNano(1000);
-                }
+                l.addNano(1000);
             }
         };
         new Thread(r).start();
@@ -48,5 +59,50 @@ public class LatencyMetricsTest
             Double recent = l.latency.getOneMinuteRate();
             assertFalse(recent.equals(Double.POSITIVE_INFINITY));
         }
+    }
+
+    /**
+     * Test that parent LatencyMetrics are receiving updates from child metrics when reading
+     */
+    @Test
+    public void testReadMerging()
+    {
+        final LatencyMetrics parent = new LatencyMetrics(ClientRequestMetrics.TYPE_NAME, "testMerge");
+        final LatencyMetrics child = new LatencyMetrics(factory, "testChild", parent);
+
+        for (int i = 0; i < 100; i++)
+        {
+            child.addNano(TimeUnit.NANOSECONDS.convert(i, TimeUnit.MILLISECONDS));
+        }
+
+        assertEquals(4950000, child.totalLatency.getCount());
+        assertEquals(child.totalLatency.getCount(), parent.totalLatency.getCount());
+        assertEquals(child.latency.getSnapshot().getMean(), parent.latency.getSnapshot().getMean(), 50D);
+
+        child.release();
+        parent.release();
+    }
+
+    @Test
+    public void testRelease()
+    {
+        final LatencyMetrics parent = new LatencyMetrics(ClientRequestMetrics.TYPE_NAME, "testRelease");
+        final LatencyMetrics child = new LatencyMetrics(factory, "testChildRelease", parent);
+
+        for (int i = 0; i < 100; i++)
+        {
+            child.addNano(TimeUnit.NANOSECONDS.convert(i, TimeUnit.MILLISECONDS));
+        }
+
+        double mean = parent.latency.getSnapshot().getMean();
+        long count = parent.totalLatency.getCount();
+
+        child.release();
+
+        // Check that no value was lost with the release
+        assertEquals(count, parent.totalLatency.getCount());
+        assertEquals(mean, parent.latency.getSnapshot().getMean(), 50D);
+
+        parent.release();
     }
 }

@@ -23,15 +23,15 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 import org.junit.Assert;
 import org.junit.BeforeClass;
-import org.junit.Ignore;
 import org.junit.Test;
 
 import org.apache.cassandra.config.Config;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.commitlog.AbstractCommitLogService.SyncRunnable;
-import org.apache.cassandra.utils.Clock;
 import org.apache.cassandra.utils.FreeRunningClock;
 
+import static org.apache.cassandra.concurrent.Interruptible.State.NORMAL;
+import static org.apache.cassandra.concurrent.Interruptible.State.SHUTTING_DOWN;
 import static org.apache.cassandra.db.commitlog.AbstractCommitLogService.DEFAULT_MARKER_INTERVAL_MILLIS;
 
 public class AbstractCommitLogServiceTest
@@ -39,6 +39,7 @@ public class AbstractCommitLogServiceTest
     @BeforeClass
     public static void before()
     {
+        DatabaseDescriptor.daemonInitialization();
         DatabaseDescriptor.setCommitLogSync(Config.CommitLogSync.periodic);
         DatabaseDescriptor.setCommitLogSyncPeriod(10 * 1000);
     }
@@ -48,8 +49,8 @@ public class AbstractCommitLogServiceTest
     {
         long syncTimeMillis = 10 * 1000;
         FakeCommitLogService commitLogService = new FakeCommitLogService(syncTimeMillis);
-        Assert.assertEquals(DEFAULT_MARKER_INTERVAL_MILLIS, commitLogService.markerIntervalMillis);
-        Assert.assertEquals(syncTimeMillis, commitLogService.syncIntervalMillis);
+        Assert.assertEquals(toNanos(DEFAULT_MARKER_INTERVAL_MILLIS), commitLogService.markerIntervalNanos);
+        Assert.assertEquals(toNanos(syncTimeMillis), commitLogService.syncIntervalNanos);
     }
 
     @Test
@@ -57,9 +58,9 @@ public class AbstractCommitLogServiceTest
     {
         long syncTimeMillis = 100;
         FakeCommitLogService commitLogService = new FakeCommitLogService(syncTimeMillis);
-        Assert.assertEquals(DEFAULT_MARKER_INTERVAL_MILLIS, commitLogService.markerIntervalMillis);
-        Assert.assertEquals(syncTimeMillis, commitLogService.syncIntervalMillis);
-        Assert.assertEquals(commitLogService.markerIntervalMillis, commitLogService.syncIntervalMillis);
+        Assert.assertEquals(toNanos(DEFAULT_MARKER_INTERVAL_MILLIS), commitLogService.markerIntervalNanos);
+        Assert.assertEquals(toNanos(syncTimeMillis), commitLogService.syncIntervalNanos);
+        Assert.assertEquals(commitLogService.markerIntervalNanos, commitLogService.syncIntervalNanos);
     }
 
     @Test
@@ -68,8 +69,8 @@ public class AbstractCommitLogServiceTest
         long syncTimeMillis = 151;
         long expectedMillis = 200;
         FakeCommitLogService commitLogService = new FakeCommitLogService(syncTimeMillis);
-        Assert.assertEquals(DEFAULT_MARKER_INTERVAL_MILLIS, commitLogService.markerIntervalMillis);
-        Assert.assertEquals(expectedMillis, commitLogService.syncIntervalMillis);
+        Assert.assertEquals(toNanos(DEFAULT_MARKER_INTERVAL_MILLIS), commitLogService.markerIntervalNanos);
+        Assert.assertEquals(toNanos(expectedMillis), commitLogService.syncIntervalNanos);
     }
 
     @Test
@@ -78,18 +79,23 @@ public class AbstractCommitLogServiceTest
         long syncTimeMillis = 121;
         long expectedMillis = 100;
         FakeCommitLogService commitLogService = new FakeCommitLogService(syncTimeMillis);
-        Assert.assertEquals(DEFAULT_MARKER_INTERVAL_MILLIS, commitLogService.markerIntervalMillis);
-        Assert.assertEquals(expectedMillis, commitLogService.syncIntervalMillis);
+        Assert.assertEquals(toNanos(DEFAULT_MARKER_INTERVAL_MILLIS), commitLogService.markerIntervalNanos);
+        Assert.assertEquals(toNanos(expectedMillis), commitLogService.syncIntervalNanos);
     }
 
     @Test
     public void testConstructorSyncTinyValue()
     {
         long syncTimeMillis = 10;
-        long expectedNanos = syncTimeMillis;
+        long expectedNanos = toNanos(syncTimeMillis);
         FakeCommitLogService commitLogService = new FakeCommitLogService(syncTimeMillis);
-        Assert.assertEquals(expectedNanos, commitLogService.markerIntervalMillis);
-        Assert.assertEquals(expectedNanos, commitLogService.syncIntervalMillis);
+        Assert.assertEquals(expectedNanos, commitLogService.markerIntervalNanos);
+        Assert.assertEquals(expectedNanos, commitLogService.syncIntervalNanos);
+    }
+
+    private static long toNanos(long millis)
+    {
+        return TimeUnit.MILLISECONDS.toNanos(millis);
     }
 
     private static class FakeCommitLogService extends AbstractCommitLogService
@@ -100,12 +106,6 @@ public class AbstractCommitLogServiceTest
             lastSyncedAt = 0;
         }
 
-        @Override
-        void start()
-        {
-            // nop
-        }
-
         protected void maybeWaitForSync(CommitLogSegment.Allocation alloc)
         {
             // nop
@@ -113,7 +113,7 @@ public class AbstractCommitLogServiceTest
     }
 
     @Test
-    public void testSync()
+    public void testSync() throws InterruptedException
     {
         long syncTimeMillis = AbstractCommitLogService.DEFAULT_MARKER_INTERVAL_MILLIS * 2;
         FreeRunningClock clock = new FreeRunningClock();
@@ -122,26 +122,25 @@ public class AbstractCommitLogServiceTest
         FakeCommitLog commitLog = (FakeCommitLog) commitLogService.commitLog;
 
         // at time 0
-        Assert.assertTrue(syncRunnable.sync());
+        syncRunnable.run(NORMAL);
         Assert.assertEquals(1, commitLog.markCount.get());
         Assert.assertEquals(0, commitLog.syncCount.get());
 
         // at time DEFAULT_MARKER_INTERVAL_MILLIS
         clock.advance(DEFAULT_MARKER_INTERVAL_MILLIS, TimeUnit.MILLISECONDS);
-        Assert.assertTrue(syncRunnable.sync());
+        syncRunnable.run(NORMAL);
         Assert.assertEquals(2, commitLog.markCount.get());
         Assert.assertEquals(0, commitLog.syncCount.get());
 
         // at time DEFAULT_MARKER_INTERVAL_MILLIS * 2
         clock.advance(DEFAULT_MARKER_INTERVAL_MILLIS, TimeUnit.MILLISECONDS);
-        Assert.assertTrue(syncRunnable.sync());
+        syncRunnable.run(NORMAL);
         Assert.assertEquals(2, commitLog.markCount.get());
         Assert.assertEquals(1, commitLog.syncCount.get());
 
         // at time DEFAULT_MARKER_INTERVAL_MILLIS * 3, but with shutdown!
         clock.advance(DEFAULT_MARKER_INTERVAL_MILLIS, TimeUnit.MILLISECONDS);
-        commitLogService.shutdown();
-        Assert.assertFalse(syncRunnable.sync());
+        syncRunnable.run(SHUTTING_DOWN);
         Assert.assertEquals(2, commitLog.markCount.get());
         Assert.assertEquals(2, commitLog.syncCount.get());
     }
@@ -153,20 +152,11 @@ public class AbstractCommitLogServiceTest
 
         FakeCommitLog()
         {
-            super(DatabaseDescriptor.getCommitLogLocation(), null);
+            super(null);
         }
 
         @Override
-        CommitLog start()
-        {
-            // this is a bit dicey. we need to start the allocator, but starting the parent's executor will muck things
-            // up as it is pointing to a different executor service, not the fake one in this test class.
-            allocator.start();
-            return this;
-        }
-
-        @Override
-        public void sync(boolean syncAllSegments, boolean flush)
+        public void sync(boolean flush)
         {
             if (flush)
                 syncCount.incrementAndGet();
@@ -181,7 +171,7 @@ public class AbstractCommitLogServiceTest
         long syncTimeMillis = 10;
         SyncRunnable syncRunnable = new FakeCommitLogService(syncTimeMillis).new SyncRunnable(new FreeRunningClock());
         long pollStarted = 1;
-        long now = pollStarted + (syncTimeMillis * 2);
+        long now = Integer.MAX_VALUE;
         Assert.assertTrue(syncRunnable.maybeLogFlushLag(pollStarted, now));
         Assert.assertEquals(now - pollStarted, syncRunnable.getTotalSyncDuration());
     }
@@ -216,7 +206,7 @@ public class AbstractCommitLogServiceTest
             Assert.assertEquals(i * (now - pollStarted), syncRunnable.getTotalSyncDuration());
         }
 
-        now = pollStarted + (syncTimeMillis * 2);
+        now = pollStarted + Integer.MAX_VALUE;
         Assert.assertTrue(syncRunnable.maybeLogFlushLag(pollStarted, now));
         Assert.assertEquals(now - pollStarted, syncRunnable.getTotalSyncDuration());
     }

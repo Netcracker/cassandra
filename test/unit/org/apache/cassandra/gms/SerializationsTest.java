@@ -18,26 +18,36 @@
  */
 package org.apache.cassandra.gms;
 
-import org.apache.cassandra.AbstractSerializationsTester;
-import org.apache.cassandra.dht.IPartitioner;
-import org.apache.cassandra.dht.Token;
-import org.apache.cassandra.io.util.DataInputPlus.DataInputStreamPlus;
-import org.apache.cassandra.io.util.DataOutputStreamPlus;
-import org.apache.cassandra.service.StorageService;
-import org.apache.cassandra.utils.FBUtilities;
-
-import org.junit.Test;
-
 import java.io.IOException;
-import java.net.InetAddress;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
+import org.junit.BeforeClass;
+import org.junit.Test;
+
+import org.apache.cassandra.AbstractSerializationsTester;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.dht.IPartitioner;
+import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.distributed.test.log.ClusterMetadataTestHelper;
+import org.apache.cassandra.io.util.DataOutputStreamPlus;
+import org.apache.cassandra.io.util.FileInputStreamPlus;
+import org.apache.cassandra.locator.InetAddressAndPort;
+import org.apache.cassandra.tcm.ClusterMetadata;
+import org.apache.cassandra.utils.FBUtilities;
+
 public class SerializationsTest extends AbstractSerializationsTester
 {
+    @BeforeClass
+    public static void initDD()
+    {
+        DatabaseDescriptor.daemonInitialization();
+        ClusterMetadataTestHelper.setInstanceForTest();
+    }
+
     private void testEndpointStateWrite() throws IOException
     {
         DataOutputStreamPlus out = getOutput("gms.EndpointState.bin");
@@ -60,7 +70,7 @@ public class SerializationsTest extends AbstractSerializationsTester
         if (EXECUTE_WRITES)
             testEndpointStateWrite();
 
-        DataInputStreamPlus in = getInput("gms.EndpointState.bin");
+        FileInputStreamPlus in = getInput("gms.EndpointState.bin");
         assert HeartBeatState.serializer.deserialize(in, getVersion()) != null;
         assert EndpointState.serializer.deserialize(in, getVersion()) != null;
         assert VersionedValue.serializer.deserialize(in, getVersion()) != null;
@@ -70,13 +80,14 @@ public class SerializationsTest extends AbstractSerializationsTester
 
     private void testGossipDigestWrite() throws IOException
     {
-        Map<InetAddress, EndpointState> states = new HashMap<InetAddress, EndpointState>();
-        states.put(InetAddress.getByName("127.0.0.1"), Statics.EndpointSt);
-        states.put(InetAddress.getByName("127.0.0.2"), Statics.EndpointSt);
+        Map<InetAddressAndPort, EndpointState> states = new HashMap<>();
+        states.put(InetAddressAndPort.getByName("127.0.0.1"), Statics.EndpointSt);
+        states.put(InetAddressAndPort.getByName("127.0.0.2"), Statics.EndpointSt);
         GossipDigestAck ack = new GossipDigestAck(Statics.Digests, states);
         GossipDigestAck2 ack2 = new GossipDigestAck2(states);
         GossipDigestSyn syn = new GossipDigestSyn("Not a real cluster name",
-                                                  StorageService.instance.getTokenMetadata().partitioner.getClass().getCanonicalName(),
+                                                  ClusterMetadata.current().tokenMap.partitioner().getClass().getCanonicalName(),
+                                                  20240430,
                                                   Statics.Digests);
 
         DataOutputStreamPlus out = getOutput("gms.Gossip.bin");
@@ -102,9 +113,9 @@ public class SerializationsTest extends AbstractSerializationsTester
             testGossipDigestWrite();
 
         int count = 0;
-        DataInputStreamPlus in = getInput("gms.Gossip.bin");
-        while (count < Statics.Digests.size())
-            assert GossipDigestAck2.serializer.deserialize(in, getVersion()) != null;
+        FileInputStreamPlus in = getInput("gms.Gossip.bin");
+        while (count++ < Statics.Digests.size())
+            assert GossipDigest.serializer.deserialize(in, getVersion()) != null;
         assert GossipDigestAck.serializer.deserialize(in, getVersion()) != null;
         assert GossipDigestAck2.serializer.deserialize(in, getVersion()) != null;
         assert GossipDigestSyn.serializer.deserialize(in, getVersion()) != null;
@@ -115,18 +126,18 @@ public class SerializationsTest extends AbstractSerializationsTester
     {
         private static HeartBeatState HeartbeatSt = new HeartBeatState(101, 201);
         private static EndpointState EndpointSt = new EndpointState(HeartbeatSt);
-        private static IPartitioner partitioner = StorageService.instance.getTokenMetadata().partitioner;
+        private static IPartitioner partitioner = ClusterMetadata.current().tokenMap.partitioner();
         private static VersionedValue.VersionedValueFactory vvFact = new VersionedValue.VersionedValueFactory(partitioner);
         private static VersionedValue vv0 = vvFact.load(23d);
         private static VersionedValue vv1 = vvFact.bootstrapping(Collections.<Token>singleton(partitioner.getRandomToken()));
         private static List<GossipDigest> Digests = new ArrayList<GossipDigest>();
-
+        static
         {
-            HeartbeatSt.updateHeartBeat();
+            EndpointSt.updateHeartBeat();
             EndpointSt.addApplicationState(ApplicationState.LOAD, vv0);
-            EndpointSt.addApplicationState(ApplicationState.STATUS, vv1);
+            EndpointSt.addApplicationState(ApplicationState.STATUS_WITH_PORT, vv1);
             for (int i = 0; i < 100; i++)
-                Digests.add(new GossipDigest(FBUtilities.getBroadcastAddress(), 100 + i, 1000 + 2 * i));
+                Digests.add(new GossipDigest(FBUtilities.getBroadcastAddressAndPort(), 100 + i, 1000 + 2 * i));
         }
     }
 }

@@ -17,40 +17,44 @@
  */
 package org.apache.cassandra.triggers;
 
-import java.nio.ByteBuffer;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.concurrent.atomic.AtomicBoolean;
 
-import org.junit.AfterClass;
+import org.junit.After;
+import org.junit.Assert;
 import org.junit.Before;
 import org.junit.BeforeClass;
 import org.junit.Test;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.SchemaLoader;
-import org.apache.cassandra.config.Schema;
+import org.apache.cassandra.config.Config.TriggersPolicy;
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.cql3.QueryProcessor;
 import org.apache.cassandra.cql3.UntypedResultSet;
-import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.ConsistencyLevel;
 import org.apache.cassandra.db.Mutation;
+import org.apache.cassandra.db.RowUpdateBuilder;
 import org.apache.cassandra.db.partitions.Partition;
-import org.apache.cassandra.db.partitions.PartitionUpdate;
 import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.exceptions.RequestExecutionException;
+import org.apache.cassandra.schema.Schema;
 import org.apache.cassandra.service.StorageService;
-import org.apache.cassandra.thrift.*;
 import org.apache.cassandra.utils.FBUtilities;
-import org.apache.thrift.protocol.TBinaryProtocol;
+import org.assertj.core.api.Assertions;
 
-import static org.apache.cassandra.utils.ByteBufferUtil.bytes;
 import static org.apache.cassandra.utils.ByteBufferUtil.toInt;
+import static org.apache.cassandra.utils.Clock.Global.nanoTime;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 
 public class TriggersTest
 {
+    private static final Logger logger = LoggerFactory.getLogger(TriggersTest.class);
+    private TriggersPolicy originalTriggersPolicy;
     private static boolean triggerCreated = false;
-    private static ThriftServer thriftServer;
 
     private static String ksName = "triggers_test_ks";
     private static String cfName = "test_table";
@@ -65,12 +69,8 @@ public class TriggersTest
     @Before
     public void setup() throws Exception
     {
-        StorageService.instance.initServer(0);
-        if (thriftServer == null || ! thriftServer.isRunning())
-        {
-            thriftServer = new ThriftServer(FBUtilities.getLocalAddress(), 9170, 50);
-            thriftServer.start();
-        }
+        StorageService.instance.initServer();
+        originalTriggersPolicy = DatabaseDescriptor.getTriggersPolicy();
 
         String cql = String.format("CREATE KEYSPACE IF NOT EXISTS %s " +
                                    "WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': 1}",
@@ -83,8 +83,10 @@ public class TriggersTest
         cql = String.format("CREATE TABLE IF NOT EXISTS %s.%s (k int, v1 int, v2 int, PRIMARY KEY (k))", ksName, otherCf);
         QueryProcessor.process(cql, ConsistencyLevel.ONE);
 
+        DatabaseDescriptor.setTriggersPolicy(TriggersPolicy.enabled);
+
         // no conditional execution of create trigger stmt yet
-        if (! triggerCreated)
+        if (!triggerCreated)
         {
             cql = String.format("CREATE TRIGGER trigger_1 ON %s.%s USING '%s'",
                                 ksName, cfName, TestTrigger.class.getName());
@@ -93,21 +95,56 @@ public class TriggersTest
         }
     }
 
-    @AfterClass
-    public static void teardown()
+    @After
+    public void after()
     {
-        if (thriftServer != null && thriftServer.isRunning())
+        DatabaseDescriptor.setTriggersPolicy(originalTriggersPolicy);
+    }
+
+    @Test
+    public void testTriggersPolicy()
+    {
+        QueryProcessor.process(String.format("INSERT INTO %s.%s (k, v1) VALUES (0, 0)", ksName, cfName), ConsistencyLevel.ONE);
+        assertUpdateIsAugmented(0, "v1", 0);
+        QueryProcessor.process(String.format("DELETE FROM %s.%s WHERE k = 0", ksName, cfName), ConsistencyLevel.ONE);
+
+        DatabaseDescriptor.setTriggersPolicy(TriggersPolicy.disabled);
+        QueryProcessor.process(String.format("INSERT INTO %s.%s (k, v1) VALUES (0, 0)", ksName, cfName), ConsistencyLevel.ONE);
+
+        UntypedResultSet rs = QueryProcessor.process(String.format("SELECT * FROM %s.%s WHERE k=%s", ksName, cfName, 0), ConsistencyLevel.ONE);
+        assertRowValue(rs.one(), 0, "v1", 0); // from original update
+        assertEquals(-1, rs.one().getInt("v2", -1)); // from trigger
+        QueryProcessor.process(String.format("DELETE FROM %s.%s WHERE k = 0", ksName, cfName), ConsistencyLevel.ONE);
+
+        DatabaseDescriptor.setTriggersPolicy(TriggersPolicy.forbidden);
+        Assertions.assertThatThrownBy(() -> {
+            QueryProcessor.process(String.format("INSERT INTO %s.%s (k, v1) VALUES (0, 0)", ksName, cfName), ConsistencyLevel.ONE);
+        })
+        .isInstanceOf(TriggerDisabledException.class)
+        .hasMessageContaining(TestTrigger.class.getName());
+    }
+
+    @Test
+    public void triggerClassNotInitializedOnCreate()
+    {
+        for (TriggersPolicy policy : new TriggersPolicy[]{TriggersPolicy.disabled, TriggersPolicy.forbidden})
         {
-            thriftServer.stop();
+            DatabaseDescriptor.setTriggersPolicy(policy);
+            String cql = String.format("CREATE TRIGGER initializationdetector ON %s.%s USING '%s'", ksName, cfName, InitializationDetector.class.getName());
+            QueryProcessor.process(cql, ConsistencyLevel.ONE);
+            Assert.assertFalse(INITIALIZATION_DETECTOR_MARKER.get());
+
+            cql = String.format("DROP TRIGGER initializationdetector ON %s.%s", ksName, cfName);
+            QueryProcessor.process(cql, ConsistencyLevel.ONE);
         }
     }
 
     @Test
     public void executeTriggerOnCqlInsert() throws Exception
     {
-        String cql = String.format("INSERT INTO %s.%s (k, v1) VALUES (0, 0)", ksName, cfName);
+        String cql = String.format("INSERT INTO %s.%s (k, v1) VALUES (3, 3)", ksName, cfName);
         QueryProcessor.process(cql, ConsistencyLevel.ONE);
-        assertUpdateIsAugmented(0, "v1", 0);
+        assertUpdateIsAugmented(3, "v1", 3);
     }
 
     @Test
@@ -119,43 +156,6 @@ public class TriggersTest
                                    ksName, cfName);
         QueryProcessor.process(cql, ConsistencyLevel.ONE);
         assertUpdateIsAugmented(1, "v1", 1);
-    }
-
-    @Test
-    public void executeTriggerOnThriftInsert() throws Exception
-    {
-        Cassandra.Client client = new Cassandra.Client(
-                                        new TBinaryProtocol(
-                                            new TFramedTransportFactory().openTransport(
-                                                FBUtilities.getLocalAddress().getHostName(), 9170)));
-        client.set_keyspace(ksName);
-        client.insert(bytes(2),
-                      new ColumnParent(cfName),
-                      getColumnForInsert("v1", 2),
-                      org.apache.cassandra.thrift.ConsistencyLevel.ONE);
-
-        assertUpdateIsAugmented(2, "v1", 2);
-    }
-
-    @Test
-    public void executeTriggerOnThriftBatchUpdate() throws Exception
-    {
-        Cassandra.Client client = new Cassandra.Client(
-                                    new TBinaryProtocol(
-                                        new TFramedTransportFactory().openTransport(
-                                            FBUtilities.getLocalAddress().getHostName(), 9170)));
-        client.set_keyspace(ksName);
-        org.apache.cassandra.thrift.Mutation mutation = new org.apache.cassandra.thrift.Mutation();
-        ColumnOrSuperColumn cosc = new ColumnOrSuperColumn();
-        cosc.setColumn(getColumnForInsert("v1", 3));
-        mutation.setColumn_or_supercolumn(cosc);
-        client.batch_mutate(
-            Collections.singletonMap(bytes(3),
-                                     Collections.singletonMap(cfName,
-                                                              Collections.singletonList(mutation))),
-            org.apache.cassandra.thrift.ConsistencyLevel.ONE);
-
-        assertUpdateIsAugmented(3, "v1", 3);
     }
 
     @Test
@@ -178,30 +178,10 @@ public class TriggersTest
         assertUpdateIsAugmented(5, "v1", 5);
     }
 
-    @Test
-    public void executeTriggerOnThriftCASOperation() throws Exception
-    {
-        Cassandra.Client client = new Cassandra.Client(
-                new TBinaryProtocol(
-                        new TFramedTransportFactory().openTransport(
-                                FBUtilities.getLocalAddress().getHostName(), 9170)));
-        client.set_keyspace(ksName);
-        client.cas(bytes(6),
-                   cfName,
-                   Collections.<Column>emptyList(),
-                   Collections.singletonList(getColumnForInsert("v1", 6)),
-                   org.apache.cassandra.thrift.ConsistencyLevel.LOCAL_SERIAL,
-                   org.apache.cassandra.thrift.ConsistencyLevel.ONE);
-
-        assertUpdateIsAugmented(6, "v1", 6);
-    }
-
-    // Unfortunately, an IRE thrown from StorageProxy.cas
-    // results in a RuntimeException from QueryProcessor.process
-    @Test(expected=RuntimeException.class)
+    @Test(expected=org.apache.cassandra.exceptions.InvalidRequestException.class)
     public void onCqlUpdateWithConditionsRejectGeneratedUpdatesForDifferentPartition() throws Exception
     {
-        String cf = "cf" + System.nanoTime();
+        String cf = "cf" + nanoTime();
         try
         {
             setupTableWithTrigger(cf, CrossPartitionTrigger.class);
@@ -214,12 +194,10 @@ public class TriggersTest
         }
     }
 
-    // Unfortunately, an IRE thrown from StorageProxy.cas
-    // results in a RuntimeException from QueryProcessor.process
-    @Test(expected=RuntimeException.class)
+    @Test(expected=org.apache.cassandra.exceptions.InvalidRequestException.class)
     public void onCqlUpdateWithConditionsRejectGeneratedUpdatesForDifferentTable() throws Exception
     {
-        String cf = "cf" + System.nanoTime();
+        String cf = "cf" + nanoTime();
         try
         {
             setupTableWithTrigger(cf, CrossTableTrigger.class);
@@ -232,53 +210,24 @@ public class TriggersTest
         }
     }
 
-    @Test(expected=InvalidRequestException.class)
-    public void onThriftCASRejectGeneratedUpdatesForDifferentPartition() throws Exception
+    @Test(expected=org.apache.cassandra.exceptions.InvalidRequestException.class)
+    public void ifTriggerThrowsErrorNoMutationsAreApplied() throws Exception
     {
-        String cf = "cf" + System.nanoTime();
+        String cf = "cf" + nanoTime();
         try
         {
-            setupTableWithTrigger(cf, CrossPartitionTrigger.class);
-            Cassandra.Client client = new Cassandra.Client(
-                    new TBinaryProtocol(
-                            new TFramedTransportFactory().openTransport(
-                                    FBUtilities.getLocalAddress().getHostName(), 9170)));
-            client.set_keyspace(ksName);
-            client.cas(bytes(9),
-                       cf,
-                       Collections.<Column>emptyList(),
-                       Collections.singletonList(getColumnForInsert("v1", 9)),
-                       org.apache.cassandra.thrift.ConsistencyLevel.LOCAL_SERIAL,
-                       org.apache.cassandra.thrift.ConsistencyLevel.ONE);
+            setupTableWithTrigger(cf, ErrorTrigger.class);
+            String cql = String.format("INSERT INTO %s.%s (k, v1) VALUES (11, 11)", ksName, cf);
+            QueryProcessor.process(cql, ConsistencyLevel.ONE);
+        }
+        catch (Exception e)
+        {
+            assertTrue(e.getMessage().equals(ErrorTrigger.MESSAGE));
+            throw e;
         }
         finally
         {
-            assertUpdateNotExecuted(cf, 9);
-        }
-    }
-
-    @Test(expected=InvalidRequestException.class)
-    public void onThriftCASRejectGeneratedUpdatesForDifferentCF() throws Exception
-    {
-        String cf = "cf" + System.nanoTime();
-        try
-        {
-            setupTableWithTrigger(cf, CrossTableTrigger.class);
-            Cassandra.Client client = new Cassandra.Client(
-                    new TBinaryProtocol(
-                            new TFramedTransportFactory().openTransport(
-                                    FBUtilities.getLocalAddress().getHostName(), 9170)));
-            client.set_keyspace(ksName);
-            client.cas(bytes(10),
-                       cf,
-                       Collections.<Column>emptyList(),
-                       Collections.singletonList(getColumnForInsert("v1", 10)),
-                       org.apache.cassandra.thrift.ConsistencyLevel.LOCAL_SERIAL,
-                       org.apache.cassandra.thrift.ConsistencyLevel.ONE);
-        }
-        finally
-        {
-            assertUpdateNotExecuted(cf, 10);
+            assertUpdateNotExecuted(cf, 11);
         }
     }
 
@@ -300,7 +249,6 @@ public class TriggersTest
         assertRowValue(rs.one(), key, "v2", 999); // from trigger
         assertRowValue(rs.one(), key, originColumnName, originColumnValue); // from original update
     }
-    
     private void assertRowValue(UntypedResultSet.Row row, int key, String columnName, Object columnValue)
     {
         assertTrue(String.format("Expected value (%s) for augmented cell %s was not found", key, columnName),
@@ -315,20 +263,12 @@ public class TriggersTest
         assertTrue(rs.isEmpty());
     }
 
-    private org.apache.cassandra.thrift.Column getColumnForInsert(String columnName, int value)
-    {
-        org.apache.cassandra.thrift.Column column = new org.apache.cassandra.thrift.Column();
-        column.setName(LegacyLayout.makeLegacyComparator(Schema.instance.getCFMetaData(ksName, cfName)).fromString(columnName));
-        column.setValue(bytes(value));
-        column.setTimestamp(System.currentTimeMillis());
-        return column;
-    }
-
     public static class TestTrigger implements ITrigger
     {
         public Collection<Mutation> augment(Partition partition)
         {
-            RowUpdateBuilder update = new RowUpdateBuilder(partition.metadata(), FBUtilities.timestampMicros(), partition.partitionKey().getKey());
+            // Use a fixed early timestamp so this update can be deleted
+            RowUpdateBuilder update = new RowUpdateBuilder(partition.metadata(), 1L, partition.partitionKey().getKey());
             update.add("v2", 999);
 
             return Collections.singletonList(update.build());
@@ -351,10 +291,44 @@ public class TriggersTest
         public Collection<Mutation> augment(Partition partition)
         {
 
-            RowUpdateBuilder update = new RowUpdateBuilder(Schema.instance.getCFMetaData(ksName, otherCf), FBUtilities.timestampMicros(), partition.partitionKey().getKey());
+            RowUpdateBuilder update = new RowUpdateBuilder(Schema.instance.getTableMetadata(ksName, otherCf), FBUtilities.timestampMicros(), partition.partitionKey().getKey());
             update.add("v2", 999);
 
             return Collections.singletonList(update.build());
+        }
+    }
+
+    public static class ErrorTrigger implements ITrigger
+    {
+        public static final String MESSAGE = "Thrown by ErrorTrigger";
+        public Collection<Mutation> augment(Partition partition)
+        {
+            throw new org.apache.cassandra.exceptions.InvalidRequestException(MESSAGE);
+        }
+    }
+
+    public static class NoOpTrigger implements ITrigger
+    {
+        public Collection<Mutation> augment(Partition partition)
+        {
+            return null;
+        }
+    }
+
+    // This is not part of InitializationDetector because if it was, accessing it would initialize the class
+    final static AtomicBoolean INITIALIZATION_DETECTOR_MARKER = new AtomicBoolean();
+    public static class InitializationDetector implements ITrigger
+    {
+
+        static
+        {
+            logger.info("{} static block was executed", InitializationDetector.class.getSimpleName());
+            INITIALIZATION_DETECTOR_MARKER.set(true);
+        }
+
+        public Collection<Mutation> augment(Partition partition)
+        {
+            return null;
         }
     }
 }

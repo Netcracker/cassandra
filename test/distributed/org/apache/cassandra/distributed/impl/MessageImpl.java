@@ -21,23 +21,27 @@ package org.apache.cassandra.distributed.impl;
 import java.net.InetSocketAddress;
 
 import org.apache.cassandra.distributed.api.IMessage;
-import org.apache.cassandra.distributed.shared.NetworkTopology;
+import org.apache.cassandra.net.Verb;
+import org.apache.cassandra.utils.ByteArrayUtil;
 
 // a container for simplifying the method signature for per-instance message handling/delivery
 public class MessageImpl implements IMessage
 {
+    private static final long serialVersionUID = 0;  // for simulator support
     public final int verb;
     public final byte[] bytes;
     public final long id;
     public final int version;
+    public final long expiresAtNanos;
     public final InetSocketAddress from;
 
-    public MessageImpl(int verb, byte[] bytes, long id, int version, InetSocketAddress from)
+    public MessageImpl(int verb, byte[] bytes, long id, int version, long expiresAtNanos, InetSocketAddress from)
     {
         this.verb = verb;
         this.bytes = bytes;
         this.id = id;
         this.version = version;
+        this.expiresAtNanos = expiresAtNanos;
         this.from = from;
     }
 
@@ -61,9 +65,26 @@ public class MessageImpl implements IMessage
         return version;
     }
 
+    @Override
+    public long expiresAtNanos()
+    {
+        return expiresAtNanos;
+    }
+
     public InetSocketAddress from()
     {
         return from;
+    }
+
+    public String toString()
+    {
+        return "MessageImpl{" +
+               "verb=" + Verb.fromId(verb) +
+               ", bytes=" + ByteArrayUtil.bytesToHex(bytes) +
+               ", id=" + id +
+               ", version=" + version +
+               ", from=" + from +
+               '}';
     }
 }
 

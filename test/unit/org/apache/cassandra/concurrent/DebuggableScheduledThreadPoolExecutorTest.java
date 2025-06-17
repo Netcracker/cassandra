@@ -20,19 +20,23 @@ package org.apache.cassandra.concurrent;
 
 import java.io.IOException;
 import java.util.concurrent.CancellationException;
-import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 
+import org.junit.AfterClass;
 import org.junit.BeforeClass;
 import org.junit.Test;
 
-import junit.framework.Assert;
+import org.junit.Assert;
+
+import org.apache.cassandra.ServerTestUtils;
 import org.apache.cassandra.service.EmbeddedCassandraService;
 import org.apache.cassandra.service.StorageService;
+
+import static org.apache.cassandra.concurrent.ExecutorFactory.Global.executorFactory;
 
 public class DebuggableScheduledThreadPoolExecutorTest
 {
@@ -42,16 +46,20 @@ public class DebuggableScheduledThreadPoolExecutorTest
     @BeforeClass
     public static void startup() throws IOException
     {
-        //The DSTPE checks for if we are in the service shutdown hook so
-        //to test it we need to start C* internally.
-        service = new EmbeddedCassandraService();
-        service.start();
+        service = ServerTestUtils.startEmbeddedCassandraService();
+    }
+
+    @AfterClass
+    public static void tearDown()
+    {
+        if (service != null)
+            service.stop();
     }
 
     @Test
     public void testShutdown() throws ExecutionException, InterruptedException, IOException
     {
-        DebuggableScheduledThreadPoolExecutor testPool = new DebuggableScheduledThreadPoolExecutor("testpool");
+        ScheduledExecutorPlus testPool = executorFactory().scheduled("testpool");
 
         final AtomicInteger value = new AtomicInteger(0);
 

@@ -24,15 +24,22 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.cql3.CQL3Type;
-import org.apache.cassandra.cql3.Constants;
-import org.apache.cassandra.cql3.Term;
+import org.apache.cassandra.cql3.terms.Constants;
+import org.apache.cassandra.cql3.terms.Term;
+import org.apache.cassandra.cql3.functions.ArgumentDeserializer;
 import org.apache.cassandra.io.util.DataInputPlus;
 import org.apache.cassandra.io.util.DataOutputPlus;
-import org.apache.cassandra.serializers.TypeSerializer;
 import org.apache.cassandra.serializers.EmptySerializer;
 import org.apache.cassandra.serializers.MarshalException;
+import org.apache.cassandra.serializers.TypeSerializer;
+import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.utils.bytecomparable.ByteComparable;
+import org.apache.cassandra.utils.bytecomparable.ByteSource;
 import org.apache.cassandra.utils.NoSpamLogger;
+
+import static org.apache.cassandra.config.CassandraRelevantProperties.SERIALIZATION_EMPTY_TYPE_NONEMPTY_BEHAVIOR;
+import static org.apache.cassandra.utils.LocalizeString.toUpperCaseLocalized;
 
 /**
  * A type that only accept empty data.
@@ -43,22 +50,21 @@ public class EmptyType extends AbstractType<Void>
     private enum NonEmptyWriteBehavior { FAIL, LOG_DATA_LOSS, SILENT_DATA_LOSS }
 
     private static final Logger logger = LoggerFactory.getLogger(EmptyType.class);
-    private static final String KEY_EMPTYTYPE_NONEMPTY_BEHAVIOR = "cassandra.serialization.emptytype.nonempty_behavior";
     private static final NoSpamLogger NON_EMPTY_WRITE_LOGGER = NoSpamLogger.getLogger(logger, 1, TimeUnit.MINUTES);
     private static final NonEmptyWriteBehavior NON_EMPTY_WRITE_BEHAVIOR = parseNonEmptyWriteBehavior();
 
     private static NonEmptyWriteBehavior parseNonEmptyWriteBehavior()
     {
-        String value = System.getProperty(KEY_EMPTYTYPE_NONEMPTY_BEHAVIOR);
+        String value = SERIALIZATION_EMPTY_TYPE_NONEMPTY_BEHAVIOR.getString();
         if (value == null)
             return NonEmptyWriteBehavior.FAIL;
         try
         {
-            return NonEmptyWriteBehavior.valueOf(value.toUpperCase().trim());
+            return NonEmptyWriteBehavior.valueOf(toUpperCaseLocalized(value).trim());
         }
         catch (Exception e)
         {
-            logger.warn("Unable to parse property " + KEY_EMPTYTYPE_NONEMPTY_BEHAVIOR + ", falling back to FAIL", e);
+            logger.warn("Unable to parse property " + SERIALIZATION_EMPTY_TYPE_NONEMPTY_BEHAVIOR.getKey() + ", falling back to FAIL", e);
             return NonEmptyWriteBehavior.FAIL;
         }
     }
@@ -67,12 +73,24 @@ public class EmptyType extends AbstractType<Void>
 
     private EmptyType() {super(ComparisonType.CUSTOM);} // singleton
 
-    public int compareCustom(ByteBuffer o1, ByteBuffer o2)
+    @Override
+    public <V> ByteSource asComparableBytes(ValueAccessor<V> accessor, V data, ByteComparable.Version version)
+    {
+        return null;
+    }
+
+    @Override
+    public <V> V fromComparableBytes(ValueAccessor<V> accessor, ByteSource.Peekable comparableBytes, ByteComparable.Version version)
+    {
+        return accessor.empty();
+    }
+
+    public <VL, VR> int compareCustom(VL left, ValueAccessor<VL> accessorL, VR right, ValueAccessor<VR> accessorR)
     {
         return 0;
     }
 
-    public String getString(ByteBuffer bytes)
+    public <V> String getString(V value, ValueAccessor<V> accessor)
     {
         return "";
     }
@@ -102,7 +120,8 @@ public class EmptyType extends AbstractType<Void>
         return CQL3Type.Native.EMPTY;
     }
 
-    public String toJSONString(ByteBuffer buffer, int protocolVersion)
+    @Override
+    public String toJSONString(ByteBuffer buffer, ProtocolVersion protocolVersion)
     {
         return "\"\"";
     }
@@ -113,19 +132,32 @@ public class EmptyType extends AbstractType<Void>
     }
 
     @Override
-    protected int valueLengthIfFixed()
+    public ArgumentDeserializer getArgumentDeserializer()
+    {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public int valueLengthIfFixed()
     {
         return 0;
     }
 
     @Override
-    public ByteBuffer readValue(DataInputPlus in)
+    public <V> long writtenLength(V value, ValueAccessor<V> accessor)
+    {
+        // default implemenation requires non-empty bytes but this always requires empty bytes, so special case
+        validate(value, accessor);
+        return 0;
+    }
+
+    public ByteBuffer readBuffer(DataInputPlus in)
     {
         return ByteBufferUtil.EMPTY_BYTE_BUFFER;
     }
 
     @Override
-    public ByteBuffer readValue(DataInputPlus in, int maxValueSize)
+    public ByteBuffer readBuffer(DataInputPlus in, int maxValueSize)
     {
         return ByteBufferUtil.EMPTY_BYTE_BUFFER;
     }
@@ -158,5 +190,11 @@ public class EmptyType extends AbstractType<Void>
         {
             super(message);
         }
+    }
+
+    @Override
+    public ByteBuffer getMaskedValue()
+    {
+        return ByteBufferUtil.EMPTY_BYTE_BUFFER;
     }
 }

@@ -18,12 +18,11 @@
 package org.apache.cassandra.db;
 
 import java.util.Objects;
-import java.security.MessageDigest;
 
-import org.apache.cassandra.config.CFMetaData;
+import org.apache.cassandra.cache.IMeasurableMemory;
 import org.apache.cassandra.db.rows.Cell;
 import org.apache.cassandra.serializers.MarshalException;
-import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.ObjectSizes;
 
 /**
  * Stores the information relating to the liveness of the primary key columns of a row.
@@ -38,7 +37,7 @@ import org.apache.cassandra.utils.FBUtilities;
  * unaffected (of course, the rest of said row data might be ttl'ed on its own but this is
  * separate).
  */
-public class LivenessInfo
+public class LivenessInfo implements IMeasurableMemory
 {
     public static final long NO_TIMESTAMP = Long.MIN_VALUE;
     public static final int NO_TTL = Cell.NO_TTL;
@@ -49,9 +48,10 @@ public class LivenessInfo
      * (See {@link org.apache.cassandra.cql3.Attributes#MAX_TTL})
      */
     public static final int EXPIRED_LIVENESS_TTL = Integer.MAX_VALUE;
-    public static final int NO_EXPIRATION_TIME = Cell.NO_DELETION_TIME;
+    public static final long NO_EXPIRATION_TIME = Cell.NO_DELETION_TIME;
 
     public static final LivenessInfo EMPTY = new LivenessInfo(NO_TIMESTAMP);
+    private static final long UNSHARED_HEAP_SIZE = ObjectSizes.measure(EMPTY);
 
     protected final long timestamp;
 
@@ -60,31 +60,42 @@ public class LivenessInfo
         this.timestamp = timestamp;
     }
 
-    public static LivenessInfo create(CFMetaData metadata, long timestamp, int nowInSec)
+    public static LivenessInfo create(long timestamp, long nowInSec)
     {
-        int defaultTTL = metadata.params.defaultTimeToLive;
-        if (defaultTTL != NO_TTL)
-            return expiring(timestamp, defaultTTL, nowInSec);
-
         return new LivenessInfo(timestamp);
     }
 
-    public static LivenessInfo expiring(long timestamp, int ttl, int nowInSec)
+    public static LivenessInfo expiring(long timestamp, int ttl, long nowInSec)
     {
         assert ttl != EXPIRED_LIVENESS_TTL;
         return new ExpiringLivenessInfo(timestamp, ttl, ExpirationDateOverflowHandling.computeLocalExpirationTime(nowInSec, ttl));
     }
 
-    public static LivenessInfo create(CFMetaData metadata, long timestamp, int ttl, int nowInSec)
+    // c14227 do not use. Special use to circumvent the overflow policy when scrubbing
+    private static LivenessInfo expiring(long timestamp, int ttl, long nowInSec, boolean applyOverflowPolicy)
+    {
+        assert ttl != EXPIRED_LIVENESS_TTL;
+        return new ExpiringLivenessInfo(timestamp, ttl, applyOverflowPolicy ? ExpirationDateOverflowHandling.computeLocalExpirationTime(nowInSec, ttl) : nowInSec);
+    }
+
+    // c14227 do not use. Special use to circumvent the overflow policy when scrubbing
+    private static LivenessInfo create(long timestamp, int ttl, long nowInSec, boolean applyOverflowPolicy)
     {
         return ttl == NO_TTL
-             ? create(metadata, timestamp, nowInSec)
+             ? create(timestamp, nowInSec)
+             : expiring(timestamp, ttl, nowInSec, applyOverflowPolicy);
+    }
+
+    public static LivenessInfo create(long timestamp, int ttl, long nowInSec)
+    {
+        return ttl == NO_TTL
+             ? create(timestamp, nowInSec)
              : expiring(timestamp, ttl, nowInSec);
     }
 
-    // Note that this ctor ignores the default table ttl and takes the expiration time, not the current time.
+    // Note that this ctor takes the expiration time, not the current time.
     // Use when you know that's what you want.
-    public static LivenessInfo create(long timestamp, int ttl, int localExpirationTime)
+    public static LivenessInfo withExpirationTime(long timestamp, int ttl, long localExpirationTime)
     {
         if (ttl == EXPIRED_LIVENESS_TTL)
             return new ExpiredLivenessInfo(timestamp, ttl, localExpirationTime);
@@ -135,7 +146,7 @@ public class LivenessInfo
      * The expiration time (in seconds) if the info is expiring ({@link #NO_EXPIRATION_TIME} otherwise).
      *
      */
-    public int localExpirationTime()
+    public long localExpirationTime()
     {
         return NO_EXPIRATION_TIME;
     }
@@ -149,7 +160,7 @@ public class LivenessInfo
      * @param nowInSec the current time in seconds.
      * @return whether this liveness info is live or not.
      */
-    public boolean isLive(int nowInSec)
+    public boolean isLive(long nowInSec)
     {
         return !isEmpty();
     }
@@ -159,9 +170,9 @@ public class LivenessInfo
      *
      * @param digest the digest to add this liveness information to.
      */
-    public void digest(MessageDigest digest)
+    public void digest(Digest digest)
     {
-        FBUtilities.updateWithLong(digest, timestamp());
+        digest.updateWithLong(timestamp());
     }
 
     /**
@@ -187,8 +198,6 @@ public class LivenessInfo
      * Whether this liveness information supersedes another one (that is
      * whether is has a greater timestamp than the other or not).
      *
-     * </br>
-     *
      * If timestamps are the same and none of them are expired livenessInfo,
      * livenessInfo with greater TTL supersedes another. It also means, if timestamps are the same,
      * ttl superseders no-ttl. This is the same rule as {@link Conflicts#resolveRegular}
@@ -197,7 +206,10 @@ public class LivenessInfo
      * supersedes, ie. tombstone supersedes.
      *
      * If timestamps are the same and both of them are expired livenessInfo(Ideally it shouldn't happen),
-     * greater localDeletionTime wins.
+     * greater localDeletionTime wins. If the localDeletion times are the same, prefer the
+     * lower TTL to make the merge deterministic (it is likely that the row has been rewritten with
+     * USING TTL/TIMESTAMP with an updated TTL that computes to the same local deletion time -- perhaps
+     * from rerunning a process to migrate user data between clusters or tables).
      *
      * @param other
      *            the {@code LivenessInfo} to compare this info to.
@@ -211,7 +223,11 @@ public class LivenessInfo
         if (isExpired() ^ other.isExpired())
             return isExpired();
         if (isExpiring() == other.isExpiring())
-            return localExpirationTime() > other.localExpirationTime();
+        {
+            return localExpirationTime() > other.localExpirationTime() ||
+                    (localExpirationTime() == other.localExpirationTime() && ttl() < other.ttl());
+        }
+
         return isExpiring();
     }
 
@@ -233,9 +249,15 @@ public class LivenessInfo
         return new LivenessInfo(newTimestamp);
     }
 
-    public LivenessInfo withUpdatedTimestampAndLocalDeletionTime(long newTimestamp, int newLocalDeletionTime)
+    public LivenessInfo withUpdatedTimestampAndLocalDeletionTime(long newTimestamp, long newLocalDeletionTime)
     {
-        return LivenessInfo.create(newTimestamp, ttl(), newLocalDeletionTime);
+        return LivenessInfo.create(newTimestamp, ttl(), newLocalDeletionTime, true);
+    }
+
+    // C14227 To prevent row resurrection and be backwards compatible sometimes we need to force an overflowed ldt
+    public LivenessInfo withUpdatedTimestampAndLocalDeletionTime(long newTimestamp, long newLocalDeletionTime, boolean applyOverflowPolicy)
+    {
+        return LivenessInfo.create(newTimestamp, ttl(), newLocalDeletionTime, applyOverflowPolicy);
     }
 
     @Override
@@ -262,6 +284,11 @@ public class LivenessInfo
         return Objects.hash(timestamp(), ttl(), localExpirationTime());
     }
 
+    public long unsharedHeapSize()
+    {
+        return this == EMPTY ? 0 : UNSHARED_HEAP_SIZE;
+    }
+
     /**
      * Effectively acts as a PK tombstone. This is used for Materialized Views to shadow
      * updated entries while co-existing with row tombstones.
@@ -270,7 +297,7 @@ public class LivenessInfo
      */
     private static class ExpiredLivenessInfo extends ExpiringLivenessInfo
     {
-        private ExpiredLivenessInfo(long timestamp, int ttl, int localExpirationTime)
+        private ExpiredLivenessInfo(long timestamp, int ttl, long localExpirationTime)
         {
             super(timestamp, ttl, localExpirationTime);
             assert ttl == EXPIRED_LIVENESS_TTL;
@@ -284,7 +311,7 @@ public class LivenessInfo
         }
 
         @Override
-        public boolean isLive(int nowInSec)
+        public boolean isLive(long nowInSec)
         {
             // used as tombstone to shadow entire PK
             return false;
@@ -300,9 +327,10 @@ public class LivenessInfo
     private static class ExpiringLivenessInfo extends LivenessInfo
     {
         private final int ttl;
-        private final int localExpirationTime;
+        private final long localExpirationTime;
+        private static final long UNSHARED_HEAP_SIZE = ObjectSizes.measure(new ExpiringLivenessInfo(-1, -1, -1));
 
-        private ExpiringLivenessInfo(long timestamp, int ttl, int localExpirationTime)
+        private ExpiringLivenessInfo(long timestamp, int ttl, long localExpirationTime)
         {
             super(timestamp);
             assert ttl != NO_TTL && localExpirationTime != NO_EXPIRATION_TIME;
@@ -317,7 +345,7 @@ public class LivenessInfo
         }
 
         @Override
-        public int localExpirationTime()
+        public long localExpirationTime()
         {
             return localExpirationTime;
         }
@@ -329,17 +357,21 @@ public class LivenessInfo
         }
 
         @Override
-        public boolean isLive(int nowInSec)
+        public boolean isLive(long nowInSec)
         {
             return nowInSec < localExpirationTime;
         }
 
         @Override
-        public void digest(MessageDigest digest)
+        public void digest(Digest digest)
         {
             super.digest(digest);
-            FBUtilities.updateWithInt(digest, localExpirationTime);
-            FBUtilities.updateWithInt(digest, ttl);
+
+            // As of 5.0, local expiration times are encoded as unsigned integers on disk, so we can do the
+            // same thing here to populate the digest. This supports extended TTLs, but also maintains digest
+            // compatibility with previous versions, avoiding false digest mismatches during upgrades.
+            digest.updateWithInt(Cell.deletionTimeLongToUnsignedInteger(localExpirationTime));
+            digest.updateWithInt(ttl);
         }
 
         @Override
@@ -370,6 +402,11 @@ public class LivenessInfo
         public String toString()
         {
             return String.format("[ts=%d ttl=%d, let=%d]", timestamp, ttl, localExpirationTime);
+        }
+
+        public long unsharedHeapSize()
+        {
+            return UNSHARED_HEAP_SIZE;
         }
     }
 }

@@ -22,7 +22,6 @@ import java.io.IOException;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
-import java.util.UUID;
 
 import org.junit.Before;
 import org.junit.BeforeClass;
@@ -30,11 +29,11 @@ import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.junit.runners.Parameterized;
 import org.junit.runners.Parameterized.Parameters;
-
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.SchemaLoader;
+import org.apache.cassandra.Util;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.config.ParameterizedClass;
 import org.apache.cassandra.db.commitlog.CommitLog;
@@ -43,10 +42,12 @@ import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.io.compress.DeflateCompressor;
 import org.apache.cassandra.io.compress.LZ4Compressor;
 import org.apache.cassandra.io.compress.SnappyCompressor;
+import org.apache.cassandra.io.compress.ZstdCompressor;
 import org.apache.cassandra.schema.KeyspaceParams;
-import org.apache.cassandra.schema.SchemaKeyspace;
-import org.apache.cassandra.service.StorageService;
-import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.schema.Schema;
+import org.apache.cassandra.schema.SchemaConstants;
+import org.apache.cassandra.security.EncryptionContext;
+import org.apache.cassandra.security.EncryptionContextGenerator;
 
 @RunWith(Parameterized.class)
 public class RecoveryManagerFlushedTest
@@ -57,21 +58,23 @@ public class RecoveryManagerFlushedTest
     private static final String CF_STANDARD1 = "Standard1";
     private static final String CF_STANDARD2 = "Standard2";
 
-    @BeforeClass
-    public static void defineSchema() throws ConfigurationException
-    {
-        SchemaLoader.prepareServer();
-        StorageService.instance.getTokenMetadata().updateHostId(UUID.randomUUID(), FBUtilities.getBroadcastAddress());
-
-        SchemaLoader.createKeyspace(KEYSPACE1,
-                                    KeyspaceParams.simple(1),
-                                    SchemaLoader.standardCFMD(KEYSPACE1, CF_STANDARD1),
-                                    SchemaLoader.standardCFMD(KEYSPACE1, CF_STANDARD2));
-    }
-
-    public RecoveryManagerFlushedTest(ParameterizedClass commitLogCompression)
+    public RecoveryManagerFlushedTest(ParameterizedClass commitLogCompression, EncryptionContext encryptionContext)
     {
         DatabaseDescriptor.setCommitLogCompression(commitLogCompression);
+        DatabaseDescriptor.setEncryptionContext(encryptionContext);
+        DatabaseDescriptor.initializeCommitLogDiskAccessMode();
+    }
+
+    @Parameters()
+    public static Collection<Object[]> generateData()
+    {
+        return Arrays.asList(new Object[][]{
+            {null, EncryptionContextGenerator.createDisabledContext()}, // No compression, no encryption
+            {null, EncryptionContextGenerator.createContext(true)}, // Encryption
+            {new ParameterizedClass(LZ4Compressor.class.getName(), Collections.emptyMap()), EncryptionContextGenerator.createDisabledContext()},
+            {new ParameterizedClass(SnappyCompressor.class.getName(), Collections.emptyMap()), EncryptionContextGenerator.createDisabledContext()},
+            {new ParameterizedClass(DeflateCompressor.class.getName(), Collections.emptyMap()), EncryptionContextGenerator.createDisabledContext()},
+            {new ParameterizedClass(ZstdCompressor.class.getName(), Collections.emptyMap()), EncryptionContextGenerator.createDisabledContext()}});
     }
 
     @Before
@@ -80,14 +83,14 @@ public class RecoveryManagerFlushedTest
         CommitLog.instance.resetUnsafe(true);
     }
 
-    @Parameters()
-    public static Collection<Object[]> generateData()
+    @BeforeClass
+    public static void defineSchema() throws ConfigurationException
     {
-        return Arrays.asList(new Object[][] {
-                { null }, // No compression
-                { new ParameterizedClass(LZ4Compressor.class.getName(), Collections.emptyMap()) },
-                { new ParameterizedClass(SnappyCompressor.class.getName(), Collections.emptyMap()) },
-                { new ParameterizedClass(DeflateCompressor.class.getName(), Collections.emptyMap()) } });
+        SchemaLoader.prepareServer();
+        SchemaLoader.createKeyspace(KEYSPACE1,
+                                    KeyspaceParams.simple(1),
+                                    SchemaLoader.standardCFMD(KEYSPACE1, CF_STANDARD1),
+                                    SchemaLoader.standardCFMD(KEYSPACE1, CF_STANDARD2));
     }
 
     @Test
@@ -95,11 +98,9 @@ public class RecoveryManagerFlushedTest
     public void testWithFlush() throws Exception
     {
         // Flush everything that may be in the commit log now to start fresh
-        FBUtilities.waitOnFutures(Keyspace.open(SystemKeyspace.NAME).flush());
-        FBUtilities.waitOnFutures(Keyspace.open(SchemaKeyspace.NAME).flush());
-
-
         CompactionManager.instance.disableAutoCompaction();
+        for (String ks : Schema.instance.getKeyspaces())
+            Util.flush(Keyspace.open(ks));
 
         // add a row to another CF so we test skipping mutations within a not-entirely-flushed CF
         insertRow("Standard2", "key");
@@ -113,7 +114,10 @@ public class RecoveryManagerFlushedTest
         Keyspace keyspace1 = Keyspace.open(KEYSPACE1);
         ColumnFamilyStore cfs = keyspace1.getColumnFamilyStore("Standard1");
         logger.debug("forcing flush");
-        cfs.forceBlockingFlush();
+        // Flush everything that may be in the commit log now to start fresh
+        Util.flush(cfs);
+        // Flush system keyspace again because of sstable activity mutation called by the tidier
+        Util.flushKeyspace(SchemaConstants.SYSTEM_KEYSPACE_NAME);
 
         logger.debug("begin manual replay");
         // replay the commit log (nothing on Standard1 should be replayed since everything was flushed, so only the row on Standard2
@@ -126,7 +130,7 @@ public class RecoveryManagerFlushedTest
     {
         Keyspace keyspace = Keyspace.open(KEYSPACE1);
         ColumnFamilyStore cfs = keyspace.getColumnFamilyStore(cfname);
-        new RowUpdateBuilder(cfs.metadata, 0, key)
+        new RowUpdateBuilder(cfs.metadata(), 0, key)
             .clustering("c")
             .add("val", "val1")
             .build()

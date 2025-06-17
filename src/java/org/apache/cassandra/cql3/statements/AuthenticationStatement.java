@@ -17,31 +17,43 @@
  */
 package org.apache.cassandra.cql3.statements;
 
+import java.util.List;
+
 import org.apache.cassandra.auth.Permission;
+import org.apache.cassandra.auth.RoleOptions;
 import org.apache.cassandra.auth.RoleResource;
 import org.apache.cassandra.cql3.CQLStatement;
+import org.apache.cassandra.cql3.ColumnIdentifier;
+import org.apache.cassandra.cql3.ColumnSpecification;
 import org.apache.cassandra.cql3.QueryOptions;
+import org.apache.cassandra.cql3.ResultSet;
+import org.apache.cassandra.db.marshal.UTF8Type;
 import org.apache.cassandra.exceptions.RequestExecutionException;
 import org.apache.cassandra.exceptions.RequestValidationException;
 import org.apache.cassandra.exceptions.UnauthorizedException;
+import org.apache.cassandra.schema.SchemaConstants;
 import org.apache.cassandra.service.ClientState;
 import org.apache.cassandra.service.QueryState;
+import org.apache.cassandra.transport.Dispatcher;
 import org.apache.cassandra.transport.messages.ResultMessage;
 
-public abstract class AuthenticationStatement extends ParsedStatement implements CQLStatement
+import static org.apache.cassandra.utils.ByteBufferUtil.bytes;
+
+public abstract class AuthenticationStatement extends CQLStatement.Raw implements CQLStatement
 {
+    private static final List<ColumnSpecification> GENERATED_PASSWORD_METADATA =
+    List.of(new ColumnSpecification(SchemaConstants.AUTH_KEYSPACE_NAME,
+                                    "generated_password",
+                                    new ColumnIdentifier("generated_password", true),
+                                    UTF8Type.instance));
+
+    public AuthenticationStatement prepare(ClientState state)
+    {
+        return this;
+    }
+
     @Override
-    public Prepared prepare(ClientState clientState)
-    {
-        return new Prepared(this);
-    }
-
-    public int getBoundTerms()
-    {
-        return 0;
-    }
-
-    public ResultMessage execute(QueryState state, QueryOptions options)
+    public ResultMessage execute(QueryState state, QueryOptions options, Dispatcher.RequestTime requestTime)
     throws RequestExecutionException, RequestValidationException
     {
         return execute(state.getClientState());
@@ -49,9 +61,10 @@ public abstract class AuthenticationStatement extends ParsedStatement implements
 
     public abstract ResultMessage execute(ClientState state) throws RequestExecutionException, RequestValidationException;
 
-    public ResultMessage executeInternal(QueryState state, QueryOptions options)
+    @Override
+    public ResultMessage executeLocally(QueryState state, QueryOptions options)
     {
-        // executeInternal is for local query only, thus altering users doesn't make sense and is not supported
+        // executeLocally is for local query only, thus altering users doesn't make sense and is not supported
         throw new UnsupportedOperationException();
     }
 
@@ -59,7 +72,7 @@ public abstract class AuthenticationStatement extends ParsedStatement implements
     {
         try
         {
-            state.ensureHasPermission(required, resource);
+            state.ensurePermission(required, resource);
         }
         catch (UnauthorizedException e)
         {
@@ -68,6 +81,27 @@ public abstract class AuthenticationStatement extends ParsedStatement implements
                                                           "to perform the requested operation",
                                                           state.getUser().getName()));
         }
+    }
+
+    public String obfuscatePassword(String query)
+    {
+        return query;
+    }
+
+    protected ResultMessage getResultMessage(RoleOptions opts)
+    {
+        if (!opts.isGeneratedPassword())
+            return null;
+
+        if (opts.getPassword().isEmpty())
+            return null;
+
+        ResultSet.ResultMetadata resultMetadata = new ResultSet.ResultMetadata(GENERATED_PASSWORD_METADATA);
+        ResultSet result = new ResultSet(resultMetadata);
+
+        result.addColumnValue(bytes(opts.getPassword().get()));
+
+        return new ResultMessage.Rows(result);
     }
 }
 

@@ -24,6 +24,7 @@ import java.util.Set;
 import org.apache.cassandra.db.compaction.OperationType;
 import org.apache.cassandra.io.sstable.SSTable;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.utils.TimeUUID;
 
 public class WrappedLifecycleTransaction implements ILifecycleTransaction
 {
@@ -109,4 +110,18 @@ public class WrappedLifecycleTransaction implements ILifecycleTransaction
         return delegate.opType();
     }
 
+    public boolean isOffline()
+    {
+        return delegate.isOffline();
+    }
+
+    public TimeUUID opId()
+    {
+        return delegate.opId();
+    }
+
+    public void cancel(SSTableReader removedSSTable)
+    {
+        delegate.cancel(removedSSTable);
+    }
 }

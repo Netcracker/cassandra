@@ -18,7 +18,6 @@
 
 package org.apache.cassandra.hints;
 
-import java.io.File;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.file.Files;
@@ -29,24 +28,32 @@ import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
 
 import com.google.common.collect.Iterables;
+
+import org.apache.cassandra.exceptions.CoordinatorBehindException;
+import org.apache.cassandra.io.util.File;
+
+import org.junit.Assert;
 import org.junit.BeforeClass;
 import org.junit.Test;
 
 import org.apache.cassandra.SchemaLoader;
-import org.apache.cassandra.config.CFMetaData;
-import org.apache.cassandra.config.Schema;
 import org.apache.cassandra.db.Mutation;
 import org.apache.cassandra.db.RowUpdateBuilder;
-import org.apache.cassandra.db.UnknownColumnFamilyException;
+import org.apache.cassandra.db.marshal.ValueAccessors;
 import org.apache.cassandra.db.rows.Cell;
 import org.apache.cassandra.db.rows.Row;
+import org.apache.cassandra.exceptions.UnknownTableException;
 import org.apache.cassandra.io.FSReadError;
 import org.apache.cassandra.io.util.DataInputBuffer;
 import org.apache.cassandra.io.util.FileUtils;
 import org.apache.cassandra.schema.KeyspaceParams;
+import org.apache.cassandra.schema.Schema;
+import org.apache.cassandra.schema.SchemaTestUtil;
+import org.apache.cassandra.schema.TableMetadata;
+import org.hamcrest.Matchers;
 
-import static junit.framework.Assert.assertEquals;
-import static junit.framework.Assert.assertNotNull;
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNotNull;
 import static org.apache.cassandra.Util.dk;
 import static org.apache.cassandra.utils.ByteBufferUtil.bytes;
 
@@ -64,12 +71,12 @@ public class HintsReaderTest
     {
         SchemaLoader.prepareServer();
 
-        descriptor = new HintsDescriptor(UUID.randomUUID(), System.currentTimeMillis());
+        descriptor = new HintsDescriptor(new UUID(0, 100), System.currentTimeMillis());
     }
 
     private static Mutation createMutation(int index, long timestamp, String ks, String tb)
     {
-        CFMetaData table = Schema.instance.getCFMetaData(ks, tb);
+        TableMetadata table = Schema.instance.getTableMetadata(ks, tb);
         return new RowUpdateBuilder(table, timestamp, bytes(index))
                .clustering(bytes(index))
                .add("val", bytes(index))
@@ -94,6 +101,8 @@ public class HintsReaderTest
             }
             FileUtils.clean(buffer);
         }
+
+        Assert.assertThat(descriptor.hintsFileSize(directory), Matchers.greaterThan(0L));
     }
 
     private void readHints(int num, int numTable)
@@ -106,7 +115,7 @@ public class HintsReaderTest
     {
         long baseTimestamp = descriptor.timestamp;
         int index = 0;
-        try (HintsReader reader = HintsReader.open(new File(directory, descriptor.fileName())))
+        try (HintsReader reader = HintsReader.open(descriptor.file(directory)))
         {
             for (HintsReader.Page page : reader)
             {
@@ -136,12 +145,13 @@ public class HintsReaderTest
 
         Row row = mutation.getPartitionUpdates().iterator().next().iterator().next();
         assertEquals(1, Iterables.size(row.cells()));
-        assertEquals(bytes(i), row.clustering().get(0));
-        Cell cell = row.cells().iterator().next();
+        ValueAccessors.assertDataEquals(bytes(i), row.clustering().get(0));
+        Cell<?> cell = row.cells().iterator().next();
         assertNotNull(cell);
-        assertEquals(bytes(i), cell.value());
+        ValueAccessors.assertDataEquals(bytes(i), cell.buffer());
         assertEquals(timestamp * 1000, cell.timestamp());
     }
+
 
     private Iterator<Hint> deserializePageBuffers(HintsReader.Page page)
     {
@@ -160,15 +170,15 @@ public class HintsReaderTest
                     return Hint.serializer.deserialize(new DataInputBuffer(buffers.next(), false),
                                                        descriptor.messagingVersion());
                 }
-                catch (UnknownColumnFamilyException e)
+                catch (UnknownTableException | CoordinatorBehindException e)
                 {
-                    return null;  // ignore
+                    return null; // ignore
                 }
                 catch (IOException e)
                 {
                     throw new RuntimeException("Unexpected error deserializing hint", e);
                 }
-            };
+            }
         };
     }
 
@@ -193,7 +203,7 @@ public class HintsReaderTest
                                     SchemaLoader.standardCFMD(ks, CF_STANDARD1),
                                     SchemaLoader.standardCFMD(ks, CF_STANDARD2));
         int numTable = 2;
-        directory = Files.createTempDirectory(null).toFile();
+        directory = new File(Files.createTempDirectory(null));
         try
         {
             generateHints(3, ks);
@@ -203,7 +213,7 @@ public class HintsReaderTest
         }
         finally
         {
-            directory.delete();
+            directory.deleteRecursive();
         }
     }
 
@@ -216,7 +226,7 @@ public class HintsReaderTest
                                     SchemaLoader.standardCFMD(ks, CF_STANDARD1),
                                     SchemaLoader.standardCFMD(ks, CF_STANDARD2));
         int numTable = 2;
-        directory = Files.createTempDirectory(null).toFile();
+        directory = new File(Files.createTempDirectory(null));
         try
         {
             generateHints(3, ks);
@@ -224,7 +234,7 @@ public class HintsReaderTest
         }
         finally
         {
-            directory.delete();
+            directory.tryDelete();
         }
     }
 
@@ -236,16 +246,17 @@ public class HintsReaderTest
                                     KeyspaceParams.simple(1),
                                     SchemaLoader.standardCFMD(ks, CF_STANDARD1),
                                     SchemaLoader.standardCFMD(ks, CF_STANDARD2));
-        directory = Files.createTempDirectory(null).toFile();
+
+        directory = new File(Files.createTempDirectory(null));
         try
         {
             generateHints(3, ks);
-            Schema.instance.dropTable(ks, CF_STANDARD1);
+            SchemaTestUtil.announceTableDrop(ks, CF_STANDARD1);
             readHints(3, 1);
         }
         finally
         {
-            directory.delete();
+            directory.tryDelete();
         }
     }
 }

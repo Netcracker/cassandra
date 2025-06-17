@@ -17,26 +17,48 @@
  */
 package org.apache.cassandra.cql3.functions;
 
+import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.*;
 
 import com.google.common.base.Objects;
+import com.google.common.collect.Lists;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import org.apache.cassandra.cql3.CqlBuilder;
 import org.apache.cassandra.db.marshal.AbstractType;
+import org.apache.cassandra.db.marshal.UserType;
+import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.exceptions.InvalidRequestException;
-import org.apache.cassandra.schema.Functions;
+import org.apache.cassandra.io.util.DataInputPlus;
+import org.apache.cassandra.io.util.DataOutputPlus;
+import org.apache.cassandra.tcm.serialization.Version;
+import org.apache.cassandra.schema.CQLTypeParser;
+import org.apache.cassandra.schema.Difference;
+import org.apache.cassandra.schema.UserFunctions;
+import org.apache.cassandra.schema.Types;
 import org.apache.cassandra.tracing.Tracing;
+import org.apache.cassandra.transport.ProtocolVersion;
+import org.apache.cassandra.utils.ByteBufferUtil;
+
+import static com.google.common.collect.Iterables.any;
+import static com.google.common.collect.Iterables.transform;
+import static org.apache.cassandra.db.TypeSizes.sizeof;
+import static org.apache.cassandra.utils.Clock.Global.nanoTime;
 
 /**
  * Base class for user-defined-aggregates.
  */
-public class UDAggregate extends AbstractFunction implements AggregateFunction
+public class UDAggregate extends UserFunction implements AggregateFunction
 {
+    public static final Serializer serializer = new Serializer();
+
     protected static final Logger logger = LoggerFactory.getLogger(UDAggregate.class);
 
-    protected final AbstractType<?> stateType;
+    private final UDFDataType stateType;
+    private final List<UDFDataType> argumentTypes;
+    private final UDFDataType resultType;
     protected final ByteBuffer initcond;
     private final ScalarFunction stateFunction;
     private final ScalarFunction finalFunction;
@@ -51,11 +73,13 @@ public class UDAggregate extends AbstractFunction implements AggregateFunction
         super(name, argTypes, returnType);
         this.stateFunction = stateFunc;
         this.finalFunction = finalFunc;
-        this.stateType = stateFunc != null ? stateFunc.returnType() : null;
+        this.argumentTypes = UDFDataType.wrap(argTypes, false);
+        this.resultType = UDFDataType.wrap(returnType, false);
+        this.stateType = stateFunc != null ? UDFDataType.wrap(stateFunc.returnType(), false) : null;
         this.initcond = initcond;
     }
 
-    public static UDAggregate create(Functions functions,
+    public static UDAggregate create(Collection<UDFunction> functions,
                                      FunctionName name,
                                      List<AbstractType<?>> argTypes,
                                      AbstractType<?> returnType,
@@ -63,36 +87,37 @@ public class UDAggregate extends AbstractFunction implements AggregateFunction
                                      FunctionName finalFunc,
                                      AbstractType<?> stateType,
                                      ByteBuffer initcond)
-    throws InvalidRequestException
     {
         List<AbstractType<?>> stateTypes = new ArrayList<>(argTypes.size() + 1);
         stateTypes.add(stateType);
         stateTypes.addAll(argTypes);
-        List<AbstractType<?>> finalTypes = Collections.<AbstractType<?>>singletonList(stateType);
+        List<AbstractType<?>> finalTypes = Collections.singletonList(stateType);
         return new UDAggregate(name,
                                argTypes,
                                returnType,
-                               resolveScalar(functions, name, stateFunc, stateTypes),
-                               finalFunc != null ? resolveScalar(functions, name, finalFunc, finalTypes) : null,
+                               findFunction(name, functions, stateFunc, stateTypes),
+                               null == finalFunc ? null : findFunction(name, functions, finalFunc, finalTypes),
                                initcond);
     }
 
-    public static UDAggregate createBroken(FunctionName name,
-                                           List<AbstractType<?>> argTypes,
-                                           AbstractType<?> returnType,
-                                           ByteBuffer initcond,
-                                           final InvalidRequestException reason)
+    private static UDFunction findFunction(FunctionName udaName, Collection<UDFunction> functions, FunctionName name, List<AbstractType<?>> arguments)
     {
-        return new UDAggregate(name, argTypes, returnType, null, null, initcond)
-        {
-            public Aggregate newAggregate() throws InvalidRequestException
-            {
-                throw new InvalidRequestException(String.format("Aggregate '%s' exists but hasn't been loaded successfully for the following reason: %s. "
-                                                                + "Please see the server log for more details",
-                                                                this,
-                                                                reason.getMessage()));
-            }
-        };
+        return functions.stream()
+                        .filter(f -> f.name().equals(name) && f.typesMatch(arguments))
+                        .findFirst()
+                        .orElseThrow(() -> new ConfigurationException(String.format("Unable to find function %s referenced by UDA %s", name, udaName)));
+    }
+
+    public boolean isPure()
+    {
+        // Right now, we have no way to check if an UDA is pure. Due to that we consider them as non pure to avoid any risk.
+        return false;
+    }
+
+    @Override
+    public Arguments newArguments(ProtocolVersion version)
+    {
+        return FunctionArguments.newInstanceForUdf(version, argumentTypes);
     }
 
     public boolean hasReferenceTo(Function function)
@@ -101,26 +126,42 @@ public class UDAggregate extends AbstractFunction implements AggregateFunction
     }
 
     @Override
+    public boolean referencesUserType(ByteBuffer name)
+    {
+        return any(argTypes(), t -> t.referencesUserType(name))
+            || returnType.referencesUserType(name)
+            || (null != stateType && stateType.toAbstractType().referencesUserType(name))
+            || stateFunction.referencesUserType(name)
+            || (null != finalFunction && finalFunction.referencesUserType(name));
+    }
+
+    public UDAggregate withUpdatedUserType(Collection<UDFunction> udfs, UserType udt)
+    {
+        if (!referencesUserType(udt.name))
+            return this;
+
+        return new UDAggregate(name,
+                               Lists.newArrayList(transform(argTypes, t -> t.withUpdatedUserType(udt))),
+                               returnType.withUpdatedUserType(udt),
+                               findFunction(name, udfs, stateFunction.name(), stateFunction.argTypes()),
+                               null == finalFunction ? null : findFunction(name, udfs, finalFunction.name(), finalFunction.argTypes()),
+                               initcond);
+    }
+
+    @Override
     public void addFunctionsTo(List<Function> functions)
     {
         functions.add(this);
-        if (stateFunction != null)
-        {
-            stateFunction.addFunctionsTo(functions);
 
-            if (finalFunction != null)
-                finalFunction.addFunctionsTo(functions);
-        }
+        stateFunction.addFunctionsTo(functions);
+
+        if (finalFunction != null)
+            finalFunction.addFunctionsTo(functions);
     }
 
     public boolean isAggregate()
     {
         return true;
-    }
-
-    public boolean isNative()
-    {
-        return false;
     }
 
     public ScalarFunction stateFunction()
@@ -140,7 +181,7 @@ public class UDAggregate extends AbstractFunction implements AggregateFunction
 
     public AbstractType<?> stateType()
     {
-        return stateType;
+        return stateType == null ? null : stateType.toAbstractType();
     }
 
     public Aggregate newAggregate() throws InvalidRequestException
@@ -150,67 +191,63 @@ public class UDAggregate extends AbstractFunction implements AggregateFunction
             private long stateFunctionCount;
             private long stateFunctionDuration;
 
-            private ByteBuffer state;
-            {
-                reset();
-            }
+            private Object state;
+            private boolean needsInit = true;
 
-            public void addInput(int protocolVersion, List<ByteBuffer> values) throws InvalidRequestException
+            @Override
+            public void addInput(Arguments arguments) throws InvalidRequestException
             {
-                long startTime = System.nanoTime();
+                maybeInit(arguments.getProtocolVersion());
+
+                long startTime = nanoTime();
                 stateFunctionCount++;
-                List<ByteBuffer> fArgs = new ArrayList<>(values.size() + 1);
-                fArgs.add(state);
-                fArgs.addAll(values);
                 if (stateFunction instanceof UDFunction)
                 {
                     UDFunction udf = (UDFunction)stateFunction;
-                    if (udf.isCallableWrtNullable(fArgs))
-                        state = udf.execute(protocolVersion, fArgs);
+                    if (udf.isCallableWrtNullable(arguments))
+                        state = udf.executeForAggregate(state, arguments);
                 }
                 else
                 {
-                    state = stateFunction.execute(protocolVersion, fArgs);
+                    throw new UnsupportedOperationException("UDAs only support UDFs");
                 }
-                stateFunctionDuration += (System.nanoTime() - startTime) / 1000;
+                stateFunctionDuration += (nanoTime() - startTime) / 1000;
             }
 
-            public ByteBuffer compute(int protocolVersion) throws InvalidRequestException
+            private void maybeInit(ProtocolVersion protocolVersion)
             {
+                if (needsInit)
+                {
+                    state = initcond != null ? stateType.compose(protocolVersion, initcond.duplicate()) : null;
+                    stateFunctionDuration = 0;
+                    stateFunctionCount = 0;
+                    needsInit = false;
+                }
+            }
+
+            public ByteBuffer compute(ProtocolVersion protocolVersion) throws InvalidRequestException
+            {
+                maybeInit(protocolVersion);
+
                 // final function is traced in UDFunction
                 Tracing.trace("Executed UDA {}: {} call(s) to state function {} in {}\u03bcs", name(), stateFunctionCount, stateFunction.name(), stateFunctionDuration);
                 if (finalFunction == null)
-                    return state;
+                    return stateType.decompose(protocolVersion, state);
 
-                List<ByteBuffer> fArgs = Collections.singletonList(state);
-                ByteBuffer result = finalFunction.execute(protocolVersion, fArgs);
-                return result;
+                if (finalFunction instanceof UDFunction)
+                {
+                    UDFunction udf = (UDFunction)finalFunction;
+                    Object result = udf.executeForAggregate(state, FunctionArguments.emptyInstance(protocolVersion));
+                    return resultType.decompose(protocolVersion, result);
+                }
+                throw new UnsupportedOperationException("UDAs only support UDFs");
             }
 
             public void reset()
             {
-                state = initcond != null ? initcond.duplicate() : null;
-                stateFunctionDuration = 0;
-                stateFunctionCount = 0;
+                needsInit = true;
             }
         };
-    }
-
-    private static ScalarFunction resolveScalar(Functions functions, FunctionName aName, FunctionName fName, List<AbstractType<?>> argTypes) throws InvalidRequestException
-    {
-        Optional<Function> fun = functions.find(fName, argTypes);
-        if (!fun.isPresent())
-            throw new InvalidRequestException(String.format("Referenced state function '%s %s' for aggregate '%s' does not exist",
-                                                            fName,
-                                                            Arrays.toString(UDHelper.driverTypes(argTypes)),
-                                                            aName));
-
-        if (!(fun.get() instanceof ScalarFunction))
-            throw new InvalidRequestException(String.format("Referenced state function '%s %s' for aggregate '%s' is not a scalar function",
-                                                            fName,
-                                                            Arrays.toString(UDHelper.driverTypes(argTypes)),
-                                                            aName));
-        return (ScalarFunction) fun.get();
     }
 
     @Override
@@ -220,18 +257,197 @@ public class UDAggregate extends AbstractFunction implements AggregateFunction
             return false;
 
         UDAggregate that = (UDAggregate) o;
-        return Objects.equal(name, that.name)
-            && Functions.typesMatch(argTypes, that.argTypes)
-            && Functions.typesMatch(returnType, that.returnType)
+        return equalsWithoutTypesAndFunctions(that)
+            && argTypes.equals(that.argTypes)
+            && returnType.equals(that.returnType)
             && Objects.equal(stateFunction, that.stateFunction)
             && Objects.equal(finalFunction, that.finalFunction)
-            && Objects.equal(stateType, that.stateType)
-            && Objects.equal(initcond, that.initcond);
+            && ((stateType == that.stateType) || ((stateType != null) && stateType.equals(that.stateType)));
+    }
+
+    private boolean equalsWithoutTypesAndFunctions(UDAggregate other)
+    {
+        return name.equals(other.name)
+            && argTypes.size() == other.argTypes.size()
+            && Objects.equal(initcond, other.initcond);
+    }
+
+    @Override
+    public Optional<Difference> compare(Function function)
+    {
+        if (!(function instanceof UDAggregate))
+            throw new IllegalArgumentException();
+
+        UDAggregate other = (UDAggregate) function;
+
+        if (!equalsWithoutTypesAndFunctions(other)
+        || ((null == finalFunction) != (null == other.finalFunction))
+        || ((null == stateType) != (null == other.stateType)))
+            return Optional.of(Difference.SHALLOW);
+
+        boolean differsDeeply = false;
+
+        if (null != finalFunction && !finalFunction.equals(other.finalFunction))
+        {
+            if (finalFunction.name().equals(other.finalFunction.name()))
+                differsDeeply = true;
+            else
+                return Optional.of(Difference.SHALLOW);
+        }
+
+        if (null != stateType && !stateType.equals(other.stateType))
+        {
+            if (stateType.toAbstractType().asCQL3Type().toString()
+                         .equals(other.stateType.toAbstractType().asCQL3Type().toString()))
+                differsDeeply = true;
+            else
+                return Optional.of(Difference.SHALLOW);
+        }
+
+        if (!returnType.equals(other.returnType))
+        {
+            if (returnType.asCQL3Type().toString().equals(other.returnType.asCQL3Type().toString()))
+                differsDeeply = true;
+            else
+                return Optional.of(Difference.SHALLOW);
+        }
+
+        for (int i = 0; i < argTypes().size(); i++)
+        {
+            AbstractType<?> thisType = argTypes.get(i);
+            AbstractType<?> thatType = other.argTypes.get(i);
+
+            if (!thisType.equals(thatType))
+            {
+                if (thisType.asCQL3Type().toString().equals(thatType.asCQL3Type().toString()))
+                    differsDeeply = true;
+                else
+                    return Optional.of(Difference.SHALLOW);
+            }
+        }
+
+        if (!stateFunction.equals(other.stateFunction))
+        {
+            if (stateFunction.name().equals(other.stateFunction.name()))
+                differsDeeply = true;
+            else
+                return Optional.of(Difference.SHALLOW);
+        }
+
+        return differsDeeply ? Optional.of(Difference.DEEP) : Optional.empty();
     }
 
     @Override
     public int hashCode()
     {
-        return Objects.hashCode(name, Functions.typeHashCode(argTypes), Functions.typeHashCode(returnType), stateFunction, finalFunction, stateType, initcond);
+        return Objects.hashCode(name, UserFunctions.typeHashCode(argTypes), UserFunctions.typeHashCode(returnType), stateFunction, finalFunction, stateType, initcond);
+    }
+
+    @Override
+    public SchemaElementType elementType()
+    {
+        return SchemaElementType.AGGREGATE;
+    }
+
+    @Override
+    public String toCqlString(boolean withWarnings, boolean withInternals, boolean ifNotExists)
+    {
+        CqlBuilder builder = new CqlBuilder();
+        builder.append("CREATE AGGREGATE ");
+
+        if (ifNotExists)
+        {
+            builder.append("IF NOT EXISTS ");
+        }
+
+        builder.append(name())
+               .append('(')
+               .appendWithSeparators(argTypes, (b, t) -> b.append(toCqlString(t)), ", ")
+               .append(')')
+               .newLine()
+               .increaseIndent()
+               .append("SFUNC ")
+               .appendQuotingIfNeeded(stateFunction().name().name)
+               .newLine()
+               .append("STYPE ")
+               .append(toCqlString(stateType()));
+
+        if (finalFunction() != null)
+            builder.newLine()
+                   .append("FINALFUNC ")
+                   .appendQuotingIfNeeded(finalFunction().name().name);
+
+        if (initialCondition() != null)
+            builder.newLine()
+                   .append("INITCOND ")
+                   .append(stateType().asCQL3Type().toCQLLiteral(initialCondition()));
+
+        return builder.append(";")
+                      .toString();
+    }
+
+    // Not quite a MetadataSerializer, or even a UDTAwareMetadataSerializer, as it needs the collection of UDFs during deserialization.
+    public static class Serializer
+    {
+        public void serialize(UDAggregate t, DataOutputPlus out, Version version) throws IOException
+        {
+            out.writeUTF(t.name().keyspace);
+            out.writeUTF(t.name().name);
+            out.writeInt(t.argumentsList().size());
+            for (String arg : t.argumentsList())
+                out.writeUTF(arg);
+            out.writeUTF(t.returnType().asCQL3Type().toString());
+            out.writeUTF(t.stateFunction.name().name);
+            out.writeUTF(t.stateType.toAbstractType().asCQL3Type().toString());
+            out.writeBoolean(t.finalFunction() != null);
+            if (t.finalFunction() != null)
+                out.writeUTF(t.finalFunction().name().name);
+            out.writeBoolean(t.initialCondition() != null);
+            if (t.initialCondition() != null)
+                ByteBufferUtil.writeWithShortLength(t.initialCondition(), out);
+        }
+
+        public UDAggregate deserialize(DataInputPlus in, Types types, Collection<UDFunction> functions, Version version) throws IOException
+        {
+            String ks = in.readUTF();
+            String name = in.readUTF();
+            FunctionName fn = new FunctionName(ks, name);
+            int argCount = in.readInt();
+            List<AbstractType<?>> argList = new ArrayList<>(argCount);
+            for (int i = 0; i < argCount; i++)
+                argList.add(CQLTypeParser.parse(ks, in.readUTF(), types).udfType());
+            AbstractType<?> returnType = CQLTypeParser.parse(ks, in.readUTF(), types).udfType();
+            FunctionName stateFunction = new FunctionName(ks, in.readUTF());
+            AbstractType<?> stateType = CQLTypeParser.parse(ks, in.readUTF(), types).udfType();
+            boolean hasFinalFunction = in.readBoolean();
+            FunctionName finalFunction = null;
+            if (hasFinalFunction)
+                finalFunction = new FunctionName(ks, in.readUTF());
+            boolean hasInitialCondition = in.readBoolean();
+            ByteBuffer initCond = null;
+            if (hasInitialCondition)
+                initCond = ByteBufferUtil.readWithShortLength(in);
+            return UDAggregate.create(functions, fn, argList, returnType, stateFunction, finalFunction, stateType, initCond);
+        }
+
+        public long serializedSize(UDAggregate t, Version version)
+        {
+            long size = sizeof(t.name().keyspace) + sizeof(t.name().name);
+
+            size += sizeof(t.argumentsList().size());
+            for (String arg : t.argumentsList())
+                size += sizeof(arg);
+
+            size += sizeof(t.returnType().asCQL3Type().toString());
+            size += sizeof(t.stateFunction.name().name);
+            size += sizeof(t.stateType.toAbstractType().asCQL3Type().toString());
+            size += sizeof(t.finalFunction() != null);
+            if (t.finalFunction() != null)
+                size += sizeof(t.finalFunction().name().name);
+            size += sizeof(t.initialCondition() != null);
+            if (t.initialCondition() != null)
+                size += ByteBufferUtil.serializedSizeWithShortLength(t.initialCondition());
+            return size;
+        }
     }
 }

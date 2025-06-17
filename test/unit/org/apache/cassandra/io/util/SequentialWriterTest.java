@@ -19,7 +19,6 @@
 package org.apache.cassandra.io.util;
 
 import java.io.DataOutputStream;
-import java.io.File;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -28,10 +27,12 @@ import java.util.concurrent.ThreadLocalRandom;
 
 import com.google.common.io.Files;
 import org.junit.After;
+import org.junit.BeforeClass;
 import org.junit.Test;
 
-import junit.framework.Assert;
+import org.junit.Assert;
 
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.io.compress.BufferType;
 import org.apache.cassandra.utils.concurrent.AbstractTransactionalTest;
 
@@ -43,11 +44,17 @@ public class SequentialWriterTest extends AbstractTransactionalTest
 
     private final List<TestableSW> writers = new ArrayList<>();
 
+    @BeforeClass
+    public static void setupDD()
+    {
+        DatabaseDescriptor.daemonInitialization();
+    }
+
     @After
     public void cleanup()
     {
         for (TestableSW sw : writers)
-            sw.file.delete();
+            sw.file.tryDelete();
         writers.clear();
     }
 
@@ -72,7 +79,10 @@ public class SequentialWriterTest extends AbstractTransactionalTest
 
         protected TestableSW(File file) throws IOException
         {
-            this(file, new SequentialWriter(file, 8 << 10, BufferType.OFF_HEAP));
+            this(file, new SequentialWriter(file, SequentialWriterOption.newBuilder()
+                                                                        .bufferSize(8 << 10)
+                                                                        .bufferType(BufferType.OFF_HEAP)
+                                                                        .build()));
         }
 
         protected TestableSW(File file, SequentialWriter sw) throws IOException
@@ -89,14 +99,14 @@ public class SequentialWriterTest extends AbstractTransactionalTest
         protected void assertInProgress() throws Exception
         {
             Assert.assertTrue(file.exists());
-            byte[] bytes = readFileToByteArray(file);
+            byte[] bytes = readFileToByteArray(file.toJavaIOFile());
             Assert.assertTrue(Arrays.equals(partialContents, bytes));
         }
 
         protected void assertPrepared() throws Exception
         {
             Assert.assertTrue(file.exists());
-            byte[] bytes = readFileToByteArray(file);
+            byte[] bytes = readFileToByteArray(file.toJavaIOFile());
             Assert.assertTrue(Arrays.equals(fullContents, bytes));
         }
 
@@ -114,7 +124,7 @@ public class SequentialWriterTest extends AbstractTransactionalTest
         protected static File tempFile(String prefix)
         {
             File file = FileUtils.createTempFile(prefix, "test");
-            file.delete();
+            file.tryDelete();
             return file;
         }
     }
@@ -122,11 +132,12 @@ public class SequentialWriterTest extends AbstractTransactionalTest
     @Test
     public void resetAndTruncateTest()
     {
-        File tempFile = new File(Files.createTempDir(), "reset.txt");
+        File tempFile = new File(Files.createTempDir().toPath(), "reset.txt");
         final int bufferSize = 48;
         final int writeSize = 64;
         byte[] toWrite = new byte[writeSize];
-        try (SequentialWriter writer = new SequentialWriter(tempFile, bufferSize, BufferType.OFF_HEAP))
+        SequentialWriterOption option = SequentialWriterOption.newBuilder().bufferSize(bufferSize).build();
+        try (SequentialWriter writer = new SequentialWriter(tempFile, option))
         {
             // write bytes greather than buffer
             writer.write(toWrite);
@@ -165,10 +176,11 @@ public class SequentialWriterTest extends AbstractTransactionalTest
     @Test
     public void outputStream()
     {
-        File tempFile = new File(Files.createTempDir(), "test.txt");
+        File tempFile = new File(Files.createTempDir().toPath(), "test.txt");
         Assert.assertFalse("temp file shouldn't exist yet", tempFile.exists());
 
-        try (DataOutputStream os = new DataOutputStream(SequentialWriter.open(tempFile).finishOnClose()))
+        SequentialWriterOption option = SequentialWriterOption.newBuilder().finishOnClose(true).build();
+        try (DataOutputStream os = new DataOutputStream(new SequentialWriter(tempFile, option)))
         {
             os.writeUTF("123");
         }

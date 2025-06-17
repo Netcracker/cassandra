@@ -22,8 +22,10 @@ import java.io.OutputStream;
 import java.nio.ByteBuffer;
 import java.nio.channels.WritableByteChannel;
 
-import org.apache.cassandra.config.Config;
+import io.netty.util.concurrent.FastThreadLocal;
 import org.apache.cassandra.utils.ByteBufferUtil;
+
+import static org.apache.cassandra.config.CassandraRelevantProperties.DATA_OUTPUT_STREAM_PLUS_TEMP_BUFFER_SIZE;
 
 /**
  * Abstract base class for DataOutputStreams that accept writes from ByteBuffer or Memory and also provide
@@ -46,8 +48,7 @@ public abstract class DataOutputStreamPlus extends OutputStream implements DataO
         this.channel = channel;
     }
 
-    private static int MAX_BUFFER_SIZE =
-            Integer.getInteger(Config.PROPERTY_PREFIX + "data_output_stream_plus_temp_buffer_size", 8192);
+    private static final int MAX_BUFFER_SIZE = DATA_OUTPUT_STREAM_PLUS_TEMP_BUFFER_SIZE.getInt();
 
     /*
      * Factored out into separate method to create more flexibility around inlining
@@ -64,7 +65,7 @@ public abstract class DataOutputStreamPlus extends OutputStream implements DataO
         return bytes;
     }
 
-    private static final ThreadLocal<byte[]> tempBuffer = new ThreadLocal<byte[]>()
+    private static final FastThreadLocal<byte[]> tempBuffer = new FastThreadLocal<byte[]>()
     {
         @Override
         public byte[] initialValue()
@@ -86,7 +87,7 @@ public abstract class DataOutputStreamPlus extends OutputStream implements DataO
             }
 
             @Override
-            public void close() throws IOException
+            public void close()
             {
             }
 
@@ -118,7 +119,7 @@ public abstract class DataOutputStreamPlus extends OutputStream implements DataO
                 {
                     int toWriteThisTime = Math.min(buf.length, toWrite - totalWritten);
 
-                    ByteBufferUtil.arrayCopy(src, src.position() + totalWritten, buf, 0, toWriteThisTime);
+                    ByteBufferUtil.copyBytes(src, src.position() + totalWritten, buf, 0, toWriteThisTime);
 
                     DataOutputStreamPlus.this.write(buf, 0, toWriteThisTime);
 

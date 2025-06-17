@@ -18,18 +18,11 @@
 package org.apache.cassandra.locator;
 
 import java.io.IOException;
-import java.net.InetAddress;
-import java.util.Map;
+import java.util.Set;
 
 import com.google.common.annotations.VisibleForTesting;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-import org.apache.cassandra.db.SystemKeyspace;
+
 import org.apache.cassandra.exceptions.ConfigurationException;
-import org.apache.cassandra.gms.ApplicationState;
-import org.apache.cassandra.gms.EndpointState;
-import org.apache.cassandra.gms.Gossiper;
-import org.apache.cassandra.utils.FBUtilities;
 
 /**
  * A snitch that assumes an EC2 region is a DC and an EC2 availability_zone
@@ -50,19 +43,17 @@ import org.apache.cassandra.utils.FBUtilities;
  * to a user is {@link Ec2MetadataServiceConnector.V2Connector#AWS_EC2_METADATA_TOKEN_TTL_SECONDS_HEADER_PROPERTY}
  * which is by default set to {@link Ec2MetadataServiceConnector.V2Connector#MAX_TOKEN_TIME_IN_SECONDS}. TTL has
  * to be an integer from the range [30, 21600].
+ * @deprecated See CASSANDRA-19488
  */
-public class Ec2Snitch extends AbstractNetworkTopologySnitch
+@Deprecated(since = "CEP-21")
+public class Ec2Snitch extends AbstractCloudMetadataServiceSnitch
 {
-    protected static final Logger logger = LoggerFactory.getLogger(Ec2Snitch.class);
+    private static final String SNITCH_PROP_NAMING_SCHEME = "ec2_naming_scheme";
+    static final String EC2_NAMING_LEGACY = "legacy";
+    private static final String EC2_NAMING_STANDARD = "standard";
+
     @VisibleForTesting
     public static final String ZONE_NAME_QUERY = "/latest/meta-data/placement/availability-zone";
-    private static final String DEFAULT_DC = "UNKNOWN-DC";
-    private static final String DEFAULT_RACK = "UNKNOWN-RACK";
-    private Map<InetAddress, Map<String, String>> savedEndpoints;
-    protected String ec2zone;
-    protected String ec2region;
-
-    protected final Ec2MetadataServiceConnector connector;
 
     public Ec2Snitch() throws IOException, ConfigurationException
     {
@@ -71,57 +62,17 @@ public class Ec2Snitch extends AbstractNetworkTopologySnitch
 
     public Ec2Snitch(SnitchProperties props) throws IOException, ConfigurationException
     {
-        this(props, Ec2MetadataServiceConnector.create(props));
+        this(Ec2MetadataServiceConnector.create(props));
     }
 
-    @VisibleForTesting
-    public Ec2Snitch(SnitchProperties props, Ec2MetadataServiceConnector connector) throws IOException
+    Ec2Snitch(AbstractCloudMetadataServiceConnector connector) throws IOException
     {
-        this.connector = connector;
-        String az = connector.apiCall(ZONE_NAME_QUERY);
-        // Split "us-east-1a" or "asia-1a" into "us-east"/"1a" and "asia"/"1a".
-        String[] splits = az.split("-");
-        ec2zone = splits[splits.length - 1];
-
-        // hack for CASSANDRA-4026
-        ec2region = az.substring(0, az.length() - 1);
-        if (ec2region.endsWith("1"))
-            ec2region = az.substring(0, az.length() - 3);
-
-        String datacenterSuffix = (new SnitchProperties()).get("dc_suffix", "");
-        ec2region = ec2region.concat(datacenterSuffix);
-        logger.info("EC2Snitch using region: {}, zone: {}.", ec2region, ec2zone);
+        super(new Ec2LocationProvider(connector));
     }
 
-    public String getRack(InetAddress endpoint)
+    @Override
+    public boolean validate(Set<String> datacenters, Set<String> racks)
     {
-        if (endpoint.equals(FBUtilities.getBroadcastAddress()))
-            return ec2zone;
-        EndpointState state = Gossiper.instance.getEndpointStateForEndpoint(endpoint);
-        if (state == null || state.getApplicationState(ApplicationState.RACK) == null)
-        {
-            if (savedEndpoints == null)
-                savedEndpoints = SystemKeyspace.loadDcRackInfo();
-            if (savedEndpoints.containsKey(endpoint))
-                return savedEndpoints.get(endpoint).get("rack");
-            return DEFAULT_RACK;
-        }
-        return state.getApplicationState(ApplicationState.RACK).value;
-    }
-
-    public String getDatacenter(InetAddress endpoint)
-    {
-        if (endpoint.equals(FBUtilities.getBroadcastAddress()))
-            return ec2region;
-        EndpointState state = Gossiper.instance.getEndpointStateForEndpoint(endpoint);
-        if (state == null || state.getApplicationState(ApplicationState.DC) == null)
-        {
-            if (savedEndpoints == null)
-                savedEndpoints = SystemKeyspace.loadDcRackInfo();
-            if (savedEndpoints.containsKey(endpoint))
-                return savedEndpoints.get(endpoint).get("data_center");
-            return DEFAULT_DC;
-        }
-        return state.getApplicationState(ApplicationState.DC).value;
+        return ((Ec2LocationProvider)locationProvider).validate(datacenters, racks);
     }
 }

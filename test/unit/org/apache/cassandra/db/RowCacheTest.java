@@ -18,7 +18,6 @@
 
 package org.apache.cassandra.db;
 
-import java.net.InetAddress;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -29,30 +28,41 @@ import com.google.common.collect.Lists;
 import org.junit.AfterClass;
 import org.junit.BeforeClass;
 import org.junit.Test;
+
 import org.apache.cassandra.SchemaLoader;
 import org.apache.cassandra.Util;
 import org.apache.cassandra.cache.RowCacheKey;
-import org.apache.cassandra.config.CFMetaData;
-import org.apache.cassandra.config.Schema;
-import org.apache.cassandra.db.marshal.AsciiType;
-import org.apache.cassandra.db.rows.*;
 import org.apache.cassandra.db.compaction.CompactionManager;
 import org.apache.cassandra.db.filter.ColumnFilter;
+import org.apache.cassandra.db.marshal.AsciiType;
 import org.apache.cassandra.db.marshal.IntegerType;
+import org.apache.cassandra.db.marshal.ValueAccessors;
 import org.apache.cassandra.db.partitions.CachedPartition;
+import org.apache.cassandra.db.rows.Cell;
+import org.apache.cassandra.db.rows.ColumnData;
+import org.apache.cassandra.db.rows.Row;
+import org.apache.cassandra.db.rows.Unfiltered;
+import org.apache.cassandra.db.rows.UnfilteredRowIterator;
 import org.apache.cassandra.dht.Bounds;
+import org.apache.cassandra.dht.ByteOrderedPartitioner.BytesToken;
 import org.apache.cassandra.dht.Token;
 import org.apache.cassandra.exceptions.ConfigurationException;
-import org.apache.cassandra.dht.ByteOrderedPartitioner.BytesToken;
-import org.apache.cassandra.locator.TokenMetadata;
+import org.apache.cassandra.locator.InetAddressAndPort;
 import org.apache.cassandra.metrics.ClearableHistogram;
 import org.apache.cassandra.schema.CachingParams;
+import org.apache.cassandra.schema.KeyspaceMetadata;
 import org.apache.cassandra.schema.KeyspaceParams;
+import org.apache.cassandra.schema.Schema;
+import org.apache.cassandra.schema.SchemaTestUtil;
 import org.apache.cassandra.service.CacheService;
 import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.service.reads.range.TokenUpdater;
 import org.apache.cassandra.utils.ByteBufferUtil;
 
-import static org.junit.Assert.*;
+import static org.apache.cassandra.config.CassandraRelevantProperties.TEST_ORG_CAFFINITAS_OHC_SEGMENTCOUNT;
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertTrue;
 
 public class RowCacheTest
 {
@@ -64,7 +74,7 @@ public class RowCacheTest
     @BeforeClass
     public static void defineSchema() throws ConfigurationException
     {
-        System.setProperty("org.caffinitas.ohc.segmentCount", "16");
+        TEST_ORG_CAFFINITAS_OHC_SEGMENTCOUNT.setInt(16);
         SchemaLoader.prepareServer();
         SchemaLoader.createKeyspace(KEYSPACE_CACHED,
                                     KeyspaceParams.simple(1),
@@ -73,6 +83,7 @@ public class RowCacheTest
                                     SchemaLoader.standardCFMD(KEYSPACE_CACHED, CF_CACHED).caching(CachingParams.CACHE_EVERYTHING),
                                     SchemaLoader.standardCFMD(KEYSPACE_CACHED, CF_CACHEDINT, 1, IntegerType.instance)
                                                 .caching(new CachingParams(true, 100)));
+        StorageService.instance.initServer();
     }
 
     @AfterClass
@@ -94,14 +105,14 @@ public class RowCacheTest
         // empty the row cache
         CacheService.instance.invalidateRowCache();
 
-        // set global row cache size to 1 MB
+        // set global row cache size to 1 MiB
         CacheService.instance.setRowCacheCapacityInMB(1);
 
         ByteBuffer key = ByteBufferUtil.bytes("rowcachekey");
         DecoratedKey dk = cachedStore.decorateKey(key);
-        RowCacheKey rck = new RowCacheKey(cachedStore.metadata.ksAndCFName, dk);
+        RowCacheKey rck = new RowCacheKey(cachedStore.metadata(), dk);
 
-        RowUpdateBuilder rub = new RowUpdateBuilder(cachedStore.metadata, System.currentTimeMillis(), key);
+        RowUpdateBuilder rub = new RowUpdateBuilder(cachedStore.metadata(), System.currentTimeMillis(), key);
         rub.clustering(String.valueOf(0));
         rub.add("val", ByteBufferUtil.bytes("val" + 0));
         rub.build().applyUnsafe();
@@ -122,7 +133,7 @@ public class RowCacheTest
             Row r = (Row) unfiltered;
             for (ColumnData c : r)
             {
-                assertEquals(((Cell)c).value(), ByteBufferUtil.bytes("val" + 0));
+                assertEquals(((Cell<?>)c).buffer(), ByteBufferUtil.bytes("val" + 0));
             }
         }
         cachedStore.truncateBlocking();
@@ -139,7 +150,7 @@ public class RowCacheTest
         // empty the row cache
         CacheService.instance.invalidateRowCache();
 
-        // set global row cache size to 1 MB
+        // set global row cache size to 1 MiB
         CacheService.instance.setRowCacheCapacityInMB(1);
 
         // inserting 100 rows into both column families
@@ -162,12 +173,12 @@ public class RowCacheTest
                 Row r = (Row)ai.next();
                 assertFalse(ai.hasNext());
 
-                Iterator<Cell> ci = r.cells().iterator();
+                Iterator<Cell<?>> ci = r.cells().iterator();
                 assert(ci.hasNext());
-                Cell cell = ci.next();
+                Cell<?> cell = ci.next();
 
                 assert cell.column().name.bytes.equals(ByteBufferUtil.bytes("val"));
-                assert cell.value().equals(ByteBufferUtil.bytes("val" + i));
+                assert cell.buffer().equals(ByteBufferUtil.bytes("val" + i));
             }
         }
 
@@ -189,12 +200,12 @@ public class RowCacheTest
                 Row r = (Row)ai.next();
                 assertFalse(ai.hasNext());
 
-                Iterator<Cell> ci = r.cells().iterator();
+                Iterator<Cell<?>> ci = r.cells().iterator();
                 assert(ci.hasNext());
-                Cell cell = ci.next();
+                Cell<?> cell = ci.next();
 
                 assert cell.column().name.bytes.equals(ByteBufferUtil.bytes("val"));
-                assert cell.value().equals(ByteBufferUtil.bytes("val" + i));
+                assert cell.buffer().equals(ByteBufferUtil.bytes("val" + i));
             }
         }
 
@@ -221,7 +232,7 @@ public class RowCacheTest
         // empty the row cache
         CacheService.instance.invalidateRowCache();
 
-        // set global row cache size to 1 MB
+        // set global row cache size to 1 MiB
         CacheService.instance.setRowCacheCapacityInMB(1);
 
         // inserting 100 rows into column family
@@ -256,12 +267,12 @@ public class RowCacheTest
                 Row r = (Row)ai.next();
                 assertFalse(ai.hasNext());
 
-                Iterator<Cell> ci = r.cells().iterator();
+                Iterator<Cell<?>> ci = r.cells().iterator();
                 assert(ci.hasNext());
-                Cell cell = ci.next();
+                Cell<?> cell = ci.next();
 
                 assert cell.column().name.bytes.equals(ByteBufferUtil.bytes("val"));
-                assert cell.value().equals(ByteBufferUtil.bytes("val" + i));
+                assert cell.buffer().equals(ByteBufferUtil.bytes("val" + i));
             }
         }
 
@@ -289,7 +300,6 @@ public class RowCacheTest
     @Test
     public void testRowCacheCleanup() throws Exception
     {
-        StorageService.instance.initServer(0);
         CacheService.instance.setRowCacheCapacityInMB(1);
         rowCacheLoad(100, Integer.MAX_VALUE, 1000);
 
@@ -297,12 +307,12 @@ public class RowCacheTest
         assertEquals(CacheService.instance.rowCache.size(), 100);
         store.cleanupCache();
         assertEquals(CacheService.instance.rowCache.size(), 100);
-        TokenMetadata tmd = StorageService.instance.getTokenMetadata();
         byte[] tk1, tk2;
         tk1 = "key1000".getBytes();
         tk2 = "key1050".getBytes();
-        tmd.updateNormalToken(new BytesToken(tk1), InetAddress.getByName("127.0.0.1"));
-        tmd.updateNormalToken(new BytesToken(tk2), InetAddress.getByName("127.0.0.2"));
+        new TokenUpdater().withTokens(InetAddressAndPort.getByName("127.0.0.1"), new BytesToken(tk1))
+                          .withTokens(InetAddressAndPort.getByName("127.0.0.2"), new BytesToken(tk2))
+                          .update();
         store.cleanupCache();
         assertEquals(50, CacheService.instance.rowCache.size());
         CacheService.instance.setRowCacheCapacityInMB(0);
@@ -311,7 +321,6 @@ public class RowCacheTest
     @Test
     public void testInvalidateRowCache() throws Exception
     {
-        StorageService.instance.initServer(0);
         CacheService.instance.setRowCacheCapacityInMB(1);
         rowCacheLoad(100, Integer.MAX_VALUE, 1000);
 
@@ -367,7 +376,9 @@ public class RowCacheTest
         CacheService.instance.setRowCacheCapacityInMB(1);
         rowCacheLoad(100, 50, 0);
         CacheService.instance.rowCache.submitWrite(Integer.MAX_VALUE).get();
-        Keyspace instance = Schema.instance.removeKeyspaceInstance(KEYSPACE_CACHED);
+
+        KeyspaceMetadata ksm = Schema.instance.getKeyspaceMetadata(KEYSPACE_CACHED);
+        SchemaTestUtil.dropKeyspaceIfExist(KEYSPACE_CACHED, true);
         try
         {
             CacheService.instance.rowCache.size();
@@ -378,7 +389,7 @@ public class RowCacheTest
         }
         finally
         {
-            Schema.instance.storeKeyspaceInstance(instance);
+            SchemaTestUtil.addOrUpdateKeyspace(ksm, true);
         }
     }
 
@@ -409,16 +420,16 @@ public class RowCacheTest
         // empty the row cache
         CacheService.instance.invalidateRowCache();
 
-        // set global row cache size to 1 MB
+        // set global row cache size to 1 MiB
         CacheService.instance.setRowCacheCapacityInMB(1);
 
         ByteBuffer key = ByteBufferUtil.bytes("rowcachekey");
         DecoratedKey dk = cachedStore.decorateKey(key);
-        RowCacheKey rck = new RowCacheKey(cachedStore.metadata.ksAndCFName, dk);
+        RowCacheKey rck = new RowCacheKey(cachedStore.metadata(), dk);
         String values[] = new String[200];
         for (int i = 0; i < 200; i++)
         {
-            RowUpdateBuilder rub = new RowUpdateBuilder(cachedStore.metadata, System.currentTimeMillis(), key);
+            RowUpdateBuilder rub = new RowUpdateBuilder(cachedStore.metadata(), System.currentTimeMillis(), key);
             rub.clustering(String.valueOf(i));
             values[i] = "val" + i;
             rub.add("val", ByteBufferUtil.bytes(values[i]));
@@ -461,11 +472,11 @@ public class RowCacheTest
         {
             Row r = (Row) unfiltered;
 
-            assertEquals(r.clustering().get(0), ByteBufferUtil.bytes(values[i].substring(3)));
+            ValueAccessors.assertDataEquals(r.clustering().get(0), ByteBufferUtil.bytes(values[i].substring(3)));
 
             for (ColumnData c : r)
             {
-                assertEquals(((Cell)c).value(), ByteBufferUtil.bytes(values[i]));
+                assertEquals(((Cell<?>)c).buffer(), ByteBufferUtil.bytes(values[i]));
             }
             i++;
         }
@@ -484,14 +495,14 @@ public class RowCacheTest
         // empty the row cache
         CacheService.instance.invalidateRowCache();
 
-        // set global row cache size to 1 MB
+        // set global row cache size to 1 MiB
         CacheService.instance.setRowCacheCapacityInMB(1);
 
         // inserting 100 rows into both column families
         SchemaLoader.insertData(KEYSPACE_CACHED, CF_CACHED, 0, 100);
 
         //force flush for confidence that SSTables exists
-        cachedStore.forceBlockingFlush();
+        Util.flush(cachedStore);
 
         ((ClearableHistogram)cachedStore.metric.sstablesPerReadHistogram.cf).clear();
 
@@ -548,12 +559,10 @@ public class RowCacheTest
     private static void readData(String keyspace, String columnFamily, int offset, int numberOfRows)
     {
         ColumnFamilyStore store = Keyspace.open(keyspace).getColumnFamilyStore(columnFamily);
-        CFMetaData cfm = Schema.instance.getCFMetaData(keyspace, columnFamily);
 
         for (int i = offset; i < offset + numberOfRows; i++)
         {
             DecoratedKey key = Util.dk("key" + i);
-            Clustering cl = new Clustering(ByteBufferUtil.bytes("col" + i));
             Util.getAll(Util.cmd(store, key).build());
         }
     }

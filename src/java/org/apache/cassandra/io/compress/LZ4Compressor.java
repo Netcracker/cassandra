@@ -20,35 +20,94 @@ package org.apache.cassandra.io.compress;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.Arrays;
+import java.util.EnumSet;
 import java.util.HashSet;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
 import com.google.common.annotations.VisibleForTesting;
+import com.google.common.collect.ImmutableSet;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import net.jpountz.lz4.LZ4Exception;
 import net.jpountz.lz4.LZ4Factory;
-import org.apache.cassandra.schema.CompressionParams;
+import org.apache.cassandra.exceptions.ConfigurationException;
+import org.apache.cassandra.utils.Pair;
 
 public class LZ4Compressor implements ICompressor
 {
+    private static final Logger logger = LoggerFactory.getLogger(LZ4Compressor.class);
+
+    public static final String LZ4_FAST_COMPRESSOR = "fast";
+    public static final String LZ4_HIGH_COMPRESSOR = "high";
+    private static final Set<String> VALID_COMPRESSOR_TYPES = new HashSet<>(Arrays.asList(LZ4_FAST_COMPRESSOR, LZ4_HIGH_COMPRESSOR));
+
+    private static final int DEFAULT_HIGH_COMPRESSION_LEVEL = 9;
+    private static final String DEFAULT_LZ4_COMPRESSOR_TYPE = LZ4_FAST_COMPRESSOR;
+
+    public static final String LZ4_HIGH_COMPRESSION_LEVEL = "lz4_high_compressor_level";
+    public static final String LZ4_COMPRESSOR_TYPE = "lz4_compressor_type";
+
     private static final int INTEGER_BYTES = 4;
 
-    @VisibleForTesting
-    public static final LZ4Compressor instance = new LZ4Compressor();
+    private static final ConcurrentHashMap<Pair<String, Integer>, LZ4Compressor> instances = new ConcurrentHashMap<>();
 
-    public static LZ4Compressor create(Map<String, String> args)
+    public static LZ4Compressor create(Map<String, String> args) throws ConfigurationException
     {
+        String compressorType = validateCompressorType(args.get(LZ4_COMPRESSOR_TYPE));
+        Integer compressionLevel = validateCompressionLevel(args.get(LZ4_HIGH_COMPRESSION_LEVEL));
+
+        Pair<String, Integer> compressorTypeAndLevel = Pair.create(compressorType, compressionLevel);
+        LZ4Compressor instance = instances.get(compressorTypeAndLevel);
+        if (instance == null)
+        {
+            if (compressorType.equals(LZ4_FAST_COMPRESSOR) && args.get(LZ4_HIGH_COMPRESSION_LEVEL) != null)
+                logger.warn("'{}' parameter is ignored when '{}' is '{}'", LZ4_HIGH_COMPRESSION_LEVEL, LZ4_COMPRESSOR_TYPE, LZ4_FAST_COMPRESSOR);
+            if (compressorType.equals(LZ4_HIGH_COMPRESSOR))
+                logger.info("The ZstdCompressor may be preferable to LZ4 in 'high' mode. Zstd will typically " +
+                            "compress much faster while achieving better ratio, but it may decompress more slowly,");
+
+            instance = new LZ4Compressor(compressorType, compressionLevel);
+            LZ4Compressor instanceFromMap = instances.putIfAbsent(compressorTypeAndLevel, instance);
+            if(instanceFromMap != null)
+                instance = instanceFromMap;
+        }
         return instance;
     }
 
     private final net.jpountz.lz4.LZ4Compressor compressor;
-    private final net.jpountz.lz4.LZ4FastDecompressor decompressor;
+    private final net.jpountz.lz4.LZ4SafeDecompressor decompressor;
+    @VisibleForTesting
+    final String compressorType;
+    @VisibleForTesting
+    final Integer compressionLevel;
+    private final Set<Uses> recommendedUses;
 
-    private LZ4Compressor()
+    private LZ4Compressor(String type, Integer compressionLevel)
     {
+        this.compressorType = type;
+        this.compressionLevel = compressionLevel;
         final LZ4Factory lz4Factory = LZ4Factory.fastestInstance();
-        compressor = lz4Factory.fastCompressor();
-        decompressor = lz4Factory.fastDecompressor();
+        switch (type)
+        {
+            case LZ4_HIGH_COMPRESSOR:
+            {
+                compressor = lz4Factory.highCompressor(compressionLevel);
+                // LZ4HC can be _extremely_ slow to compress, up to 10x slower
+                this.recommendedUses = ImmutableSet.of(Uses.GENERAL);
+                break;
+            }
+            case LZ4_FAST_COMPRESSOR:
+            default:
+            {
+                compressor = lz4Factory.fastCompressor();
+                this.recommendedUses = ImmutableSet.copyOf(EnumSet.allOf(Uses.class));
+            }
+        }
+
+        decompressor = lz4Factory.safeDecompressor();
     }
 
     public int initialCompressedBufferLength(int chunkLength)
@@ -82,20 +141,24 @@ public class LZ4Compressor implements ICompressor
                 | ((input[inputOffset + 2] & 0xFF) << 16)
                 | ((input[inputOffset + 3] & 0xFF) << 24);
 
-        final int compressedLength;
+        final int writtenLength;
         try
         {
-            compressedLength = decompressor.decompress(input, inputOffset + INTEGER_BYTES,
-                                                       output, outputOffset, decompressedLength);
+            writtenLength = decompressor.decompress(input,
+                                                    inputOffset + INTEGER_BYTES,
+                                                    inputLength - INTEGER_BYTES,
+                                                    output,
+                                                    outputOffset,
+                                                    decompressedLength);
         }
         catch (LZ4Exception e)
         {
             throw new IOException(e);
         }
 
-        if (compressedLength != inputLength - INTEGER_BYTES)
+        if (writtenLength != decompressedLength)
         {
-            throw new IOException("Compressed lengths mismatch");
+            throw new IOException("Decompressed lengths mismatch");
         }
 
         return decompressedLength;
@@ -110,7 +173,8 @@ public class LZ4Compressor implements ICompressor
 
         try
         {
-            int compressedLength = decompressor.decompress(input, input.position(), output, output.position(), decompressedLength);
+            int compressedLength = input.remaining();
+            decompressor.decompress(input, input.position(), input.remaining(), output, output.position(), decompressedLength);
             input.position(input.position() + compressedLength);
             output.position(output.position() + decompressedLength);
         }
@@ -127,7 +191,50 @@ public class LZ4Compressor implements ICompressor
 
     public Set<String> supportedOptions()
     {
-        return new HashSet<>();
+        return new HashSet<>(Arrays.asList(LZ4_HIGH_COMPRESSION_LEVEL, LZ4_COMPRESSOR_TYPE));
+    }
+
+    public static String validateCompressorType(String compressorType) throws ConfigurationException
+    {
+        if (compressorType == null)
+            return DEFAULT_LZ4_COMPRESSOR_TYPE;
+
+        if (!VALID_COMPRESSOR_TYPES.contains(compressorType))
+        {
+            throw new ConfigurationException(String.format("Invalid compressor type '%s' specified for LZ4 parameter '%s'. "
+                                                           + "Valid options are %s.", compressorType, LZ4_COMPRESSOR_TYPE,
+                                                           VALID_COMPRESSOR_TYPES.toString()));
+        }
+        else
+        {
+            return compressorType;
+        }
+    }
+
+    public static Integer validateCompressionLevel(String compressionLevel) throws ConfigurationException
+    {
+        if (compressionLevel == null)
+            return DEFAULT_HIGH_COMPRESSION_LEVEL;
+
+        ConfigurationException ex = new ConfigurationException("Invalid value [" + compressionLevel + "] for parameter '"
+                                                                 + LZ4_HIGH_COMPRESSION_LEVEL + "'. Value must be between 1 and 17.");
+
+        Integer level;
+        try
+        {
+            level = Integer.valueOf(compressionLevel);
+        }
+        catch (NumberFormatException e)
+        {
+            throw ex;
+        }
+
+        if (level < 1 || level > 17)
+        {
+            throw ex;
+        }
+
+        return level;
     }
 
     public BufferType preferredBufferType()
@@ -138,5 +245,11 @@ public class LZ4Compressor implements ICompressor
     public boolean supports(BufferType bufferType)
     {
         return true;
+    }
+
+    @Override
+    public Set<Uses> recommendedUses()
+    {
+        return recommendedUses;
     }
 }

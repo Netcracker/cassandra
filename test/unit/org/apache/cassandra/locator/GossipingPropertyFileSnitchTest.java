@@ -18,12 +18,14 @@
 
 package org.apache.cassandra.locator;
 
-import java.net.InetAddress;
 
-import com.google.common.net.InetAddresses;
+import org.junit.Before;
+import org.junit.BeforeClass;
 import org.junit.Test;
 
-import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.tcm.ClusterMetadataService;
+import org.apache.cassandra.tcm.StubClusterMetadataService;
 
 import static org.junit.Assert.*;
 
@@ -32,19 +34,25 @@ import static org.junit.Assert.*;
  */
 public class GossipingPropertyFileSnitchTest
 {
-    public static void checkEndpoint(final AbstractNetworkTopologySnitch snitch,
-                                     final String endpointString, final String expectedDatacenter,
-                                     final String expectedRack)
+    @BeforeClass
+    public static void setup() throws Exception
     {
-        final InetAddress endpoint = InetAddresses.forString(endpointString);
-        assertEquals(expectedDatacenter, snitch.getDatacenter(endpoint));
-        assertEquals(expectedRack, snitch.getRack(endpoint));
+        DatabaseDescriptor.daemonInitialization();
+    }
+
+    @Before
+    public void resetCMS()
+    {
+        ClusterMetadataService.unsetInstance();
+        ClusterMetadataService.setInstance(StubClusterMetadataService.forTesting());
     }
 
     @Test
-    public void testLoadConfig() throws Exception
+    public void testLoadConfig()
     {
         final GossipingPropertyFileSnitch snitch = new GossipingPropertyFileSnitch();
-        checkEndpoint(snitch, FBUtilities.getBroadcastAddress().getHostAddress(), "DC1", "RAC1");
+        // for registering a new node, location is obtained from the snitch config
+        assertEquals("DC1", snitch.getLocalDatacenter());
+        assertEquals("RAC1", snitch.getLocalRack());
     }
 }

@@ -20,21 +20,39 @@
  */
 package org.apache.cassandra.db.lifecycle;
 
-import java.io.File;
-import java.io.FilenameFilter;
 import java.nio.file.Path;
-import java.nio.file.Paths;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.Set;
+import java.util.TreeSet;
+import java.util.function.BiPredicate;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 import java.util.zip.CRC32;
 
+import com.google.common.annotations.VisibleForTesting;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import org.apache.cassandra.io.sstable.Component;
+import org.apache.cassandra.io.sstable.Descriptor;
 import org.apache.cassandra.io.sstable.SSTable;
+import org.apache.cassandra.io.sstable.format.SSTableFormat;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.io.util.File;
 import org.apache.cassandra.io.util.FileUtils;
+import org.apache.cassandra.io.util.PathUtils;
 import org.apache.cassandra.utils.FBUtilities;
+
+import static org.apache.cassandra.io.sstable.Descriptor.TMP_EXT;
+import static org.apache.cassandra.utils.LocalizeString.toUpperCaseLocalized;
 
 /**
  * A decoded line in a transaction log file replica.
@@ -43,6 +61,10 @@ import org.apache.cassandra.utils.FBUtilities;
  */
 final class LogRecord
 {
+    private static final Logger logger = LoggerFactory.getLogger(LogRecord.class);
+    @VisibleForTesting
+    static boolean INCLUDE_STATS_FOR_TESTS = false;
+
     public enum Type
     {
         UNKNOWN, // a record that cannot be parsed
@@ -53,7 +75,7 @@ final class LogRecord
 
         public static Type fromPrefix(String prefix)
         {
-            return valueOf(prefix.toUpperCase());
+            return valueOf(toUpperCaseLocalized(prefix));
         }
 
         public boolean hasFile()
@@ -66,7 +88,10 @@ final class LogRecord
             return this == record.type;
         }
 
-        public boolean isFinal() { return this == Type.COMMIT || this == Type.ABORT; }
+        public boolean isFinal()
+        {
+            return this == Type.COMMIT || this == Type.ABORT;
+        }
     }
 
     /**
@@ -126,14 +151,16 @@ final class LogRecord
 
             Type type = Type.fromPrefix(matcher.group(1));
             return new LogRecord(type,
-                                 matcher.group(2) + Component.separator, // see comment on CASSANDRA-13294 below
-                                 Long.valueOf(matcher.group(3)),
-                                 Integer.valueOf(matcher.group(4)),
-                                 Long.valueOf(matcher.group(5)), line);
+                                 matcher.group(2),
+                                 Long.parseLong(matcher.group(3)),
+                                 Integer.parseInt(matcher.group(4)),
+                                 Long.parseLong(matcher.group(5)),
+                                 line);
         }
-        catch (Throwable t)
+        catch (IllegalArgumentException e)
         {
-            return new LogRecord(Type.UNKNOWN, null, 0, 0, 0, line).setError(t);
+            return new LogRecord(Type.UNKNOWN, null, 0, 0, 0, line)
+                   .setError(String.format("Failed to parse line: %s", e.getMessage()));
         }
     }
 
@@ -149,11 +176,7 @@ final class LogRecord
 
     public static LogRecord make(Type type, SSTable table)
     {
-        // CASSANDRA-13294: add the sstable component separator because for legacy (2.1) files
-        // there is no separator after the generation number, and this would cause files of sstables with
-        // a higher generation number that starts with the same number, to be incorrectly classified as files
-        // of this record sstable
-        String absoluteTablePath = absolutePath(table.descriptor.baseFilename());
+        String absoluteTablePath = absolutePath(table.descriptor.baseFile());
         return make(type, getExistingFiles(absoluteTablePath), table.getAllFilePaths().size(), absoluteTablePath);
     }
 
@@ -162,7 +185,7 @@ final class LogRecord
         // contains a mapping from sstable absolute path (everything up until the 'Data'/'Index'/etc part of the filename) to the sstable
         Map<String, SSTable> absolutePaths = new HashMap<>();
         for (SSTableReader table : tables)
-            absolutePaths.put(absolutePath(table.descriptor.baseFilename()), table);
+            absolutePaths.put(absolutePath(table.descriptor.baseFile()), table);
 
         // maps sstable base file name to the actual files on disk
         Map<String, List<File>> existingFiles = getExistingFiles(absolutePaths.keySet());
@@ -177,24 +200,72 @@ final class LogRecord
         return records;
     }
 
-    private static String absolutePath(String baseFilename)
+    private static String absolutePath(File baseFile)
     {
-        return FileUtils.getCanonicalPath(baseFilename + Component.separator);
+        return baseFile.withSuffix(String.valueOf(Component.separator)).canonicalPath();
     }
 
     public LogRecord withExistingFiles(List<File> existingFiles)
     {
+        if (!absolutePath.isPresent())
+            throw new IllegalStateException(String.format("Cannot create record from existing files for type %s - file is not present", type));
+
         return make(type, existingFiles, 0, absolutePath.get());
     }
 
+    /**
+     * We create a LogRecord based on the files on disk; there's some subtlety around how we handle stats files as the
+     * timestamp can be mutated by the async completion of compaction if things race with node shutdown. To work around this,
+     * we don't take the stats file timestamp into account when calculating nor using the timestamps for all the components
+     * as we build the LogRecord.
+     */
     public static LogRecord make(Type type, List<File> files, int minFiles, String absolutePath)
     {
+        return make(type, files, minFiles, absolutePath, INCLUDE_STATS_FOR_TESTS);
+    }
+
+    /**
+     * In most cases we skip including the stats file timestamp entirely as it can be mutated during anticompaction
+     * and thus "invalidate" the LogRecord. There is an edge case where we have a LogRecord that was written w/the wrong
+     * timestamp (i.e. included a mutated stats file) and we need the node to come up, so we need to expose the selective
+     * ability to either include the stats file timestamp or not.
+     *
+     * See {@link LogFile#verifyRecord}
+     */
+    static LogRecord make(Type type, List<File> files, int minFiles, String absolutePath, boolean includeStatsFile)
+    {
+        List<File> toVerify;
+        File statsFile = null;
+        if (!includeStatsFile && !files.isEmpty())
+        {
+            toVerify = new ArrayList<>(files.size() - 1);
+            for (File f : files)
+            {
+                if (!f.name().endsWith(TMP_EXT))
+                {
+                    if (Descriptor.componentFromFile(f) == SSTableFormat.Components.STATS)
+                        statsFile = f;
+                    else
+                        toVerify.add(f);
+                }
+            }
+        }
+        else
+        {
+            toVerify = files;
+        }
         // CASSANDRA-11889: File.lastModified() returns a positive value only if the file exists, therefore
         // we filter by positive values to only consider the files that still exists right now, in case things
         // changed on disk since getExistingFiles() was called
-        List<Long> positiveModifiedTimes = files.stream().map(File::lastModified).filter(lm -> lm > 0).collect(Collectors.toList());
+        List<Long> positiveModifiedTimes = toVerify.stream().map(File::lastModified).filter(lm -> lm > 0).collect(Collectors.toList());
         long lastModified = positiveModifiedTimes.stream().reduce(0L, Long::max);
-        return new LogRecord(type, absolutePath, lastModified, Math.max(minFiles, positiveModifiedTimes.size()));
+
+        // We need to preserve the file count for the number of existing files found on disk even though we ignored the
+        // stats file during our timestamp calculation. If the stats file still exists, we add in the count of it as
+        // a separate validation assumption that it's one of the files considered valid in this LogRecord.
+        boolean addStatTS = statsFile != null && statsFile.exists();
+        int positiveTSCount = addStatTS ? positiveModifiedTimes.size() + 1 : positiveModifiedTimes.size();
+        return new LogRecord(type, absolutePath, lastModified, Math.max(minFiles, positiveTSCount));
     }
 
     private LogRecord(Type type, long updateTime)
@@ -220,7 +291,7 @@ final class LogRecord
         assert !type.hasFile() || absolutePath != null : "Expected file path for file records";
 
         this.type = type;
-        this.absolutePath = type.hasFile() ? Optional.of(absolutePath) : Optional.empty();
+        this.absolutePath = type.hasFile() ? Optional.of(absolutePath) : Optional.<String>empty();
         this.updateTime = type == Type.REMOVE ? updateTime : 0;
         this.numFiles = type.hasFile() ? numFiles : 0;
         this.status = new Status();
@@ -235,11 +306,6 @@ final class LogRecord
             this.checksum = checksum;
             this.raw = raw;
         }
-    }
-
-    LogRecord setError(Throwable t)
-    {
-        return setError(t.getMessage());
     }
 
     LogRecord setError(String error)
@@ -290,8 +356,8 @@ final class LogRecord
 
     public static List<File> getExistingFiles(String absoluteFilePath)
     {
-        Path path = Paths.get(absoluteFilePath);
-        File[] files = path.getParent().toFile().listFiles((dir, name) -> name.startsWith(path.getFileName().toString()));
+        File file = new File(absoluteFilePath);
+        File[] files = file.parent().tryList((dir, name) -> name.startsWith(file.name()));
         // files may be null if the directory does not exist yet, e.g. when tracking new files
         return files == null ? Collections.emptyList() : Arrays.asList(files);
     }
@@ -309,13 +375,13 @@ final class LogRecord
         Map<File, TreeSet<String>> dirToFileNamePrefix = new HashMap<>();
         for (String absolutePath : absoluteFilePaths)
         {
-            Path fullPath = Paths.get(absolutePath);
+            Path fullPath = new File(absolutePath).toPath();
             Path path = fullPath.getParent();
             if (path != null)
-                dirToFileNamePrefix.computeIfAbsent(path.toFile(), (k) -> new TreeSet<>()).add(fullPath.getFileName().toString());
+                dirToFileNamePrefix.computeIfAbsent(new File(path), (k) -> new TreeSet<>()).add(fullPath.getFileName().toString());
         }
 
-        FilenameFilter ff = (dir, name) -> {
+        BiPredicate<File, String> ff = (dir, name) -> {
             TreeSet<String> dirSet = dirToFileNamePrefix.get(dir);
             // if the set contains a prefix of the current file name, the file name we have here should sort directly
             // after the prefix in the tree set, which means we can use 'floor' to get the prefix (returns the largest
@@ -324,7 +390,7 @@ final class LogRecord
             String baseName = dirSet.floor(name);
             if (baseName != null && name.startsWith(baseName))
             {
-                String absolutePath = new File(dir, baseName).getPath();
+                String absolutePath = new File(dir, baseName).path();
                 fileMap.computeIfAbsent(absolutePath, k -> new ArrayList<>()).add(new File(dir, name));
             }
             return false;
@@ -332,7 +398,7 @@ final class LogRecord
 
         // populate the file map:
         for (File f : dirToFileNamePrefix.keySet())
-            f.listFiles(ff);
+            f.tryList(ff);
 
         return fileMap;
     }
@@ -345,35 +411,17 @@ final class LogRecord
 
     String fileName()
     {
-        return absolutePath.isPresent() ? Paths.get(absolutePath.get()).getFileName().toString() : "";
+        return absolutePath.isPresent() ? new File(absolutePath.get()).name() : "";
     }
 
     boolean isInFolder(Path folder)
     {
-        return absolutePath.isPresent()
-               ? FileUtils.isContained(folder.toFile(), Paths.get(absolutePath.get()).toFile())
-               : false;
+        return absolutePath.isPresent() && PathUtils.isContained(folder, new File(absolutePath.get()).toPath());
     }
 
-    /**
-     * Return the absolute path, if present, except for the last character (the descriptor separator), or
-     * the empty string if the record has no path. This method is only to be used internally for writing
-     * the record to file or computing the checksum.
-     *
-     * CASSANDRA-13294: the last character of the absolute path is the descriptor separator, it is removed
-     * from the absolute path for backward compatibility, to make sure that on upgrade from 3.0.x to 3.0.y
-     * or to 3.y or to 4.0, the checksum of existing txn files still matches (in case of non clean shutdown
-     * some txn files may be present). By removing the last character here, it means that
-     * it will never be written to txn files, but it is added after reading a txn file in LogFile.make().
-     */
-    private String absolutePath()
+    String absolutePath()
     {
-        if (!absolutePath.isPresent())
-            return "";
-
-        String ret = absolutePath.get();
-        assert ret.charAt(ret.length() -1) == Component.separator : "Invalid absolute path, should end with '-'";
-        return ret.substring(0, ret.length() - 1);
+        return absolutePath.isPresent() ? absolutePath.get() : "";
     }
 
     @Override

@@ -17,11 +17,11 @@
  */
 package org.apache.cassandra.metrics;
 
-
 import com.codahale.metrics.Gauge;
+import com.codahale.metrics.Meter;
 import com.codahale.metrics.Timer;
 import org.apache.cassandra.db.commitlog.AbstractCommitLogService;
-import org.apache.cassandra.db.commitlog.CommitLogSegmentManager;
+import org.apache.cassandra.db.commitlog.AbstractCommitLogSegmentManager;
 
 import static org.apache.cassandra.metrics.CassandraMetricsRegistry.Metrics;
 
@@ -30,7 +30,8 @@ import static org.apache.cassandra.metrics.CassandraMetricsRegistry.Metrics;
  */
 public class CommitLogMetrics
 {
-    public static final MetricNameFactory factory = new DefaultNameFactory("CommitLog");
+    public static final String TYPE_NAME = "CommitLog";
+    public static final MetricNameFactory factory = new DefaultNameFactory(TYPE_NAME);
 
     /** Number of completed tasks */
     public Gauge<Long> completedTasks;
@@ -42,14 +43,20 @@ public class CommitLogMetrics
     public final Timer waitingOnSegmentAllocation;
     /** The time spent waiting on CL sync; for Periodic this is only occurs when the sync is lagging its sync interval */
     public final Timer waitingOnCommit;
-    
+    /** Time spent actually flushing the contents of a buffer to disk */
+    public final Timer waitingOnFlush;
+    /** Number and rate of oversized mutations */
+    public final Meter oversizedMutations;
+
     public CommitLogMetrics()
     {
         waitingOnSegmentAllocation = Metrics.timer(factory.createMetricName("WaitingOnSegmentAllocation"));
         waitingOnCommit = Metrics.timer(factory.createMetricName("WaitingOnCommit"));
+        waitingOnFlush = Metrics.timer(factory.createMetricName("WaitingOnFlush"));
+        oversizedMutations = Metrics.meter(factory.createMetricName("OverSizedMutations"));
     }
 
-    public void attach(final AbstractCommitLogService service, final CommitLogSegmentManager allocator)
+    public void attach(final AbstractCommitLogService service, final AbstractCommitLogSegmentManager segmentManager)
     {
         completedTasks = Metrics.register(factory.createMetricName("CompletedTasks"), new Gauge<Long>()
         {
@@ -69,7 +76,7 @@ public class CommitLogMetrics
         {
             public Long getValue()
             {
-                return allocator.onDiskSize();
+                return segmentManager.onDiskSize();
             }
         });
     }
